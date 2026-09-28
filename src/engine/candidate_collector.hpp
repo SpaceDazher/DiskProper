@@ -242,7 +242,8 @@ struct CollectOptions {
     // заметка содержит путь, а путей может быть много.
     std::size_t maxNotes{64};
 
-    CandidateFinalizer finalize;};
+    CandidateFinalizer finalize;
+};
 
 // Счётчики прогона. Ни одно поле не превращается в «результат»: результат —
 // кандидаты, а счётчики говорят, что сборщик видел. Нужны отчёту (FR-8) и
