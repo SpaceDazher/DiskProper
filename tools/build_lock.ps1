@@ -13,8 +13,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $lock = Join-Path $repo 'build\.build-lock'
-$waitMinutes = 40
-$staleMinutes = 45
+$waitMinutes = 12
+$staleMinutes = 20
 
 if ($Action -eq 'acquire') {
     $deadline = (Get-Date).AddMinutes($waitMinutes)

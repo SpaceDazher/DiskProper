@@ -361,16 +361,16 @@ Snapshot UndoService::snapshot(std::int64_t now, const platform::TrashOptions& t
     // Имя не root(): локальная переменная скрыла бы метод с таким же именем, и
     // строка стала бы «вызов std::string» вместо чтения корня.
     const std::string trashRootPath = root();
-    if (root.empty()) {
+    if (trashRootPath.empty()) {
         // Корень неизвестен (нет %ProgramData%) — это отказ, а не «корзина пуста»:
         // вызывающий обязан показать его иначе, чем пустой список.
-        logPath(kLogSnapshot, core::LogLevel::Warn, "корень корзины неизвестен, отмена недоступна", root, 0,
+        logPath(kLogSnapshot, core::LogLevel::Warn, "корень корзины неизвестен, отмена недоступна", trashRootPath, 0,
                 options_.logFailures);
         return out;
     }
 
     const platform::TrashOptions options = effective(trashOptions);
-    const platform::TrashInventory inventory = platform::loadInventory(root, options);
+    const platform::TrashInventory inventory = platform::loadInventory(trashRootPath, options);
     out.brokenDirs = inventory.brokenDirs;
     out.scannedDirs = inventory.scannedDirs;
 
@@ -399,7 +399,7 @@ Snapshot UndoService::snapshot(std::int64_t now, const platform::TrashOptions& t
         view.expired = isExpired(tx.txId);
         std::string dir;
         std::string problem;
-        if (dirOf(root, tx.txId, dir, problem)) view.directory = dir;
+        if (dirOf(trashRootPath, tx.txId, dir, problem)) view.directory = dir;
         switch (tx.state) {
             case core::TrashTxState::Open:
                 view.note = "манифест ещё не записан, отмена недоступна";
@@ -434,7 +434,7 @@ Snapshot UndoService::snapshot(std::int64_t now, const platform::TrashOptions& t
               });
 
     if (options_.logFailures) {
-        core::LogFields fields = add(field("root", root), "transactions", out.transactions.size());
+        core::LogFields fields = add(field("root", trashRootPath), "transactions", out.transactions.size());
         fields = add(std::move(fields), "available", out.availableTransactions);
         fields = add(std::move(fields), "broken", out.brokenDirs.size());
         fields = add(std::move(fields), "bytes", out.totalBytes);
@@ -456,13 +456,13 @@ bool UndoService::readTransaction(std::string_view txId, const platform::TrashOp
     problem.status = platform::TrashStatus::Ok;
     problem.win32Error = 0;
     problem.problem.clear();
-    if (root.empty()) {
+    if (trashRootPath.empty()) {
         problem.status = platform::TrashStatus::InvalidArgument;
         problem.problem = "корень корзины неизвестен: восстановление недоступно";
         return false;
     }
     problem.txId = std::string{txId};
-    if (!dirOf(root, txId, dirOut, problem.problem)) {
+    if (!dirOf(trashRootPath, txId, dirOut, problem.problem)) {
         problem.status = platform::TrashStatus::InvalidArgument;
         return false;
     }
@@ -594,7 +594,7 @@ RestorePlanResult UndoService::planRestore(std::string_view txId, const core::Re
     // Том корзины нужен ядру для оценки копирования (FR-7: «честно показываем,
     // что это долго»). Не задан — спрашиваем один раз на план, а не по элементу.
     std::string trashVolume = request.trashVolume;
-    if (trashVolume.empty()) trashVolume = platform::volumeOfPath(root).volumeGuid;
+    if (trashVolume.empty()) trashVolume = platform::volumeOfPath(trashRootPath).volumeGuid;
     result.trashVolume = trashVolume;
 
     core::RestoreRequest wanted = request;
@@ -868,16 +868,16 @@ bool UndoService::purge(std::string_view txId, std::string& detail, const platfo
     // Имя не root(): локальная переменная скрыла бы метод с таким же именем, и
     // строка стала бы «вызов std::string» вместо чтения корня.
     const std::string trashRootPath = root();
-    if (root.empty()) {
+    if (trashRootPath.empty()) {
         detail = "корень корзины неизвестен";
         return false;
     }
     std::string dir;
     std::string problem;
-    if (!dirOf(root, txId, dir, problem)) {
+    if (!dirOf(trashRootPath, txId, dir, problem)) {
         detail = problem;
-        logPath(kLogPurge, core::LogLevel::Warn, "недопустимый идентификатор транзакции", root, 0, options_.logFailures,
-                txId);
+        logPath(kLogPurge, core::LogLevel::Warn, "недопустимый идентификатор транзакции", trashRootPath, 0,
+                options_.logFailures, txId);
         return false;
     }
     const platform::TrashOptions options = effective(trashOptions);

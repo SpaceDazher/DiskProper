@@ -302,6 +302,24 @@ void PlanBuilder::selectAllVisible() {
     rebuild();
 }
 
+void PlanBuilder::selectSafeOnly() {
+    // Третье состояние кнопки экрана рядом с «выбрать всё» и «снять всё»:
+    // остаётся ровно то, что безопасно. Скрытый Risky и занятые элементы не
+    // трогаются — их нельзя ни взять, ни снять (FR-4, FR-5).
+    for (std::size_t index = 0; index < candidates_.size(); ++index) {
+        const core::CleanupCandidate& candidate = candidates_[index];
+        if (!candidate.lockedBy.empty()) continue;
+        if (candidate.safety == core::SafetyLevel::Safe) {
+            overrides_[index] = SelectionOverride::SelectedByUser;
+        } else if (candidate.safety == core::SafetyLevel::Risky && !options_.allowRisky) {
+            continue;  // скрыт: снимать нечего, человек его не видел
+        } else {
+            overrides_[index] = SelectionOverride::KeptByUser;
+        }
+    }
+    rebuild();
+}
+
 void PlanBuilder::selectNone() {
     for (std::size_t index = 0; index < candidates_.size(); ++index) {
         const core::CleanupCandidate& candidate = candidates_[index];
@@ -445,6 +463,12 @@ void PlanBuilder::rebuild() {
         core::ActionTotals& actionTotals = slotFor(plan_.totals.byAction, decision.action);
         ++actionTotals.count;
         actionTotals.bytes += item.reclaimBytes;
+        // Те же счётчики в представлении: JSON плана отдаёт view_.totals.byAction,
+        // а исполнитель сверяется с plan_.totals.byAction. Молчащие нули в одном
+        // из них — это расхождение «цифры на экране» и «состава операций».
+        core::ActionTotals& viewActionTotals = slotFor(view_.totals.byAction, decision.action);
+        ++viewActionTotals.count;
+        viewActionTotals.bytes += item.reclaimBytes;
 
         if (removable) {
             ++plan_.totals.selectedCount;
@@ -949,6 +973,20 @@ std::vector<std::string> PlanBuilder::validate() const {
                            std::to_string(selectedCount) + " / " + core::formatBytes(selectedSum) +
                            ", заявлено " + std::to_string(view_.totals.selectedCount) + " / " +
                            core::formatBytes(view_.totals.selectedBytes));
+    }
+
+    // Агрегаты по действиям: план отдаёт исполнитель, представление — UI и JSON.
+    const core::PlanAction allActions[] = {core::PlanAction::Delete, core::PlanAction::Trash,
+                                            core::PlanAction::Keep, core::PlanAction::SkipLocked};
+    for (const core::PlanAction action : allActions) {
+        const core::ActionTotals& fromPlan = plan_.totals.byAction.forAction(action);
+        const core::ActionTotals& fromView = view_.totals.byAction.forAction(action);
+        if (fromPlan.count != fromView.count || fromPlan.bytes != fromView.bytes) {
+            problems.push_back("агрегаты действия " + std::string(actionToken(action)) + " в представлении (" +
+                               std::to_string(fromView.count) + " / " + std::to_string(fromView.bytes) +
+                               " байт) не сходятся с планом (" + std::to_string(fromPlan.count) + " / " +
+                               std::to_string(fromPlan.bytes) + " байт)");
+        }
     }
     return problems;
 }

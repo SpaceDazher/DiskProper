@@ -225,6 +225,15 @@ std::optional<vfs::FileStamp> stampOf(const ItemReport& item) {
     return stamp;
 }
 
+// Код Win32 в поле hr строки отчёта. ItemReport::hr — это HRESULT (§12: «все
+// ошибки в логе с путём и HRESULT»), а часть платформенных модулей отдаёт отказ
+// сырым кодом Win32. Смешивать два соглашения в одном поле нельзя: разбирающий
+// отчёт по HRESULT не отличил бы «5» (access denied) от 0x80070005, а журнал
+// отдал бы это в системный текст по разным правилам.
+std::int32_t hresultOrZero(std::uint32_t win32Code) noexcept {
+    return static_cast<std::int32_t>(platform::hresultFromWin32(win32Code));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -557,7 +566,7 @@ void CleanupExecutor::checkItem(const core::CleanupCandidate& candidate, ItemRep
     const vfs_paths::Guard guard = vfs_paths::checkRuleRoot(item.path, root);
     if (!guard.allowed()) {
         if (!guard.normalized.empty()) item.path = guard.normalized;
-        item.hr = static_cast<std::int32_t>(guard.lastError);
+        item.hr = hresultOrZero(guard.lastError);
         skipItem(item, outcomeOf(guard.verdict));
         return;
     }
@@ -605,7 +614,7 @@ void CleanupExecutor::checkItem(const core::CleanupCandidate& candidate, ItemRep
     if (info.free()) return;
 
     if (info.unknown()) {
-        item.hr = static_cast<std::int32_t>(info.win32Error);
+        item.hr = hresultOrZero(info.win32Error);
         item.lockDetail = locks::describe(info);
         skipItem(item, ItemOutcome::SkippedLockUnknown);
         if (!info.statusText.empty()) item.detail = info.statusText;
@@ -644,6 +653,7 @@ bool CleanupExecutor::checkPhase(const std::vector<core::CleanupCandidate>& cand
     const std::size_t workers = resolveWorkers(targets.size());
     WorkerPool pool(workers, runToken_, &progress_);
     std::size_t submitted = 0;
+    bool submitFailed = false;
     for (const std::size_t index : targets) {
         if (runToken_.stop_requested()) break;
         ItemReport& item = items[index];
@@ -651,11 +661,28 @@ bool CleanupExecutor::checkPhase(const std::vector<core::CleanupCandidate>& cand
         bool queued = false;
         try {
             queued = pool.submit([this, &candidate, &item] {
-                checkItem(candidate, item);
+                // Исключение внутри проверки не фатально (FR-6), но такую строку
+                // нельзя оставлять NotStarted: в фазе C этот исход означает
+                // «проверена и разрешена», а проверена она не была — путь ушёл бы
+                // на удаление без проверки корня, белого списка и Restart Manager.
+                // Исход ставится раньше текста: если сборка строки тоже бросит,
+                // Failed в отчёте уже есть.
+                try {
+                    checkItem(candidate, item);
+                } catch (const std::exception& error) {
+                    item.outcome = ItemOutcome::Failed;
+                    item.code = toString(item.outcome);
+                    item.detail = std::string{"исключение при проверке: "} + exceptionText(error);
+                } catch (...) {
+                    item.outcome = ItemOutcome::Failed;
+                    item.code = toString(item.outcome);
+                    item.detail = "исключение при проверке (неизвестное)";
+                }
                 progress_.taskFinished();
                 emitProgress(false);
             });
         } catch (const std::exception& error) {
+            submitFailed = true;
             core::LogFields fields = pathField(item.path);
             fields.push_back(core::logField("what", exceptionText(error)));
             core::logError(kEventJobFailed, "работа фазы проверок не поставлена в пул", std::move(fields));
@@ -668,7 +695,13 @@ bool CleanupExecutor::checkPhase(const std::vector<core::CleanupCandidate>& cand
 
     // Строки, до которых пул не дошёл (отмена или сбой постановки), остаются
     // нетронутыми: NotStarted — это «мы не начали», а не «операция не удалась».
-    for (std::size_t i = submitted; i < targets.size(); ++i) skipItem(items[targets[i]], ItemOutcome::NotStarted);
+    // Причину пишем явно: в отчёте «мы не успели» и «пользователь нажал Отмена» —
+    // разные утверждения, а молчаливое NotStarted читалось бы как «всё прошло».
+    for (std::size_t i = submitted; i < targets.size(); ++i) {
+        ItemReport& item = items[targets[i]];
+        skipItem(item, ItemOutcome::NotStarted);
+        if (submitFailed) item.detail = "работа не поставлена в пул: прогон прерван";
+    }
     emitProgress(false);
     return !runToken_.stop_requested();
 }
@@ -793,7 +826,7 @@ bool CleanupExecutor::recheckLock(std::string_view path, ItemReport& item) {
     item.lockStatus = locks::toString(info.state);
     item.lockDetail = locks::describe(info);
     if (info.free()) return true;
-    item.hr = static_cast<std::int32_t>(info.win32Error);
+    item.hr = hresultOrZero(info.win32Error);
     return false;
 }
 
@@ -948,7 +981,7 @@ void CleanupExecutor::trashItem(ItemReport& item, RunContext& run) {
     const vfs_paths::RootGuard root = vfs_paths::prepareRoot(item.ruleRoot);
     const vfs_paths::Guard guard = vfs_paths::checkRuleRoot(item.path, root);
     if (!guard.allowed()) {
-        item.hr = static_cast<std::int32_t>(guard.lastError);
+        item.hr = hresultOrZero(guard.lastError);
         skipItem(item, outcomeOf(guard.verdict));
         return;
     }
@@ -960,7 +993,7 @@ void CleanupExecutor::trashItem(ItemReport& item, RunContext& run) {
     const platform::TrashStageResult staged = platform::stageTrashItem(request, run.trashOptions);
 
     item.txId = run.txId;
-    item.hr = static_cast<std::int32_t>(staged.transfer.win32Error);
+    item.hr = hresultOrZero(staged.transfer.win32Error);
     item.attempts = 1;
     item.filesDone = staged.transfer.filesMoved;
     item.outcome = outcomeOf(staged.transfer.status);
@@ -1001,6 +1034,7 @@ bool CleanupExecutor::executePhase(std::vector<ItemReport>& items, RunContext& r
     const std::size_t workers = resolveWorkers(targets.size());
     WorkerPool pool(workers, runToken_, &progress_);
     std::size_t submitted = 0;
+    bool submitFailed = false;
     for (const std::size_t index : targets) {
         if (runToken_.stop_requested()) break;
         ItemReport& item = items[index];
@@ -1030,6 +1064,7 @@ bool CleanupExecutor::executePhase(std::vector<ItemReport>& items, RunContext& r
                 noteItem(item);
             });
         } catch (const std::exception& error) {
+            submitFailed = true;
             core::LogFields fields = pathField(item.path);
             fields.push_back(core::logField("what", exceptionText(error)));
             core::logError(kEventJobFailed, "работа фазы исполнения не поставлена в пул", std::move(fields));
@@ -1041,9 +1076,12 @@ bool CleanupExecutor::executePhase(std::vector<ItemReport>& items, RunContext& r
     pool.close();
 
     // Не начатые строки: объект цел, это «мы не успели», а не «не смогли».
+    // Причина (отмена или сбой постановки) пишется в строку, потому что по
+    // одному NotStarted их не различить.
     for (std::size_t i = submitted; i < targets.size(); ++i) {
         ItemReport& item = items[targets[i]];
         skipItem(item, ItemOutcome::NotStarted);
+        if (submitFailed) item.detail = "работа не поставлена в пул: прогон прерван";
         noteItem(item);
     }
     emitProgress(false);
@@ -1108,7 +1146,13 @@ void CleanupExecutor::prepareTrash(RunContext& run, const std::vector<ItemReport
     }
     run.trashDir = dir;
     run.trashReady = true;
-    txId_ = run.txId;
+    {
+        // Идентификатор транзакции читает toText() из журнала, а журнал пишется
+        // и из рабочего потока, поэтому запись — под тем же замком, что и
+        // публикация отчёта в finalize().
+        std::lock_guard lock(mutex_);
+        txId_ = run.txId;
+    }
 
     if (options_.logFailures) {
         core::LogFields fields = pathField(dir);
@@ -1199,15 +1243,9 @@ void CleanupExecutor::countTotals(const std::vector<ItemReport>& items, Executio
 }
 
 void CleanupExecutor::finalize(std::vector<ItemReport>& items, ExecutionReport& report, RunContext& run) {
-    // Строки, оставшиеся не начатыми (отмена пришла между фазами), получают
-    // окончательный исход до подсчёта: «не успели» и «отменили» — разные
-    // утверждения, и в отчёте обе должны быть видны.
-    for (ItemReport& item : items) {
-        if (item.outcome == ItemOutcome::NotStarted) {
-            skipItem(item, ItemOutcome::Cancelled);
-            item.detail = "отмена до начала операции";
-        }
-    }
+    // Окончательные исходы всем строкам уже проставлены до вызова (execute,
+    // шаг со NotStarted до сбора отказов), поэтому здесь только корзина,
+    // счётчики и публикация.
     finishTrash(run, report);
     countTotals(items, report);
     report.items = std::move(items);
@@ -1420,6 +1458,22 @@ ExecutionRefusal CleanupExecutor::execute(const std::vector<core::CleanupCandida
             return ExecutionRefusal::BadChecklist;
         }
     }
+    // Чек-лист — производная от плана, а не самостоятельное решение. Разошлись
+    // (другая сборка, устаревшая копия, ручная правка) — то подтверждённый
+    // dry-run (FR-5) и то, что сейчас пойдёт в работу, это разные списки, а
+    // выбрать «правильный» исполнитель не в его силах. Сверка двумя
+    // указателями за O(n + m): оба списка идут в порядке кандидатов (контракт
+    // core::CleanupPlan, по которому их строит buildChecklist), а квадрат на
+    // плане в 500 тысяч строк — это минуты ожидания перед первым удалением.
+    std::size_t planAt = 0;
+    for (const ChecklistEntry& entry : checklist.entries) {
+        while (planAt < plan.items.size() && plan.items[planAt].candidateIndex < entry.candidateIndex) ++planAt;
+        if (planAt >= plan.items.size() || plan.items[planAt].candidateIndex != entry.candidateIndex ||
+            plan.items[planAt].action != entry.action) {
+            logRefusal(ExecutionRefusal::BadChecklist, checklist);
+            return ExecutionRefusal::BadChecklist;
+        }
+    }
     if (runToken_.stop_requested()) {
         logRefusal(ExecutionRefusal::Cancelled, checklist);
         return ExecutionRefusal::Cancelled;
@@ -1448,10 +1502,21 @@ ExecutionRefusal CleanupExecutor::execute(const std::vector<core::CleanupCandida
 
     const std::int64_t startTick = steadyTicks();
     bool aborted = false;
+    // executePhase отмечает каждую строку ровно один раз (noteItem) — по мере
+    // того, как строки получают окончательный исход: полоса прогресса идёт
+    // вместе с удалением, а не прыгает в 100 % в конце. Если до неё не дошли
+    // (отмена, сбой постановки работы, исключение), строки не отмечены вовсе:
+    // счётчик прогресса застыл бы на нуле, а журнал не получил бы ни одной
+    // записи о прерванном прогоне. Отметить их обязан execute — у него есть все
+    // строки и их окончательные исходы.
+    bool itemsNoted = false;
     try {
         if (!checkPhase(candidates, items)) aborted = true;
         if (!aborted && !closePhase(items)) aborted = true;
-        if (!aborted) executePhase(items, run);
+        if (!aborted) {
+            executePhase(items, run);
+            itemsNoted = true;
+        }
     } catch (const std::exception& error) {
         // Прогон целиком не состоялся (например, память кончилась в середине
         // постановки). Отчёт всё равно публикуется: частично выполненная
@@ -1470,11 +1535,39 @@ ExecutionRefusal CleanupExecutor::execute(const std::vector<core::CleanupCandida
     report.cancelled = aborted || runToken_.stop_requested();
     report.duration = sinceTick(startTick);
 
+    // Строки, оставшиеся не начатыми, получают окончательный исход ДО сбора
+    // отказов: «пользователь нажал Отмена» и «пул не принял работу» — разные
+    // утверждения, и молчаливое NotStarted в отчёте выглядело бы как «всё
+    // прошло». Причину, набранную в фазе, сохраняем: она точнее общего текста.
+    for (ItemReport& item : items) {
+        if (item.outcome != ItemOutcome::NotStarted) continue;
+        const std::string reason = item.detail;
+        if (report.cancelled) {
+            item.outcome = ItemOutcome::Cancelled;
+            item.detail = reason.empty() ? std::string{"отмена до начала операции"} : reason;
+        } else {
+            // Отмены не было, а строка всё равно не начата: прогон прерван
+            // сбоем (например, память кончилась на постановке работы). Это
+            // отказ прогона, а не «пользователь отменил».
+            item.outcome = ItemOutcome::Failed;
+            item.detail =
+                reason.empty() ? std::string{"операция не начата: прогон прерван до постановки работы"} : reason;
+        }
+        item.code = toString(item.outcome);
+    }
+
+    // Прерванный прогон: строки всё равно уходят в журнал и в счётчики, иначе
+    // «очистку отменили» и «очистка ничего не тронула» выглядели бы одинаково.
+    // Повторно отмеченные строки (исключение ровно посередине executePhase)
+    // дадут лишь перебор itemsDone, который fraction() всё равно срезает в 1.0.
+    if (!itemsNoted) {
+        for (const ItemReport& item : items) noteItem(item);
+    }
+
     // Отказы в отчёт: часть строк может остаться не начатой, и их «мы не
-    // успели» тоже должно быть видно.
+    // успели» тоже должно быть видно — это делает шаг выше.
     for (const ItemReport& item : items) {
         addError(report, item, run);
-        (void)plan;  // план уже свёрнут в чек-лист; параметр оставлен для контракта и логов
     }
     finalize(items, report, run);
     return ExecutionRefusal::Completed;
@@ -1608,13 +1701,23 @@ std::string CleanupExecutor::toText() const {
     out += running() ? "прогон идёт" : "простой";
     out += ", прогонов ";
     out += std::to_string(generation());
-    if (!txId_.empty()) {
-        out += ", последняя транзакция корзины ";
-        out += txId_;
+    // Отчёт и идентификатор транзакции читаются под тем же замком, под каким
+    // публикуются: toText() зовут и из рабочего потока (запись в журнал), где
+    // гонка с finalize() — это чтение shared_ptr на полпути пересчёта счётчиков.
+    std::string txId;
+    ExecutionReportPtr report;
+    {
+        std::lock_guard lock(mutex_);
+        txId = txId_;
+        report = result_;
     }
-    if (result_) {
+    if (!txId.empty()) {
+        out += ", последняя транзакция корзины ";
+        out += txId;
+    }
+    if (report) {
         out += "; ";
-        out += result_->toText();
+        out += report->toText();
     }
     return out;
 }

@@ -41,7 +41,9 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <iterator>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 
 #include "core/log.hpp"
@@ -67,6 +69,12 @@ constexpr std::string_view kEventRotate{"engine.journal.rotate"};
 // Метка времени в имени архива: 16 знаков, чтобы лексикографический порядок
 // совпадал с хронологическим при любой длине числа.
 constexpr int kArchiveStampWidth = 16;
+
+// Хвост журнала, который перечитывается при открытии файла: нумерация записей
+// должна продолжиться после перезапуска процесса, а не начаться с единицы
+// снова. 64 КБ хватает на любую разумную длину строки, файл целиком читать
+// для этого незачем.
+constexpr std::uintmax_t kSequenceTailBytes = 64u * 1024u;
 
 bool isDigit(char c) noexcept {
     return c >= '0' && c <= '9';
@@ -361,6 +369,23 @@ bool readFileLimited(const std::string& path, std::uint64_t limit, std::string& 
     return true;
 }
 
+// Последние `limit` байт файла. Первая строка может оказаться разрезанной
+// границей чтения — разбор её пропустит, а следующая даст настоящий ответ.
+bool readFileTail(const std::string& path, std::uintmax_t limit, std::string& out) {
+    std::ifstream stream(nativePath(path), std::ios::binary);
+    if (!stream) return false;
+
+    std::error_code ec;
+    const std::uintmax_t size = fs::file_size(nativePath(path), ec);
+    if (ec) return false;
+
+    const std::uintmax_t offset = size > limit ? size - limit : 0;
+    stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!stream) return false;
+    out.assign(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+    return true;
+}
+
 std::vector<std::string> splitLines(const std::string& text) {
     std::vector<std::string> lines;
     std::size_t start = 0;
@@ -539,6 +564,10 @@ Value toJson(const JournalRecord& record) {
         members.emplace_back("hresult", Value(static_cast<double>(record.hresult)));
         members.emplace_back("path", Value(record.path));
         members.emplace_back("undoRef", Value(record.undoRef));
+        // Признак «операции нет в снимке» пишется только когда он истинен: у
+        // тысяч плановых операций лишний ключ в каждой строке — это шум при
+        // чтении журнала глазами и по jq (FR-8).
+        if (record.unplanned) members.emplace_back("unplanned", Value(true));
     }
     members.emplace_back("detail", Value(record.detail));
 
@@ -607,6 +636,7 @@ bool recordFromJson(const Value& value, JournalRecord& out, std::string& problem
         record.hresult = readNumber(value, "hresult", 0);
         record.path = readString(value, "path");
         record.undoRef = readString(value, "undoRef");
+        record.unplanned = readFlag(value, "unplanned");
     }
     record.detail = readString(value, "detail");
     record.appVersion = readString(value, "appVersion");
@@ -774,6 +804,12 @@ std::vector<TransactionSummary> summarize(const JournalScan& scan) {
                 target->snapshotFile = snapshotFileName(record.txId);
                 break;
             case JournalEvent::Operation:
+                // Расхождение плана и исполнения приходит из самой записи.
+                // Без этого счётчика `balanced()` на перечитанном журнале врал
+                // бы: незапланированные операции попадали в счётчики статусов и
+                // выглядели как согласованная транзакция (это ровно то, что ищут
+                // при разборе инцидента, §12).
+                if (record.unplanned) ++target->totals.unplanned;
                 switch (record.status) {
                     case OpStatus::Deleted:
                         ++target->totals.deleted;
@@ -904,25 +940,41 @@ JournalScan TransactionJournal::scanCurrent(const JournalOptions& options) {
         return scan;
     }
 
-    std::vector<std::string> ordered;
-    ordered.push_back(joinPath(options.rootDirectory, kJournalFileName));
-    for (const std::string& file : listArchivedFiles(options)) ordered.push_back(file);
+    // Текущий файл разбирается первым и остаётся «файлом журнала» в результате:
+    // его счётчики (tornTail, damagedLines) — его, и переносить их на архив
+    // нельзя.
+    scan = scanFile(joinPath(options.rootDirectory, kJournalFileName));
 
-    bool first = true;
-    for (const std::string& file : ordered) {
-        JournalScan part = scanFile(file);
-        if (first) {
-            scan = std::move(part);
-            first = false;
-            continue;
-        }
-        scan.files.push_back(file);
-        scan.records.insert(scan.records.end(), part.records.begin(), part.records.end());
+    // listArchivedFiles отдаёт свежие первыми, а записи склеиваются по времени:
+    // архивы от старых к новым, поверх них текущий файл. Обратный порядок был бы
+    // не просто неудобен: сводка идёт по записям подряд, и транзакция, начатая
+    // до ротации, получила бы свой tx.begin ПОСЛЕ своего tx.end — закрытая
+    // транзакция выглядела бы открытой, а pendingTransactions предлагал бы
+    // восстановление после давно завершённой очистки.
+    const std::vector<std::string> archived = listArchivedFiles(options);
+    if (archived.empty()) return scan;
+
+    std::vector<JournalScan> parts;
+    parts.reserve(archived.size());
+    for (auto it = archived.rbegin(); it != archived.rend(); ++it) parts.push_back(scanFile(*it));
+
+    std::vector<JournalRecord> records;
+    std::vector<std::string> problems;
+    for (const JournalScan& part : parts) {
+        records.insert(records.end(), part.records.begin(), part.records.end());
+        problems.insert(problems.end(), part.problems.begin(), part.problems.end());
         scan.tornTail += part.tornTail;
         scan.damagedLines += part.damagedLines;
-        scan.problems.insert(scan.problems.end(), part.problems.begin(), part.problems.end());
         scan.truncated = scan.truncated || part.truncated;
     }
+    records.insert(records.end(), scan.records.begin(), scan.records.end());
+    problems.insert(problems.end(), scan.problems.begin(), scan.problems.end());
+    scan.records = std::move(records);
+    scan.problems = std::move(problems);
+    // files остаются от свежих к старым, как объявлено у JournalScan: текущий
+    // файл уже в списке, дальше архивы в порядке имён.
+    for (const JournalScan& part : parts) scan.files.push_back(part.file);
+    std::reverse(scan.files.begin() + 1, scan.files.end());
     return scan;
 }
 
@@ -957,6 +1009,12 @@ struct TransactionJournal::Impl {
     // candidateIndex каждой запланированной операции в порядке снимка: по нему
     // результат сопоставляется с планом, и «лишний» результат виден сразу.
     std::vector<std::size_t> planned;
+    // Позиция той же операции по candidateIndex. Снимок — это и есть план, а он
+    // на практике бывает на десятки тысяч операций, и `recordOperation` зовёт
+    // пул исполнителя (§6.4): линейный поиск давал бы квадрат по числу
+    // операций на самом горячем пути журнала. Первое вхождение выигрывает —
+    // ровно как при линейном поиске.
+    std::unordered_map<std::size_t, std::size_t> plannedPositions;
 
     std::int64_t now() const {
         return options.nowMillis ? options.nowMillis() : nowUnixMillis();
@@ -1001,7 +1059,28 @@ struct TransactionJournal::Impl {
         std::error_code ec;
         const std::uintmax_t size = fs::file_size(nativePath(currentFile), ec);
         currentBytes = ec ? 0 : static_cast<std::uint64_t>(size);
+        resumeSequence();
         return true;
+    }
+
+    // Продолжить нумерацию записей с места, где файл остался в прошлый раз.
+    // Иначе после перезапуска в одном файле оказались бы две записи с seq = 1,
+    // и ссылка «запись N» в отчёте (SPEC §7.1) указывала бы на две разные
+    // строки. Записи одного файла нумеруются подряд, а не по сеансам.
+    void resumeSequence() {
+        std::string tail;
+        if (!readFileTail(currentFile, kSequenceTailBytes, tail)) return;
+        const std::vector<std::string> lines = splitLines(tail);
+        for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+            if (it->find_first_not_of(" \t\r") == std::string::npos) continue;
+            JournalRecord record;
+            std::string problem;
+            // Оборванный падением хвост не разбирается: пропускаем такую строку
+            // и берём номер у следующей целой.
+            if (!parseRecordLine(*it, record, problem)) continue;
+            if (record.sequence > sequence) sequence = record.sequence;
+            return;
+        }
     }
 
     void closeStream() {
@@ -1072,6 +1151,10 @@ struct TransactionJournal::Impl {
         std::error_code ec;
         fs::rename(nativePath(currentFile), nativePath(archive), ec);
         if (ec) {
+            // Журнал в архив не ушёл, но закрытым его оставлять нельзя: иначе
+            // отказ ротации молча оборвал бы запись до конца сеанса. Файл не
+            // урезался, следующая запись просто продолжит его.
+            (void)ensureOpen();
             noteError("журнал не переименован в архив: " + ec.message());
             return false;
         }
@@ -1136,10 +1219,8 @@ struct TransactionJournal::Impl {
     // Позиция операции в снимке. Ищем по candidateIndex, а не по позиции: снимок
     // хранит операции в порядке кандидатов, и сопоставлять надо с кандидатом.
     std::size_t positionOf(std::size_t candidateIndex) const {
-        for (std::size_t index = 0; index < planned.size(); ++index) {
-            if (planned[index] == candidateIndex) return index;
-        }
-        return planned.size();
+        const auto found = plannedPositions.find(candidateIndex);
+        return found == plannedPositions.end() ? planned.size() : found->second;
     }
 
     bool writeSnapshotLocked(const SnapshotRequest& request, SnapshotInfo& out);
@@ -1306,6 +1387,7 @@ bool TransactionJournal::Impl::endTransaction(TxState state, std::string detail)
     txOpen = false;
     txId.clear();
     planned.clear();
+    plannedPositions.clear();
     return written;
 }
 
@@ -1408,8 +1490,13 @@ BeginResult TransactionJournal::beginTransaction(const core::PlanSnapshot& snaps
 
     impl_->planned.clear();
     impl_->planned.reserve(snapshot.operations.size());
+    impl_->plannedPositions.clear();
+    impl_->plannedPositions.reserve(snapshot.operations.size());
     for (const core::PlanOperation& operation : snapshot.operations) {
         impl_->planned.push_back(operation.candidateIndex);
+        // `emplace` не перезаписывает ключ, поэтому первое вхождение
+        // candidateIndex остаётся на своей позиции — как и при линейном поиске.
+        impl_->plannedPositions.emplace(operation.candidateIndex, impl_->planned.size() - 1);
     }
 
     impl_->totals = TxTotals{};
@@ -1483,6 +1570,7 @@ bool TransactionJournal::recordOperation(const core::PlanOperation& operation, O
     record.path = operation.path;
     record.undoRef = std::move(undoRef);
     record.detail = std::move(detail);
+    record.unplanned = !planned;
     if (!planned) {
         // Результат по операции, которой не было в снимке: это расхождение плана
         // и исполнения, и журнал обязан его назвать, а не молча учесть.

@@ -521,12 +521,20 @@ struct ArgsCursor {
 };
 
 bool takeValue(ArgsCursor& cursor, const std::string& flag, std::string& value, std::string& problem) {
-    if (cursor.position + 1u >= cursor.items.size()) {
+    // Главный цикл разбора прочитал имя опции как items[position++], поэтому
+    // position уже указывает на СЛЕДУЮЩЕЕ слово — на значение. Значит:
+    //   * «значения нет» — это ровно position == items.size();
+    //   * значение читается по текущему position, и только потом position
+    //     двигается дальше.
+    // Чтение по position + 1 (как было) уходило на один элемент за конец
+    // вектора: в Debug это «vector subscript out of range» на
+    // «rules validate --set nosuchdir», в Release — тихо мусор в пути.
+    if (cursor.position >= cursor.items.size()) {
         problem = "опция " + flag + " требует значения";
         return false;
     }
-    ++cursor.position;
     value = cursor.items[cursor.position];
+    ++cursor.position;
     return true;
 }
 

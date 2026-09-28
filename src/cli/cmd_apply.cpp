@@ -1052,10 +1052,14 @@ PlanExit runApply(const std::vector<std::string>& args, const ApplyIo& io, const
 
     PlanExit code = prepareRun(options, io, env, out);
     if (code == PlanExit::Ok) {
-        if (options.json) {
-            // В машинном режиме текст плана уходит в err, stdout занят JSON.
-            printPlanText(options, io, out, /*beforeExecute=*/options.execute);
-        } else if (!options.execute) {
+        // Список операций печатается ровно один раз на запуск: без --execute
+        // это он и есть весь вывод команды, а с --execute его печатает
+        // executePlan — вместе со снимком состояния и до вопроса (FR-5).
+        // Ветка --json звала printPlanText ещё и при --execute, и список
+        // уходил в stderr дважды подряд.
+        if (!options.execute) {
+            // В машинном режиме текст плана уходит в err, stdout занят JSON
+            // (то же требование, что у `scan --json`).
             printPlanText(options, io, out, /*beforeExecute=*/false);
         }
         if (options.execute) {

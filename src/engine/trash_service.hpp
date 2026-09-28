@@ -517,6 +517,11 @@ private:
     // Перенос одного объекта с уже готовыми опциями — чтобы в цикле не
     // пересобирать TrashOptions на каждом файле.
     StageOutcome stagePrepared(std::string_view txId, std::string_view sourcePath, const platform::TrashOptions& opts);
+    // Тихий снос транзакции, которой сервис владел (admit с пустым openTxId) и в
+    // которой не лежит ни байта: каталог и запись в журнале, без warn в лог.
+    // Отличается от публичного abandon() только журналированием: там снос —
+    // происшествие, здесь обычный исход «первый элемент не лёг».
+    [[nodiscard]] bool dropEmptyOwned(std::string_view txId, const platform::TrashOptions& opts);
     // Снять каталог транзакции и привести журнал в соответствие с фактом:
     // содержимого больше нет. keepCollapsed=true — для вытеснения по лимиту и
     // для явного удаления пользователем: открытая транзакция схлопывается и

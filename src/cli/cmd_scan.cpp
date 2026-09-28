@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -52,6 +53,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -255,19 +257,94 @@ private:
 // Набор правил
 // ---------------------------------------------------------------------------
 
+// Значение переменной окружения в UTF-8. Отсутствие переменной и пустое
+// значение неразличимы намеренно: в локаторе правил «%TEMP%» и «%TEMP%» с
+// пустым значением означают одно и то же — подставлять нечего.
+//
+// Почему не std::getenv, два независимые причины:
+//
+//  1) MSVC помечает узкий getenv как C4996 («используйте _dupenv_s»), а слой
+//     собирается с /WX (src/cli/CMakeLists.txt) — то есть предупреждение
+//     становится ошибкой сборки и роняет всю цель mrproper_cli.
+//  2) Узкий вариант теряет не-ASCII. На русской Windows типичное
+//     USERPROFILE = «C:\Users\Дмитрий», и подстановка в локатор дала бы
+//     «C:\Users\??????» — тихая потеря мусора из отчёта, то есть скан врёт.
+//
+// Широкая пара _wgetenv_s + core::toUtf8 даёт UTF-8 — ровно то, чего ждёт
+// core::expandEnvironment (core/glob.hpp: значения наполняются из
+// GetEnvironmentVariableW). На хостах без широкой CRT — обычный getenv, там
+// окружение само по себе узкое.
+//
+// У MSVC _wgetenv_s не выделяет буфер, а заполняет выделенный вызывающим, и
+// сигналит о нехватке места через ERANGE вместе с нужным размером, поэтому
+// здесь буфер растёт по требованию. Три попытки достаточно: первая покрывает
+// всё, кроме нестандартно длинного значения, а предел нужен, чтобы «буфер не
+// растёт» не превратилось в бесконечный цикл.
+//
+// Определение скрыто #if, а не только вызов: на хосте без широкой CRT функция
+// была бы неиспользуемой, а -Wall -Wextra -Werror (src/cli/CMakeLists.txt)
+// превращают это в ошибку сборки — ровно тот класс поломки, которого §11.1
+// требует избежать, проверяя переносимый слой на любом хосте.
+#if defined(_WIN32)
+[[nodiscard]] std::optional<std::string> readWideEnvironmentValue(const std::string& name) {
+    constexpr std::size_t kInitialSlots = 1024;  // 2 КиБ: длиннее в Windows не бывает
+    constexpr int kMaxAttempts = 3;
+
+    // Имя переменной — ASCII-константа из kRuleEnvironmentNames, поэтому
+    // расширение символ в символ корректно без MultiByteToWideChar.
+    std::wstring wideName;
+    wideName.reserve(name.size());
+    for (const char symbol : name) {
+        wideName.push_back(static_cast<wchar_t>(static_cast<unsigned char>(symbol)));
+    }
+
+    std::wstring buffer(kInitialSlots, L'\0');
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        std::size_t required = 0;
+        const int status = _wgetenv_s(&required, buffer.data(), buffer.size(), wideName.c_str());
+        if (status == ERANGE) {
+            if (required <= buffer.size()) return std::nullopt;  // размер не растёт — выхода нет
+            buffer.assign(required, L'\0');
+            continue;
+        }
+        // EINVAL/ENOMEM/неизвестная ошибка и «переменной нет» трактуются
+        // одинаково: подставлять в локатор нечего, а различать их команде
+        // незачем — core::expandEnvironment в обоих случаях оставит шаблон
+        // неразрешённым.
+        if (status != 0) return std::nullopt;
+        // Буфер всегда нуль-терминирован (SAL _Out_writes_opt_z_), а wstring
+        // после записи CRT длины не знает — читаем до нуля.
+        const std::wstring_view text(buffer.c_str());
+        if (text.empty()) return std::nullopt;
+        return core::toUtf8(text);
+    }
+    return std::nullopt;
+}
+#endif  // defined(_WIN32)
+
+[[nodiscard]] std::optional<std::string> readEnvironmentValue(const std::string& name) {
+#if defined(_WIN32)
+    return readWideEnvironmentValue(name);
+#else
+    const char* value = std::getenv(name.c_str());
+    if (value == nullptr || *value == '\0') return std::nullopt;
+    return std::string(value);
+#endif
+}
+
 // Дамп переменных окружения для подстановки в локаторы. Формат — тот, что ждёт
-// core::loadRuleFiles: «NAME=value» по строке на переменную.
+// core::loadRuleFiles: «NAME=value» по строке на переменную. Переменных, которых
+// нет, в дампе нет вовсе: core::expandEnvironment помечает %НЕИЗВЕСТНО% как
+// неразрешённое, и такой локатор затем отбрасывается целиком.
 [[nodiscard]] std::string processEnvironmentDump() {
     std::string dump;
     for (const std::string_view name : kRuleEnvironmentNames) {
-        // Имена — ASCII, поэтому std::string безопасен и на Windows (getenv там
-        // ждёт узкую строку), и на любом хосте, где команда тоже собирается.
         const std::string key(name);
-        const char* value = std::getenv(key.c_str());
-        if (value == nullptr || *value == '\0') continue;
+        const std::optional<std::string> value = readEnvironmentValue(key);
+        if (!value.has_value()) continue;
         dump += key;
         dump += '=';
-        dump += value;
+        dump += *value;
         dump += '\n';
     }
     return dump;

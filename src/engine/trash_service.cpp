@@ -479,16 +479,27 @@ AdmitResult TrashService::admit(const AdmitRequest& request, const platform::Tra
     result.txId = txId;
     result.placed = result.stage.placed();
 
-    if (result.stage.cancelled() && ownsTx) {
-        // Отмена при уже перенесённых байтах: закрываем транзакцию манифестом,
-        // а не сносим каталог — снос удалил бы файлы без возможности отмены
-        // (правило 5). Пустую транзакцию сносим: каталог без манифеста — мусор.
+    if (ownsTx) {
         const core::TrashTransaction* open = ledger_.find(txId);
-        if (open != nullptr && open->items.empty()) {
-            (void)abandon(txId, opts);
+        if (result.stage.cancelled()) {
+            // Отмена при уже перенесённых байтах: закрываем транзакцию манифестом,
+            // а не сносим каталог — снос удалил бы файлы без возможности отмены
+            // (правило 5). Пустую транзакцию сносим: каталог без манифеста — мусор.
+            if (open != nullptr && open->items.empty()) {
+                (void)dropEmptyOwned(txId, opts);
+                result.txId.clear();
+            } else if (open != nullptr) {
+                result.commit = commit(txId, opts);
+            }
+        } else if (open != nullptr && open->items.empty()) {
+            // Ни байта не легло — и при отказе переноса каталог транзакции пуст,
+            // а пустой каталог без манифеста нельзя ни восстановить, ни посчитать
+            // (правило 10). Оставить его значило бы копить по каталогу на каждый
+            // прогон, где первый элемент не лёг: в следующем open() они читались
+            // бы как битые и попадали в отчёт как чужой мусор. Причина отказа уже
+            // записана внутри beginTransaction/stagePrepared.
+            (void)dropEmptyOwned(txId, opts);
             result.txId.clear();
-        } else if (open != nullptr) {
-            result.commit = commit(txId, opts);
         }
     }
 
@@ -772,6 +783,16 @@ CommitResult TrashService::commit(std::string_view txId, const platform::TrashOp
     return result;
 }
 
+// Тихий снос транзакции, которой сервис владел и в которой не лежит ни байта.
+// Отдельный путь вместо публичного abandon() намеренно: там снос — происшествие
+// («недоделанная транзакция снята по вызову»), а здесь обычный исход «корзина
+// недоступна» или «первый элемент не лёг», и warn на каждый такой прогон только
+// шумит в журнале. Причина уже записана в beginTransaction/stagePrepared.
+bool TrashService::dropEmptyOwned(std::string_view txId, const platform::TrashOptions& opts) {
+    PurgeReport report;
+    return purgeDirectory(txId, report, opts, /*keepCollapsed=*/false);
+}
+
 bool TrashService::abandon(std::string_view txId, const platform::TrashOptions& trashOptions) {
     const platform::TrashOptions opts = effective(trashOptions);
     if (txId.empty() || !core::isValidTxId(txId)) return false;
@@ -952,10 +973,18 @@ RestoreOutcome TrashService::restore(std::string_view txId, const core::RestoreP
     outcome.txId = std::string(txId);
     const platform::TrashOptions opts = effective(trashOptions);
 
-    if (txId.empty() || !core::isValidTxId(txId) || plan.items.empty()) return outcome;
+    if (txId.empty() || !core::isValidTxId(txId)) return outcome;
     const core::TrashTransaction* view = ledger_.find(txId);
     if (view == nullptr) {
         logFailure(options_.logFailures, kEventRestore, "транзакция не найдена в журнале", std::string(txId), 0, "not-found");
+        return outcome;
+    }
+    if (plan.items.empty()) {
+        // Возвращать нечего: всё в плане — Conflict (FR-7: не перезаписывать,
+        // спросить) либо потерянное содержимое. Это не отказ платформы, но
+        // элементы в транзакции остаются, и отчёт обязан назвать их число —
+        // иначе интерфейс покажет «осталось 0» при транзакции на 1200 файлов.
+        outcome.remainingItems = view->itemCount();
         return outcome;
     }
     if (!view->undoable()) {

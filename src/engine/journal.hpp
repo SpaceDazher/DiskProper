@@ -244,13 +244,21 @@ OpStatus statusForAction(core::PlanAction action, bool succeeded) noexcept;
 // «нулевым» состоянием, а не optional: лишний optional в горячем пути записи
 // (одна запись на операцию, их бывают тысячи) стоит дороже, чем проверка.
 struct JournalRecord {
-    std::uint64_t sequence{};   // сквозной номер записи в файле, начиная с 1
+    // Сквозной номер записи в файле, начиная с 1. Продолжается после
+    // перезапуска процесса: записи одного файла нумеруются подряд, а не по
+    // сеансам, иначе «запись N» в отчёте указывала бы на две разные строки.
+    std::uint64_t sequence{};
     std::int64_t atUnixMillis{};
     JournalEvent event{JournalEvent::Note};
     std::string txId;
     TxState state{TxState::Open};
     std::size_t operationIndex{};  // позиция операции в снимке
     bool hasOperation{false};      // false для событий без операции
+    // Операции не было в снимке плана. По этому флагу `summarize` восстанавливает
+    // `TxTotals::unplanned` при чтении журнала обратно. По одному индексу он не
+    // восстанавливается: для такой операции пишется candidateIndex, а он может
+    // случайно попасть в диапазон плана, поэтому флаг кладётся в запись явно.
+    bool unplanned{false};
     OpStatus status{OpStatus::Skipped};
     core::PlanAction action{core::PlanAction::Keep};
     std::uint64_t bytes{};         // фактически освобождено за операцию, 0 если не удаляли
@@ -510,8 +518,11 @@ public:
     // результат с записью в `problems`.
     static JournalScan scanFile(const std::string& path);
 
-    // Текущий файл плюс архивы, от свежих к старым: `records` в хронологическом
-    // порядке. `scanCurrent` — то, что вызывает экран «Отчёт» (§7.1) и CLI.
+    // Текущий файл плюс архивы. `files` перечислены от свежих к старым (так их
+    // удобнее показывать в отчёте), а `records` идут строго в хронологическом
+    // порядке: архивы от старых к новым, поверх них текущий файл. Порядок
+    // записей значим — по нему восстанавливается состояние транзакции, начатой
+    // до ротации. `scanCurrent` — то, что вызывает экран «Отчёт» (§7.1) и CLI.
     static JournalScan scanCurrent(const JournalOptions& options);
 
     // Архивы, свежие первыми. Имена сортируются меткой времени в имени, а не

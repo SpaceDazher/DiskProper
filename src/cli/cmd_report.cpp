@@ -393,13 +393,16 @@ std::vector<std::string> readStringArray(const json::Value& node, std::string_vi
 
 // «0x80070005» → 0x80070005. Код ошибки приходит строкой (SPEC §4 FR-6: в
 // отчёте видно, чем именно упало), а модель хранит число.
-std::uint32_t readErrorCode(const json::Value& node) {
-    const std::string text = readString(node, "code");
+std::uint32_t readErrorCode(std::string_view text) {
     if (text.empty()) return 0;
+    // std::stoull в наборе заголовков MSVC не имеет перегрузки для
+    // string_view (только wstring и string), поэтому текст копируется. Поле
+    // кода — короткая строка, копия не стоит ничего.
+    const std::string owned(text);
     try {
         std::size_t consumed = 0;
-        const unsigned long long parsed = std::stoull(text, &consumed, 0);
-        if (consumed != text.size()) return 0;
+        const unsigned long long parsed = std::stoull(owned, &consumed, 0);
+        if (consumed != owned.size()) return 0;
         return static_cast<std::uint32_t>(parsed);
     } catch (const std::exception&) {
         return 0;
@@ -483,10 +486,12 @@ public:
         if (!parseArrayOf(root, "candidates", "candidates", [this](const json::Value& node) { parseCandidate(node); })) {
             return false;
         }
-        if (!parseArrayOf(root, "operations", "operations", [this](const json::Value& node) { parseOperation(node); })) {
+        if (!parseArrayOf(root, "operations", "operations",
+                          [this](const json::Value& node) { parseOperation(node, report_.operations); })) {
             return false;
         }
-        if (!parseArrayOf(root, "untouched", "untouched", [this](const json::Value& node) { parseOperation(node); })) {
+        if (!parseArrayOf(root, "untouched", "untouched",
+                          [this](const json::Value& node) { parseOperation(node, report_.untouched); })) {
             return false;
         }
         if (!parseArrayOf(root, "errors", "errors", [this](const json::Value& node) { parseError(node); })) return false;
@@ -648,7 +653,7 @@ private:
         report_.candidates.push_back(std::move(candidate));
     }
 
-    void parseOperation(const json::Value& node) {
+    void parseOperation(const json::Value& node, std::vector<core::ReportOperation>& target) {
         if (!node.isObject()) {
             problem_ = "элемент не является объектом";
             return;
@@ -677,7 +682,10 @@ private:
             operation.status = statusFromToken(status->asString(), problem_);
             if (!problem_.empty()) return;
         }
-        report_.operations.push_back(std::move(operation));
+        // Раздел, куда попал элемент, задаёт вызывающий: «operations» и
+        // «untouched» — разные списки одного типа (SPEC §6.3), и сложение их в
+        // один теряло бы ответ на вопрос «что намеренно не тронули».
+        target.push_back(std::move(operation));
     }
 
     void parseError(const json::Value& node) {
@@ -777,7 +785,7 @@ core::HtmlReportInput toHtmlInput(const core::Report& report, const Options& opt
         issue.stage = error.scope;
         issue.subject = error.path.empty() ? error.operation : error.path;
         issue.message = error.message;
-        issue.code = readErrorCode(error);
+        issue.code = readErrorCode(error.code);
         input.issues.push_back(std::move(issue));
     }
 
@@ -810,12 +818,20 @@ struct ArgsCursor {
 };
 
 bool takeValue(ArgsCursor& cursor, const std::string& flag, std::string& value, std::string& problem) {
-    if (cursor.position + 1u >= cursor.items.size()) {
+    // Главный цикл разбора прочитал имя опции как items[position++], поэтому
+    // position уже указывает на СЛЕДУЮЩЕЕ слово — на значение. Значит:
+    //   * «значения нет» — это ровно position == items.size();
+    //   * значение читается по текущему position, и только потом position
+    //     двигается дальше.
+    // Чтение по position + 1 (как было) уходило на один элемент за конец
+    // вектора: в Debug это «vector subscript out of range» на
+    // «report --in scan.json», в Release — тихо мусор в пути.
+    if (cursor.position >= cursor.items.size()) {
         problem = "опция " + flag + " требует значения";
         return false;
     }
-    ++cursor.position;
     value = cursor.items[cursor.position];
+    ++cursor.position;
     return true;
 }
 

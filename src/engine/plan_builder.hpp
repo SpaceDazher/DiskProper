@@ -136,7 +136,7 @@ struct PlanItemView {
     std::string category;
     std::string displayName;
     std::string path;
-    std::uint64_t bytes{};  // аллоцированный объём: столько реально освободится
+    std::uint64_t bytes{};  // аллоцированный объём кандидата: столько освободится, если строка выбрана
     core::SafetyLevel safety{core::SafetyLevel::Review};
     int confidence{};
     core::PlanAction action{core::PlanAction::Keep};
@@ -288,6 +288,9 @@ public:
     // «Выбрать всё» и «снять всё» в дереве: галочки на видимых незаблокированных
     // строках, скрытые Risky и занятые элементы не трогаются.
     void selectAllVisible();
+    // «Только Safe» (третья цифра агрегатов, FR-5): Safe — выбраны, видимые
+    // остальные — сняты, скрытый Risky и занятые не трогаются.
+    void selectSafeOnly();
     void selectNone();
     [[nodiscard]] bool setCategorySelected(std::string_view category, bool selected);
     // Вернуть элемент к решению профиля.
@@ -299,6 +302,9 @@ public:
     [[nodiscard]] const PlanView& view() const noexcept { return view_; }
     // План для исполнителя: константная ссылка, переживает дальнейшие пересборки.
     [[nodiscard]] std::shared_ptr<const core::CleanupPlan> publishedPlan() const noexcept { return published_; }
+    // Указатели на элементы представления действительны до следующей пересборки
+    // (любой смены выборов или опций): тогда нужен index(), а не сохранённый
+    // указатель. Долгоживущая ссылка для исполнителя — publishedPlan().
     [[nodiscard]] const PlanItemView* item(std::size_t candidateIndex) const noexcept;
     [[nodiscard]] const PlanCategoryView* category(std::string_view name) const noexcept;
     [[nodiscard]] CleanupSummary summary() const;
