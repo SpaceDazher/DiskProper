@@ -1,0 +1,101 @@
+# MrProper: единый стиль C++ (SPEC §9.1, ADR-001).
+#
+# Этот файл описывает стиль УЖЕ НАПИСАННОГО кода (src/core, tests), а не новый:
+#   - отступ 4 пробела, табов нет;
+#   - открывающая скобка на строке объявления;
+#   - указатель и ссылка прижаты к типу слева: const std::int64_t& age;
+#   - модификаторы доступа на нулевой позиции тела класса;
+#   - короткие однострочные if без скобок: if (x) return y;
+#   - содержимое namespace не сдвигается;
+#   - комментарии и идентификаторы — по-русски (см. задание команды).
+#
+# Использование:
+#   clang-format -i src tests            # применить
+#   clang-format --dry-run --Werror src tests   # проверить, ничего не меняя
+#   (в Visual Studio: Ctrl+Shift+A, стиль "LLVM", файл берётся автоматически)
+#
+# Набор ключей намеренно скромный: только опции, существующие в clang-format
+# 11 и новее (ниже — 3.8 быть не может: AllowShortNamespacesOnASingleLine и
+# KeepEmptyLinesAtTheStartOfBlocks появились в 11). Неизвестный ключ заставляет
+# clang-format отвергнуть весь файл, а это тихий способ испортить
+# форматирование у всех. Проверено, что ключи не конфликтуют со стилем, уже
+# написанным в src/core и tests.
+Language: Cpp
+BasedOnStyle: LLVM
+# C++20. Latest вместо c++20 — чтобы не требовать clang-format ≥ 11.
+Standard: Latest
+
+# --- Колонки и отступы ------------------------------------------------------
+ColumnLimit: 120
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4          # public:/private: на нулевой позиции
+IndentCaseLabels: true
+NamespaceIndentation: None        # содержимое namespace не сдвигается
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+IndentPPDirectives: AfterHash
+
+# --- Скобки ----------------------------------------------------------------
+BreakBeforeBraces: Attach
+Cpp11BracedListStyle: true
+BreakConstructorInitializers: BeforeColon
+ConstructorInitializerIndentWidth: 4
+AllowAllParametersOfDeclarationOnNextLine: true
+AllowAllParametersOfDefinitionOnNextLine: true
+AllowShortBlocksOnASingleLine: Never
+AllowShortEnumsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+AllowShortNamespacesOnASingleLine: false
+# case 1: return one;  — clang-format ≥ 14 умеет KeepCase; на старых версиях
+# такой стиль не сохраняется, поэтому здесь он не задан. Правки вручную.
+
+# --- Выражения и указатели -------------------------------------------------
+AlignAfterOpenBracket: Align
+AlignOperands: Align
+AlignTrailingComments: true
+AlignEscapedNewlines: Left
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+BreakBeforeBinaryOperators: None   # оператор остаётся в конце строки
+BreakBeforeTernaryOperators: true
+DerivePointerAlignment: false
+PointerAlignment: Left
+ReferenceAlignment: Left
+SpaceBeforeParens: ControlStatements
+SpacesInAngles: Never
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SpacesInConditionalStatement: Never
+SpaceAfterTemplateKeyword: true
+SpacesBeforeTrailingComments: 2
+
+# --- Комментарии ------------------------------------------------------------
+ReflowComments: true
+CommentPragmas: '^[[:space:]]*\\?[[:space:]]*pragma'
+
+# --- Включения -------------------------------------------------------------
+# Свой заголовок → стандартные → прочие локальные. Порядок блоков не меняем:
+# в проекте «свой заголовок, пустая строка, <…>, пустая строка, "…»».
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+IncludeIsMainRegex: '([_-](test|unittest))?$'
+IncludeCategories:
+  - Regex: '^<[a-z_]+>$'
+    Priority: 3
+  - Regex: '^<[a-z_]+/'
+    Priority: 2
+  - Regex: '^<[a-z_]+/(.*/)?[a-z_]+>$'
+    Priority: 2
+  - Regex: '^<.+(\.h)?>$'
+    Priority: 4
+  - Regex: '^".*"$'
+    Priority: 1
+
+# --- Форматирование исходников (для унаследованного кода) -------------------
+FixNamespaceComments: true
+SortUsingDeclarations: true

@@ -1,0 +1,295 @@
+{
+  "version": 2,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "displayName": "MrProper: общая база (MSVC x64)",
+      "description": "Скрытая база: Visual Studio 2019 Build Tools — единственный тулчейн с C++ на этой машине (VS 2022 стоит без C++ workload, см. SPEC §8 Этап 0.0). Для VS 2022 есть отдельная база vs2022-base. Архитектура x64, экспорт compile_commands.json для clang-tidy",
+      "generator": "Visual Studio 16 2019",
+      "architecture": "x64",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "vs2022-base",
+      "hidden": true,
+      "displayName": "MrProper: общая база MSVC 2022 (SPEC §8 Этап 0)",
+      "description": "Скрытая база целевого тулчейна из спецификации: Visual Studio 2022 с рабочей нагрузкой C++. Работает на CI (windows-latest) и на машине, где установлен VS 2022 Build Tools; на текущей машине генератор недоступен, поэтому локальная разработка идёт через пресет dev",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "dev",
+      "inherits": "base",
+      "displayName": "MrProper: dev (SPEC §8 Этап 0: cmake --build --preset dev && ctest --preset dev)",
+      "description": "Именно этот пресет проверяет Этап 0 в спеке. Санитайзеры в нём выключены намеренно: на MSVC 19.29 (Visual Studio 2019 16.11) рантайм ASan не инициализируется, и проверка из спеки падала бы на пустом выводе программы. С санитайзерами — пресет asan-debug на тулчейне VS 2022",
+      "binaryDir": "${sourceDir}/build/Debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MRPROPER_BUILD_TESTS": "ON",
+        "MRPROPER_WARNINGS_AS_ERRORS": "ON",
+        "MRPROPER_SANITIZE": "OFF"
+      }
+    },
+    {
+      "name": "vs2022-dev",
+      "inherits": "vs2022-base",
+      "displayName": "MrProper: dev на MSVC 2022 (целевой тулчейн спецификации)",
+      "description": "То же, что dev, но на целевом тулчейке из SPEC §8 Этап 0.0: MSVC v143, где доступны std::stop_token, <format> и оба санитайзера",
+      "binaryDir": "${sourceDir}/build/vs2022-dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MRPROPER_BUILD_TESTS": "ON",
+        "MRPROPER_WARNINGS_AS_ERRORS": "ON",
+        "MRPROPER_SANITIZE": "OFF"
+      }
+    },
+    {
+      "name": "vs2022-asan-debug",
+      "inherits": "vs2022-base",
+      "displayName": "MrProper: Debug + ASan на MSVC 2022",
+      "description": "Спека требует «sanitizers в debug». На VS 2022 17.x это работает, на VS 2019 16.11 рантайм ASan не инициализируется (0xC0000142) — поэтому отдельный пресет, а не значение по умолчанию у dev",
+      "binaryDir": "${sourceDir}/build/vs2022-asan-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MRPROPER_BUILD_TESTS": "ON",
+        "MRPROPER_WARNINGS_AS_ERRORS": "ON",
+        "MRPROPER_SANITIZE": "address,undefined"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "displayName": "MrProper: Debug (то же, что tools\\build.bat Debug)",
+      "description": "Каталог build\\Debug общий с tools\\build.bat: чередование скрипта и пресета не приводит к двум разным деревьям сборки",
+      "binaryDir": "${sourceDir}/build/Debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MRPROPER_BUILD_TESTS": "ON",
+        "MRPROPER_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "MrProper: Release (то же, что tools\\build.bat Release)",
+      "description": "Каталог build\\Release общий с tools\\build.bat; префикс установки per-user, права администратора не нужны (SPEC §4 FR-9)",
+      "binaryDir": "${sourceDir}/build/Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MRPROPER_BUILD_TESTS": "ON",
+        "MRPROPER_WARNINGS_AS_ERRORS": "ON",
+        "CMAKE_INSTALL_PREFIX": "$env{LOCALAPPDATA}/Programs/MrProper"
+      }
+    },
+    {
+      "name": "asan-debug",
+      "inherits": "base",
+      "displayName": "MrProper: Debug + AddressSanitizer",
+      "description": "Проверочная сборка MSVC: на VS 2022 17.x (CI) работает /fsanitize=address. На VS 2019 16.11 — единственном тулчейне этой машины — отладочный и динамический рантайм ASan не инициализируется, процесс падает с 0xC0000142, поэтому проверять санитайзеры здесь нужно пресетами wsl-*. Отдельный каталог, чтобы ASan не закрепился в кэше обычной Debug-сборки",
+      "binaryDir": "${sourceDir}/build/asan-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MRPROPER_BUILD_TESTS": "ON",
+        "MRPROPER_WARNINGS_AS_ERRORS": "ON",
+        "MRPROPER_SANITIZE": "address"
+      }
+    },
+    {
+      "name": "wsl-base",
+      "hidden": true,
+      "displayName": "MrProper: общая база для WSL-хоста (GCC/Clang)",
+      "description": "Скрытая база для переносимого ядра: SPEC §6.1 и ADR-004 — ядро обязано собираться и проверяться на любом хосте, поэтому на Linux/Ubuntu-WSL доступны оба санитайзера",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "ninja-base",
+      "hidden": true,
+      "displayName": "MrProper: общая база для Ninja (одноконфигурационная сборка)",
+      "description": "Скрытая база: генератор Ninja из состава Visual Studio. Нужна там, где важна скорость и compile_commands.json — CMake 3.20 не выдаёт его для генератора Visual Studio, а без него не запускается clang-tidy (SPEC §9.1). Требует окружения MSVC (vcvars), то есть запускать из Developer Command Prompt",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "ninja-debug",
+      "inherits": "ninja-base",
+      "displayName": "MrProper: Ninja Debug + compile_commands.json",
+      "description": "Одноконфигурационная сборка: CMAKE_BUILD_TYPE здесь действует, в отличие от пресетов debug/release",
+      "binaryDir": "${sourceDir}/build/ninja-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MRPROPER_BUILD_TESTS": "ON",
+        "MRPROPER_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "ninja-release",
+      "inherits": "ninja-base",
+      "displayName": "MrProper: Ninja Release + compile_commands.json",
+      "description": "Быстрая проверка перед коммитом и основа для clang-tidy",
+      "binaryDir": "${sourceDir}/build/ninja-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MRPROPER_BUILD_TESTS": "ON",
+        "MRPROPER_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "wsl-debug",
+      "inherits": "wsl-base",
+      "displayName": "MrProper: WSL Debug + ASan/UBSan",
+      "description": "Сборка ядра и тестов на WSL с полным набором санитайзеров; MSVC-специфичные слои (platform, ui) в этом пресете не участвуют",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/wsl-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MRPROPER_BUILD_TESTS": "ON",
+        "MRPROPER_WARNINGS_AS_ERRORS": "ON",
+        "MRPROPER_SANITIZE": "address,undefined"
+      }
+    },
+    {
+      "name": "wsl-release",
+      "inherits": "wsl-base",
+      "displayName": "MrProper: WSL Release (проверка переносимости ядра)",
+      "description": "Сборка ядра и тестов на WSL без санитайзеров: ловит регрессии, завязанные на оптимизацию",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/wsl-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MRPROPER_BUILD_TESTS": "ON",
+        "MRPROPER_WARNINGS_AS_ERRORS": "ON",
+        "MRPROPER_SANITIZE": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "configuration": "Debug"
+    },
+    {
+      "name": "vs2022-dev",
+      "configurePreset": "vs2022-dev",
+      "configuration": "Debug"
+    },
+    {
+      "name": "vs2022-asan-debug",
+      "configurePreset": "vs2022-asan-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "configuration": "Release",
+      "cleanFirst": true
+    },
+    {
+      "name": "asan-debug",
+      "configurePreset": "asan-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "wsl-debug",
+      "configurePreset": "wsl-debug",
+      "jobs": 0
+    },
+    {
+      "name": "ninja-debug",
+      "configurePreset": "ninja-debug"
+    },
+    {
+      "name": "ninja-release",
+      "configurePreset": "ninja-release"
+    },
+    {
+      "name": "wsl-release",
+      "configurePreset": "wsl-release",
+      "jobs": 0
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "configuration": "Debug",
+      "displayName": "MrProper: ctest --preset dev (проверка Этапа 0 из SPEC §8)",
+      "output": {
+        "shortProgress": true,
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "vs2022-dev",
+      "configurePreset": "vs2022-dev",
+      "configuration": "Debug",
+      "displayName": "MrProper: тесты на MSVC 2022",
+      "output": {
+        "shortProgress": true,
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "configuration": "Debug",
+      "displayName": "MrProper: тесты Debug",
+      "description": "Полный вывод при падении: в CI нужен текст проверки, а не только код возврата",
+      "output": {
+        "shortProgress": true,
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "configuration": "Release",
+      "displayName": "MrProper: тесты Release",
+      "output": {
+        "shortProgress": true,
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "asan-debug",
+      "configurePreset": "asan-debug",
+      "configuration": "Debug",
+      "displayName": "MrProper: тесты Debug под ASan",
+      "description": "Прогон под AddressSanitizer обязателен перед волнами W09-W12: там появляются обход ФС и удаление файлов",
+      "output": {
+        "shortProgress": true,
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "wsl-debug",
+      "configurePreset": "wsl-debug",
+      "configuration": "Debug",
+      "displayName": "MrProper: тесты ядра на WSL под ASan/UBSan",
+      "output": {
+        "shortProgress": true,
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+    Манифест приложения MrProper.
+
+    Где это требование зафиксировано (docs/SPEC.md):
+      * §5 «Безопасность» — «всегда UAC-манифест», «рантайм-повышения нет;
+        повышение — один раз при старте»;
+      * §5 «Платформа» и «Совместимость» — Windows 10 22H2 / Windows 11 x64,
+        `_WIN32_WINNT=0x0A00`; поэтому Windows 7/8.1 здесь не объявляются;
+      * §5 «DPI» — Per-Monitor V2; §5 «Пути» — длинные пути, `\\?\`;
+      * §5 «Тема» и «Локализация» — системная тема, переводы в ресурсах;
+      * §8, Этап 5 — «манифест UAC (asInvoker + elevation helper)»;
+      * §10, риск «Установка требует прав, которые мы не хотим давать всему UI»;
+      * §12, Definition of Done — «приложение запускается без повышения прав».
+    Замечание: в постановке задачи стоит ссылка «§4 FR-9», но в текущей
+    редакции SPEC.md FR-9 — это «Настройки и политики», к манифесту отношения
+    не имеет; выше перечислены реальные требования.
+
+    Файл встраивается линкером в ресурс RT_MANIFEST (тип 24) .exe.
+
+    Три решения, которые здесь зафиксированы:
+
+    1. requestedExecutionLevel = asInvoker. Утилита запускается без прав
+       администратора (SPEC §5 «Безопасность», §8 Этап 5, §10, §12). Никакой
+       код не повышает права молча: если понадобится elevated-процесс (системные
+       категории мусора), это отдельный исполняемый файл, запускаемый через
+       ShellExecuteEx с глаголом "runas", и только после явного согласия
+       пользователя. uiAccess=false — приложению не нужен ввод в защищённый
+       рабочий стол.
+
+    2. compatibility: объявлен только Windows 10/11 (GUID {8e0f7a12-…} — один и
+       тот же для 10 и 11). Windows 7/8.1 намеренно НЕ объявлены: приложение
+       их не поддерживает, и без объявления ОС применяет маскирование поведения
+       для старых версий, которое тут не нужно.
+
+    3. windowsSettings: PerMonitorV2 (требование §5 «DPI»), UTF-8 как активная
+       кодовая страница и longPathAware (требование §5 «Пути», пути вида
+       \\?\). Порядок элементов внутри windowsSettings задан документацией
+       Microsoft и менять его нельзя.
+
+       Про activeCodePage=UTF-8: он объявляет, что узкие (не -W) API Win32
+       считают текущую кодовую страницу равной UTF-8, и это же задаёт /utf-8
+       компилятору. Ставить его можно только вместе с договорённостью, что
+       слой platform не использует ANSI-функции: иначе «узкая» строка,
+       посчитанная как CP1251, будет передана в систему как UTF-8 и даст
+       мусор в кириллических путях. Ось поведения — широкие API (-W).
+
+    ВАЖНО: этот файл встраивается ровно один раз. Не добавляй одновременно
+    "1 24 "app.manifest"" в version.rc и /MANIFEST:EMBED — два манифеста в одном
+    исполняемом файле ломают загрузку. Способ встраивания — в packaging/README.md.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!--
+      Версия здесь обязана совпадать с:
+        * project(MrProper VERSION ...) в CMakeLists.txt,
+        * FILEVERSION/PRODUCTVERSION в packaging/version.rc,
+        * выводом версии у mrproper-cli (опция с двойным тире).
+      Значение 0.1.0.0 соответствует project(MrProper VERSION 0.1.0).
+      Требование о единой версии приложения — §4 FR-8 (отчёт содержит версии
+      ОС/приложения), имя продукта в строках версии — §13.1, границы версий
+      (MVP v1.0, далее v1.1/v1.2) — §3.
+      Владелец CMake-файла — задачи 01/02, синхронизация описана в README.
+  -->
+  <assemblyIdentity type="win32"
+                   name="MrProper"
+                   version="0.1.0.0"
+                   processorArchitecture="amd64" />
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+        <!-- asInvoker: запускаемся с правами пользователя, без запроса UAC. -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 и Windows 11 используют один и тот же GUID. -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+    </application>
+  </compatibility>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- Обе строки про DPI: 2005 — для старых потребителей настройки,
+           2016 — для PerMonitorV2. Проверка идёт по более новой. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">UTF-8</activeCodePage>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

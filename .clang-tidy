@@ -1,0 +1,154 @@
+# MrProper: статический анализ (SPEC §9.1, ADR-001).
+#
+# Запуск:
+#   clang-tidy -p build/Debug src/core/json.cpp            # один файл
+#   run-clang-tidy -p build/Debug                          # все файлы цели
+#   clang-tidy -p build/Debug -fix-errors src tests        # с автоправкой
+# Важно: clang-tidy ищет .clang-tidy только в каталоге файла и выше, поэтому
+# конфиг обязан лежать в корне репозитория (файл .clang-format — там же).
+#
+# Что и почему выключено (список ниже, в Checks):
+#   bugprone-easily-swappable-parameters — в Win32-обёртках параметры типа
+#     DWORD/BOOL/HRESULT меняются местами постоянно, проверка даёт шум;
+#   bugprone-narrowing-conversions и -implicit-widening-of-multiplication-result —
+#     UINT/DWORD/size_t в платформенном коде требуют явных static_cast, который
+#     проверка всё равно посчитает лишним; вместо них /W4 + -Wconversion;
+#   bugprone-suspicious-enum-usage — в слое Win32 перечисления WinAPI обычны;
+#   cert-dcl21-cpp, cert-dcl58-cpp, cert-err34-c, cert-msc50-cpp — правила CERT
+#     для C, а не для C++20; применять их к этому проекту нельзя;
+#   cppcoreguidelines-* включены точечно (init-variables, owning-memory,
+#     no-malloc, slicing), полное семейство даёт больше тысячи замечаний.
+#
+# Требуется clang-tidy 16+ (проверки readability-function-size,
+# readability-function-cognitive-complexity появились в 15/16). На более старой
+# версии clang-tidy откажется читать файл из-за неизвестной проверки.
+#
+# Политика набора проверок:
+#   1. Сначала «-» для семейств, затем явное включение нужного — чтобы новые
+#      проверки в новой версии clang-tidy не приходили в проект молча.
+#   2. WarningsAsErrors пуст намеренно: жёсткий режим включается в CI ключом
+#      --warnings-as-errors='*' (задача 04), локально ошибка анализа не должна
+#      мешать сборке.
+#   3. Стиль — в .clang-format, здесь FormatStyle: file, чтобы tidy не
+#      переформатировал файл иначе, чем это сделает clang-format.
+---
+Checks: >
+  -*,
+  clang-diagnostic-*,
+  clang-analyzer-*,
+  bugprone-*,
+  performance-*,
+  cert-*,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-owning-memory,
+  cppcoreguidelines-no-malloc,
+  cppcoreguidelines-slicing,
+  modernize-use-override,
+  modernize-use-equals-default,
+  modernize-use-equals-delete,
+  modernize-use-emplace,
+  modernize-use-nullptr,
+  modernize-use-using,
+  modernize-use-bool-literals,
+  modernize-loop-convert,
+  modernize-make-unique,
+  modernize-pass-by-value,
+  modernize-return-braced-init-list,
+  readability-braces-around-statements,
+  readability-const-return-type,
+  readability-container-size-empty,
+  readability-convert-member-functions-to-static,
+  readability-delete-null-pointer,
+  readability-duplicate-include,
+  readability-function-cognitive-complexity,
+  readability-function-size,
+  readability-identifier-naming,
+  readability-misleading-indentation,
+  readability-misplaced-array-index,
+  readability-redundant-access-specifiers,
+  readability-redundant-casting,
+  readability-redundant-control-flow,
+  readability-redundant-declaration,
+  readability-redundant-string-cstr,
+  readability-redundant-string-init,
+  readability-simplify-boolean-expr,
+  readability-static-accessed-through-instance,
+  readability-string-compare,
+  readability-uniqueptr-delete-release,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-suspicious-enum-usage,
+  -cert-dcl21-cpp,
+  -cert-dcl58-cpp,
+  -cert-err34-c,
+  -cert-msc50-cpp
+
+WarningsAsErrors: ''
+# Важно: HeaderFilterRegex проверяется на ПОЛНОМ (абсолютном) пути, поэтому
+# якорь в начале строки не сработал бы никогда — каталог ищется в любом месте
+# пути, разделители и «\», и «/». Без этой поправки проверки в заголовках
+# молча не запускались бы вовсе.
+HeaderFilterRegex: '(^|[\\/])(src|tests)[\\/]'
+FormatStyle: file
+MaxTemporaryExpansion: 128
+CheckOptions:
+  # ── Стиль имён, принятый в проекте ────────────────────────────────────────
+  # Публичные структуры: Score, ScoreInput, Volume, Partition.
+  # Поля и функции: formatBytes, minAgeDays, resolvedLocator.
+  # Константы уровня файла: kMaxDepth, kRulesDir.
+  - key: ClassCase
+    value: CamelCase
+  - key: StructCase
+    value: CamelCase
+  - key: UnionCase
+    value: CamelCase
+  - key: EnumCase
+    value: CamelCase
+  - key: EnumConstantCase
+    value: CamelCase
+  - key: TypeAliasCase
+    value: CamelCase
+  - key: FunctionCase
+    value: camelBack
+  - key: MethodCase
+    value: camelBack
+  - key: ParameterCase
+    value: camelBack
+  - key: LocalVariableCase
+    value: camelBack
+  - key: ClassMemberCase
+    value: camelBack
+  - key: StaticVariableCase
+    value: camelBack
+  - key: ConstantCase
+    value: UPPER_CASE
+  - key: ConstexprVariableCase
+    value: CamelCase
+  - key: ConstexprVariablePrefix
+    value: k
+  - key: MacroDefinitionCase
+    value: UPPER_CASE
+  - key: NamespaceCase
+    value: lower_case
+  # ── Стиль без фигурных скобок: однострочные if — норма проекта ───────────
+  - key: readability-braces-around-statements.ShortStatementLines
+    value: '1'
+  - key: readability-braces-around-statements.AllowShortLoopBodiesOnASingleLine
+    value: 'false'
+  # ── Порог «сложности», выше которого код читается только по шагам ─────────
+  - key: readability-function-cognitive-complexity.Threshold
+    value: '25'
+  - key: readability-function-size.LineThreshold
+    value: '120'
+  - key: readability-function-size.StatementThreshold
+    value: '60'
+  # ── Windows-слой: <windows.h> под WIN32_LEAN_AND_MEAN разрешён; про
+  #    C-приведения и неявные bool/HRESULT-преобразования сказано в Checks.
+  - key: bugprone-suspicious-include
+    value: 'windows.h'
+  # ── Порядок вычислений: предупреждаем о баге, а не о вкусе ───────────────
+  - key: bugprone-branch-clone.Threshold
+    value: '2'
+  - key: bugprone-argument-comment.CommentAbove
+    value: 'true'

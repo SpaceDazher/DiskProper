@@ -1,0 +1,66 @@
+# MrProper: правила для редакторов (SPEC §9.1, ADR-001).
+#
+# Зачем при наличии .clang-format: .clang-format переформатирует код по кнопке,
+# .editorconfig не даёт редактору испортить файл уже при сохранении — разные
+# отступы, CRLF вместо LF, отсутствующий перевод строки в конце. Отступы и
+# предел строки здесь обязаны совпадать с .clang-format, иначе «формат по
+# кнопке» и «сохранить файл» будут драться.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+max_line_length = 120
+tab_width = 4
+
+# Правила очистки и манифест набора — это данные, а не код: их читает и человек
+# глазами, и загрузчик. Два пробела, как принято в JSON вообще.
+[*.{json,jsonc}]
+indent_size = 2
+insert_final_newline = true
+
+[*.{yml,yaml}]
+indent_size = 2
+
+# Markdown: висячие два пробела в конце строки — это перевод строки, а не мусор.
+[*.{md,markdown}]
+indent_size = 2
+max_line_length = off
+trim_trailing_whitespace = false
+
+# Пакетные и PowerShell-скрипты: cmd.exe и PowerShell штатно ждут CRLF, а git с
+# autocrlf=true всё равно отдаст их с CRLF. LF-версия .bat работает, но
+# постоянно конфликтует при чекине.
+[*.{bat,cmd,ps1,psm1}]
+end_of_line = crlf
+indent_style = space
+indent_size = 4
+
+# CMake: отступ 4, как в остальном проекте, никаких табов.
+[CMakeLists.txt]
+indent_style = space
+indent_size = 4
+
+[*.cmake]
+indent_style = space
+indent_size = 4
+
+# Ресурсы Windows (.rc) следуют стилю исходников.
+[*.rc]
+indent_style = space
+indent_size = 4
+end_of_line = crlf
+
+# Тестовые фикстуры — большие файлы данных, выравнивание в них бессмысленно.
+[tests/fixtures/*]
+max_line_length = off
+trim_trailing_whitespace = false
+
+# Каталог сборки — машинный вывод, не правится руками.
+[build/**]
+insert_final_newline = unset
+trim_trailing_whitespace = unset

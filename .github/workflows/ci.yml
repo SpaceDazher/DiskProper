@@ -1,0 +1,346 @@
+# =============================================================================
+# MrProper — непрерывная интеграция.
+#
+# Спека: SPEC §11 п.0 — «CI (GitHub Actions, windows-latest) … Матрица:
+# Debug/ASan+UBSan, Release; шаги configure → build → ctest → clang-tidy»;
+# §9.1 ADR-010 — репозиторий публичный, значит CI на публичных раннерах;
+# §8 Этап 0 — тулчейн это MSVC из состава Visual Studio.
+#
+# Три ворота, три отдельных статуса в статус-баре PR:
+#   build — матрица Debug, Debug+ASan/UBSan, Release: tools\build.bat, затем
+#           tools\test.bat;
+#   tidy  — clang-tidy по compile_commands.json, любое замечание = ошибка;
+#   sbom  — CycloneDX-SBOM собранного Release (нужен, чтобы «в чём собрано»
+#           читалось из артефакта, а не из догадок: репозиторий публичный).
+#
+# Почему продукт собирает скрипт, а не «cmake прямо в YAML»:
+#   * сборка — это MSVC с /W4 /WX из CMakeLists.txt, и проверить её может
+#     только настоящий cl.exe; матрица по ОС здесь бессмысленна (ADR-001);
+#   * tools\build.bat сам находит vcvars64 через vswhere (-products * -requires
+#     Microsoft.VisualStudio.Component.VC.Tools.x86.x64), то есть образ
+#     windows-latest подходит без правок скрипта;
+#   * если CI собирает не тем путём, что команда проверяет локально, зелёный
+#     статус перестаёт что-либо значить. Прямой вызов cmake в пайплайне есть
+#     ровно один раз, и он ничего не производит — только базу компиляции для
+#     clang-tidy (job tidy).
+#
+# Про ctest: SPEC §11 перечисляет «ctest», но в проекте ту же роль играет
+# tools\test.bat (SPEC §8, Этап 0) — тот же исполняемый файл, что и
+# зарегистрирован в CTest. Прямой ctest в CI не зовём намеренно: иначе
+# расхождение между «проверено локально» и «проверено в CI» снова становится
+# возможным, а именно его ворота и должны исключать.
+#
+# Никаких paths-фильтров: правки docs/ тоже проходят ворота, потому что DoD
+# из SPEC §12 проверяется человеком по итогам этого прогона.
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  # Ручной запуск: тот же контракт, что у PR, но без ограничения веткой.
+  workflow_dispatch:
+  schedule:
+    # Ночной прогон обеих конфигураций: образ windows-latest, Visual Studio и
+    # LLVM обновляются без нашего участия, и поломку из-за обновления раннера
+    # надо находить до релиза, а не после жалобы пользователя.
+    # Внимание: cron в GitHub Actions всегда UTC, ключа timezone здесь не
+    # существует (валидатор workflow его отвергает) — 02:17 UTC это 05:17 МСК.
+    - cron: "17 2 * * *"
+
+# Пайплану нужно только читать репозиторий. Никаких прав на запись: ворота не
+# имеют права ни публиковать что-либо, ни подписывать сборки (ADR-009).
+permissions:
+  contents: read
+
+# Новый пуш в тот же PR гасит предыдущий прогон — экономим минуты раннера.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: build + test (${{ matrix.label }})
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      # Обе конфигурации докладываются даже если одна из них упала: разбирать
+      # две красные копии быстрее, чем перезапускать.
+      fail-fast: false
+      matrix:
+        # config — то, что понимает tools\build.bat (имя каталога и --config),
+        # sanitize — переменная окружения MRPROPER_SANITIZE, tag — безопасное
+        # имя артефакта (в имени нельзя «/» и «:»).
+        #
+        # Ноги Debug и Debug+ASan/UBSan собираются в один и тот же каталог
+        # build\Debug, но это разные раннеры: кэш сборки у каждого свой,
+        # поэтому подмена конфигурации между ними невозможна.
+        include:
+          - config: Debug
+            sanitize: "OFF"
+            tag: debug
+            label: "Debug"
+          - config: Release
+            sanitize: "OFF"
+            tag: release
+            label: "Release"
+          # SPEC §11 п.0 требует в матрице «Debug/ASan+UBSan». Санитайзеры
+          # включаются переменной окружения, а не -D: tools\build.bat передаёт
+          # только -DCMAKE_BUILD_TYPE, а MRPROPER_SANITIZE читается в
+          # cmake/MrProperOptions.cmake именно из окружения. Сборка при этом
+          # остаётся той же — тот же скрипт, тот же тулчейн, тот же /WX.
+          # На VS 2022 17.6+ (windows-latest) доступны оба флага; на более
+          # старом MSVC cmake/MrProperSanitizers.cmake отбрасывает undefined с
+          # предупреждением, а не с ошибкой.
+          - config: Debug
+            sanitize: "address,undefined"
+            tag: debug-asan
+            label: "Debug + ASan/UBSan"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # build.bat печатает путь к vcvars и версию CMake — этого достаточно,
+      # чтобы отличить «сломался код» от «сменился тулчейн» без лишнего шага.
+      # Побочный эффект: генератор по умолчанию на раннере — Visual Studio
+      # (multi-config), поэтому CMake печатает предупреждение о том, что
+      # CMAKE_EXPORT_COMPILE_COMMANDS им не поддерживается. Это ожидаемо и не
+      # является поломкой: база компиляции для clang-tidy собирается
+      # отдельно, генератором Ninja, в job tidy.
+      - name: Сборка — tools\build.bat ${{ matrix.config }}
+        shell: pwsh
+        env:
+          MRPROPER_SANITIZE: ${{ matrix.sanitize }}
+        run: |
+          & cmd /c "tools\build.bat ${{ matrix.config }}"
+          if ($LASTEXITCODE -ne 0) {
+            throw "tools\build.bat ${{ matrix.config }} завершился с кодом $LASTEXITCODE"
+          }
+
+      # Лог тестов сохраняем артефактом: для утилиты, которая удаляет данные,
+      # перечень пройденных проверок — часть доказательства, а не Console.log.
+      - name: Тесты — tools\test.bat ${{ matrix.config }}
+        shell: pwsh
+        run: |
+          $log = "test-${{ matrix.config }}.log"
+          & cmd /c "tools\test.bat ${{ matrix.config }}" *> $log
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log
+          if ($code -ne 0) {
+            throw "tools\test.bat ${{ matrix.config }} завершился с кодом $code"
+          }
+
+      - name: Артефакты сборки
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mrproper-${{ matrix.tag }}
+          if-no-files-found: error
+          retention-days: 14
+          # MSVC — многоконфигурационный генератор, поэтому двоики лежат в
+          # build\<Config>\<Config>\. Второй набор шаблонов закрывает
+          # одноконфигурационный генератор (его выберет Ninja-пресет из
+          # CMakePresets.json, когда появится). Пустой результат — ошибка шага,
+          # а не тихий «сборка ничего не дала».
+          path: |
+            build/${{ matrix.config }}/${{ matrix.config }}/*.exe
+            build/${{ matrix.config }}/*.exe
+            build/${{ matrix.config }}/${{ matrix.config }}/*.dll
+            build/${{ matrix.config }}/*.dll
+            build/${{ matrix.config }}/${{ matrix.config }}/*.pdb
+            build/${{ matrix.config }}/*.pdb
+            build/${{ matrix.config }}/${{ matrix.config }}/*.lib
+            build/${{ matrix.config }}/*.lib
+
+      # Лог упавших тестов — единственное, что нужно для разбора, поэтому он
+      # попадает в артефакты даже при красном job.
+      - name: Лог тестов при падении
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mrproper-test-log-${{ matrix.tag }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: test-${{ matrix.config }}.log
+
+  tidy:
+    name: clang-tidy
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Ворота не должны молча деградировать в «ничего не проверил»: если
+      # правил анализа или самого анализатора нет, шаг падает с внятной причиной.
+      - name: Найти clang-tidy, clang-cl и ninja
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath ".clang-tidy")) {
+            throw "Нет .clang-tidy в корне репозитория: правила статического анализа не заданы, ворота clang-tidy применить не к чему."
+          }
+
+          # Образ windows-latest несёт LLVM и Ninja (CMake 3.3x, LLVM 20.x),
+          # но положить их в PATH может и не оказаться — отсюда явный поиск
+          # сначала в PATH, потом в типовых каталогах установки.
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          $vsNinja = "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja"
+
+          function Resolve-Tool([string]$name, [string]$fallbackDir) {
+            $cmd = Get-Command $name -ErrorAction SilentlyContinue
+            if ($cmd) { return $cmd.Source }
+            $guess = Join-Path $fallbackDir "$name.exe"
+            if (Test-Path -LiteralPath $guess) { return $guess }
+            return ""
+          }
+
+          $tidyExe = Resolve-Tool "clang-tidy" $llvmBin
+          $clExe = Resolve-Tool "clang-cl" $llvmBin
+          $ninjaExe = Resolve-Tool "ninja" $vsNinja
+          if (-not $ninjaExe) {
+            $ninjaExe = Resolve-Tool "ninja" "C:\Program Files\CMake\bin"
+          }
+
+          if (-not $tidyExe) { throw "clang-tidy не найден: ни в PATH, ни в $llvmBin\clang-tidy.exe" }
+          if (-not $clExe) { throw "clang-cl не найден: ни в PATH, ни в $llvmBin\clang-cl.exe" }
+          if (-not $ninjaExe) { throw "ninja не найден: он нужен генератору CMake, а без него нет compile_commands.json" }
+
+          & $tidyExe --version
+          & $clExe --version
+          & $ninjaExe --version
+
+          "CLANG_TIDY=$tidyExe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CLANG_CL=$clExe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "NINJA_EXE=$ninjaExe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Это единственное место в пайплайне, где cmake вызывается напрямую, и
+      # оно ничего не производит: нужен только compile_commands.json для
+      # clang-tidy, ни один целевой файл здесь не собирается. Продукт
+      # собирается исключительно tools\build.bat.
+      # Конфигурация — Ninja + clang-cl: состав исходников, include-пути и
+      # флаги берутся из CMakeLists.txt, а не из копии правил в CI. clang-cl
+      # сам находит установленный MSVC, поэтому vcvars64 этому шагу не нужен.
+      - name: База компиляции для clang-tidy (Ninja + clang-cl)
+        shell: pwsh
+        run: |
+          $cmakeArgs = @(
+            "-S", "."
+            "-B", "build/tidy"
+            "-G", "Ninja"
+            "-DCMAKE_MAKE_PROGRAM=$env:NINJA_EXE"
+            "-DCMAKE_BUILD_TYPE=Release"
+            "-DCMAKE_CXX_COMPILER=$env:CLANG_CL"
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+          )
+          cmake @cmakeArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "cmake configure для базы компиляции не удался (код $LASTEXITCODE)"
+          }
+          if (-not (Test-Path -LiteralPath "build/tidy/compile_commands.json")) {
+            throw "cmake не создал build/tidy/compile_commands.json"
+          }
+
+      # --warnings-as-errors=* поднимает любое замечание clang-tidy до ошибки:
+      # иначе ворота «прошли» бы при полной пустоте сигнала. Файлы передавать
+      # не нужно — без них clang-tidy проверяет всю базу компиляции, а список
+      # печатается, чтобы по логу было видно объём проверки (и пустую базу мы
+      # ловим как ошибку).
+      - name: Прогнать clang-tidy по всем файлам базы
+        shell: pwsh
+        run: |
+          $db = Get-Content -LiteralPath "build/tidy/compile_commands.json" -Raw | ConvertFrom-Json
+          $files = @($db | ForEach-Object { $_.file } | Sort-Object -Unique)
+          if ($files.Count -eq 0) {
+            throw "compile_commands.json пуст: clang-tidy нечего проверять"
+          }
+          Write-Host ("Файлов к проверке: {0}" -f $files.Count)
+
+          $log = "clang-tidy.log"
+          & $env:CLANG_TIDY -p build/tidy "--warnings-as-errors=*" *> $log
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath $log
+          if ($code -ne 0) {
+            throw "clang-tidy вернул код $code"
+          }
+
+      - name: Приложить протокол tidy
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-log
+          if-no-files-found: ignore
+          retention-days: 14
+          path: clang-tidy.log
+
+  sbom:
+    name: SBOM (CycloneDX)
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      # Ровно то, что нужно этому job: прочитать исходники и забрать артефакт
+      # соседнего job.
+      #
+      # Публикация в раздел Security → Dependencies здесь намеренно не
+      # включается. У anchore/sbom-action есть вход dependency-snapshot, но он
+      # отправляет в API зависимостей снимок манифестов репозитория, а у нас
+      # на руках SBOM собранных бинарников: это разные сущности, и подмена
+      # одного другим записала бы в раздел Security чужую правду. Публикация
+      # потребовала бы и токена с Contents: write, и включённого dependency
+      # graph — то есть настройки репозитория, а не workflow. Готовый файл
+      # уезжает артефактом, откуда его публикуют отдельно и осознанно.
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Только релизная сборка: SBOM описывает то, что получает пользователь.
+      # Ноги Debug и Debug+ASan не публикуются — это проверочные сборки.
+      - name: Забрать бинарники Release
+        uses: actions/download-artifact@v4
+        with:
+          name: mrproper-release
+          path: bin
+
+      - name: Сформировать SBOM (syft, CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: bin
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          # Файл сам по себе — полезный артефакт, дефолтный sbom-артефакт
+          # действия нам не нужен: ниже он один, с внятным именем.
+          upload-artifact: false
+
+      # Самопроверка: пустой или нечитаемый SBOM — это не SBOM. Компонентов
+      # может не быть вовсе (утилита собирается на голом MSVC, сторонних
+      # библиотек в ней нет — это и есть ожидаемый результат), поэтому
+      # отсутствие компонентов печатается предупреждением, а не ошибкой.
+      - name: Проверить, что SBOM пригоден
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath "sbom.cdx.json")) {
+            throw "sbom.cdx.json не создан: шаг syft отработал вхолостую."
+          }
+          $sbom = Get-Content -LiteralPath "sbom.cdx.json" -Raw | ConvertFrom-Json
+          if ($sbom.bomFormat -ne "CycloneDX") {
+            throw "Ожидался bomFormat=CycloneDX, получено '$($sbom.bomFormat)'."
+          }
+          if (-not $sbom.specVersion) {
+            throw "В SBOM нет specVersion — файл неполный."
+          }
+          $components = @($sbom.components).Count
+          Write-Host ("SBOM: {0}, specVersion {1}, компонентов {2}" -f $sbom.bomFormat, $sbom.specVersion, $components)
+          if ($components -eq 0) {
+            Write-Host "Компонентов нет: у MrProper нет сторонних зависимостей (SPEC §8, Этап 0), это ожидаемо."
+          }
+
+      - name: Приложить SBOM к прогону
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,131 @@
+// Ресурс версии и метаданных MrProper.
+//
+// Зачем он нужен: эти поля Windows показывает в свойствах .exe, в диспетчере
+// задач, в «Программы и компоненты» и в диалоге файла. Требования спеки:
+// §4 FR-8 — отчёт обязан содержать версию приложения; §13.1 — имя продукта
+// MrProper используется в строках версии; §3 — границы версий (MVP v1.0).
+// Версия поэтому живёт в одном месте и не собирается из строк в разных
+// файлах кода.
+//
+// Встраивание (владелец CMake — задачи 01/02, манифест подключается рядом с
+// ним, полный сниппет в packaging/README.md):
+//
+//   target_sources(mrproper_app WIN32 PRIVATE packaging/version.rc)
+//   target_link_options(mrproper_app PRIVATE
+//       /MANIFEST:EMBED
+//       "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/packaging/app.manifest")
+//
+// Версию можно переопределить из CMake, не правя этот файл: все значения ниже
+// защищены #ifndef и подставляются через /D. Например, из project(VERSION):
+//   target_compile_definitions(mrproper_app PRIVATE
+//       MRPROPER_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+//       MRPROPER_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+//       MRPROPER_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+//       MRPROPER_VERSION_BUILD=0
+//       MRPROPER_FILEVERSION_STRING="${PROJECT_VERSION}.0"
+//       MRPROPER_PRODUCTVERSION_STRING="${PROJECT_VERSION}.0")
+//
+// Русские строки в ресурсе лежат в UTF-8, поэтому страницу кода задаёт
+// директива ниже; без неё rc.exe прочитает файл как ANSI и испортит текст.
+#pragma code_page(65001)
+
+#include <winver.h>
+
+// Числовая версия: четыре числа, как в FILEVERSION/PRODUCTVERSION.
+#ifndef MRPROPER_VERSION_MAJOR
+#define MRPROPER_VERSION_MAJOR 0
+#endif
+#ifndef MRPROPER_VERSION_MINOR
+#define MRPROPER_VERSION_MINOR 1
+#endif
+#ifndef MRPROPER_VERSION_PATCH
+#define MRPROPER_VERSION_PATCH 0
+#endif
+#ifndef MRPROPER_VERSION_BUILD
+#define MRPROPER_VERSION_BUILD 0
+#endif
+
+// Строковые версии задаются целиком, а не собираются из чисел: у
+// препроцессора rc.exe нельзя надёжно склеивать строки, и такая попытка
+// молча даст мусор в свойствах файла.
+#ifndef MRPROPER_FILEVERSION_STRING
+#define MRPROPER_FILEVERSION_STRING "0.1.0.0"
+#endif
+#ifndef MRPROPER_PRODUCTVERSION_STRING
+#define MRPROPER_PRODUCTVERSION_STRING "0.1.0.0"
+#endif
+
+// Метаданные издателя. CompanyName и Copyright — плейсхолдеры: перед релизом
+// их обязан заменить владелец сборки на настоящего правообладателя,
+// иначе свойства файла будут врать пользователю.
+#ifndef MRPROPER_COMPANY_NAME
+#define MRPROPER_COMPANY_NAME "MrProper"
+#endif
+#ifndef MRPROPER_COPYRIGHT
+#define MRPROPER_COPYRIGHT "Copyright (C) MrProper"
+#endif
+
+#ifndef MRPROPER_INTERNAL_NAME
+#define MRPROPER_INTERNAL_NAME "MrProper"
+#endif
+#ifndef MRPROPER_ORIGINAL_FILENAME
+#define MRPROPER_ORIGINAL_FILENAME "MrProper.exe"
+#endif
+
+// FILEFLAGS зависит от конфигурации: в Debug в ресурс попадает VS_FF_DEBUG.
+// Именно VS_FF_DEBUG, а не VIF_DEBUG: такого имени в winver.h нет, и rc.exe в
+// Debug-конфигурации падал бы с RC2104.
+//
+// ВАЖНО о том, как эта ветка включается: сам rc.exe символ _DEBUG не
+// определяет (проверено — сборка без ключей даёт dwFileFlags=0x0, сборка с
+// /D_DEBUG даёт dwFileFlags=0x1). Определение приходит только из командной
+// строки. Если сборка его не передаёт, файл останется валидным, просто без
+// бита «отладочная сборка»; обычные target_compile_definitions в CMake попадают
+// в CL, а не в RC, поэтому включать это должен владелец CMake-файла явно
+// (способ — в packaging/README.md, §1). Проверять resource.rc нужно и в Debug.
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION MRPROPER_VERSION_MAJOR,MRPROPER_VERSION_MINOR,MRPROPER_VERSION_PATCH,MRPROPER_VERSION_BUILD
+    PRODUCTVERSION MRPROPER_VERSION_MAJOR,MRPROPER_VERSION_MINOR,MRPROPER_VERSION_PATCH,MRPROPER_VERSION_BUILD
+    FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+    FILEFLAGS VS_FF_DEBUG
+#else
+    FILEFLAGS 0x0L
+#endif
+    FILEOS VOS_NT_WINDOWS32
+    FILETYPE VFT_APP
+    FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "VarFileInfo"
+    BEGIN
+        // 0x419/1200 — русский в UTF-16, 0x409/1200 — английский в UTF-16.
+        VALUE "Translation", 0x419, 1200, 0x409, 1200
+    END
+
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", MRPROPER_COMPANY_NAME
+            VALUE "FileDescription", "MrProper — очистка диска"
+            VALUE "FileVersion", MRPROPER_FILEVERSION_STRING
+            VALUE "InternalName", MRPROPER_INTERNAL_NAME
+            VALUE "LegalCopyright", MRPROPER_COPYRIGHT
+            VALUE "OriginalFilename", MRPROPER_ORIGINAL_FILENAME
+            VALUE "ProductName", "MrProper"
+            VALUE "ProductVersion", MRPROPER_PRODUCTVERSION_STRING
+        END
+
+        BLOCK "04090409"
+        BEGIN
+            VALUE "CompanyName", MRPROPER_COMPANY_NAME
+            VALUE "FileDescription", "MrProper — Disk Cleanup"
+            VALUE "FileVersion", MRPROPER_FILEVERSION_STRING
+            VALUE "InternalName", MRPROPER_INTERNAL_NAME
+            VALUE "LegalCopyright", MRPROPER_COPYRIGHT
+            VALUE "OriginalFilename", MRPROPER_ORIGINAL_FILENAME
+            VALUE "ProductName", "MrProper"
+            VALUE "ProductVersion", MRPROPER_PRODUCTVERSION_STRING
+        END
+    END
+END

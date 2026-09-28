@@ -180,6 +180,7 @@ const PREAMBLE = [
   "Ты — субагент команды MrProper. Проект: C++20, Windows 10/11 x64, десктоп-утилита",
   "очистки диска. Репозиторий: D:\\Project\\MrProper (из WSL: /mnt/d/Project/MrProper).",
   "Спецификация: docs/SPEC.md — прочитай свои разделы ДО написания кода, не выдумывай API.",
+  "Она уже есть в репозитории; если файла нет — напиши это в RVI и работай по описанию задачи.",
   "",
   "ЖЁСТКИЕ ПРАВИЛА:",
   "1. Владеешь ТОЛЬКО перечисленными файлами. Чужие файлы трогать нельзя — их пишут параллельно.",
@@ -196,16 +197,18 @@ const PREAMBLE = [
   "8. Комментарии и тексты в коде — по-русски, если это не противоречит стилю существующих файлов.",
 ].join("\n");
 
+// Схема намеренно минимальна: чем меньше обязательных полей, тем реже модель
+// нарушает формат. На практике строгий массив строк ронял ~40% агентов.
 const resultSchema = {
   type: "object",
-  required: ["id", "rvi", "summary", "filesTouched"],
+  required: ["id", "rvi", "summary"],
   properties: {
     id: { type: "string" },
     rvi: { enum: ["ok", "fail", "skip"] },
-    verificationCommand: { type: "string" },
-    filesTouched: { type: "array", items: { type: "string" } },
     summary: { type: "string" },
-    blocker: { type: "string", nullable: true },
+    verificationCommand: { type: "string" },
+    filesTouched: { type: "string", description: "список файлов через запятую" },
+    blocker: { type: "string" },
   },
 };
 
@@ -242,7 +245,7 @@ for (const [phaseTitle, tasks] of byPhase) {
             "\nКритерий проверки: " + t.verify +
             "\n\nСделай задачу полностью. Если критерий требует недоступного (например, прав админа или второй системы) — верни skip с точной причиной.",
           { label: t.id + " " + t.title.slice(0, 40), phase: phaseTitle, schema: resultSchema },
-        ).then((r) => (r ? Object.assign(r, { id: t.id }) : { id: t.id, rvi: "fail", summary: "агент упал", filesTouched: [], verificationCommand: "", blocker: "worker error" })),
+        ).then((r) => (r ? Object.assign(r, { id: t.id }) : { id: t.id, rvi: "fail", summary: "агент упал или нарушил схему ответа", filesTouched: "", verificationCommand: "", blocker: "worker error" })),
       ),
     );
     for (const r of done.filter(Boolean)) {
