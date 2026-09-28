@@ -327,7 +327,7 @@ const ManifestFile* Manifest::byPath(std::string_view path) const {
     return nullptr;
 }
 
-Manifest parseManifest(std::string_view text, std::string_view origin) {
+Manifest parseRuleSetManifest(std::string_view text, std::string_view origin) {
     const std::string source(origin);
     if (text.size() > kMaxManifestBytes) {
         throw RuleSyncError(source + ": манифест больше " + std::to_string(kMaxManifestBytes) + " байт");
@@ -414,7 +414,10 @@ Manifest parseManifest(std::string_view text, std::string_view origin) {
         }
         file.sha256 = toHex(digest);
         if (const json::Value* size = item.find("size")) {
-            file.size = requireCount(*size, "size", source);
+            // requireCount ждёт родительский объект и ключ в нём, поэтому
+            // передаём элемент files, а не сам узел "size": иначе любой файл
+            // с объявленным размером падал с «нет обязательного поля size».
+            file.size = requireCount(item, "size", source);
             file.sizeDeclared = true;
         }
         manifest.files.push_back(file);
@@ -499,7 +502,7 @@ RuleSetVerification verifyRuleSet(std::string_view manifestBytes, std::string_vi
     // Шаг 1 (SPEC §9.2 п.2): схема манифеста. Не разобрался — дальше идти
     // незачем: неизвестно, что вообще проверять.
     try {
-        report.manifest = parseManifest(manifestBytes);
+        report.manifest = parseRuleSetManifest(manifestBytes);
         report.manifestParsed = true;
     } catch (const RuleSyncError& e) {
         report.problems.push_back(e.what());

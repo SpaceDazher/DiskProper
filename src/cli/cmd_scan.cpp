@@ -318,7 +318,7 @@ private:
         // попыткой разбора, а не именем файла: переименованный набор из правил
         // не должен перестать работать.
         try {
-            rulesVersion = core::parseManifest(text, name).version;
+            rulesVersion = core::parseRuleSetManifest(text, name).version;
             continue;
         } catch (const core::RuleSyncError&) {
             // Не манифест — идёт в набор правил, разберётся загрузчик.

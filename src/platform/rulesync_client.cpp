@@ -912,7 +912,7 @@ bool readInstalledSet(const Layout& layout, InstalledSet& out, std::string& prob
 
     core::Manifest manifest;
     try {
-        manifest = core::parseManifest(out.manifestBytes, kManifestFileName);
+        manifest = core::parseRuleSetManifest(out.manifestBytes, kManifestFileName);
     } catch (const std::exception& error) {
         problem = error.what();
         return false;
@@ -1318,7 +1318,7 @@ UpdateReport Client::runCheck(bool force) {
     // целостность уже подписанного.
     core::Manifest manifest;
     try {
-        manifest = core::parseManifest(manifestBytes, kManifestFileName);
+        manifest = core::parseRuleSetManifest(manifestBytes, kManifestFileName);
     } catch (const std::exception& error) {
         report.problems.push_back(std::string("манифест не разобран: ") + error.what());
         finishReport(report, layout_, status, now, startedMs);

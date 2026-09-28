@@ -554,7 +554,7 @@ TEST(rules_manifest_coreParsesManifestAndVerifiesFiles) {
     // приложение не сможет применить собственный набор (SPEC §9.2 п.3).
     Manifest manifest;
     try {
-        manifest = parseManifest(*bytes, "rules/manifest.json");
+        manifest = parseRuleSetManifest(*bytes, "rules/manifest.json");
     } catch (const RuleSyncError& e) {
         fail(std::string{"ядро не разобрало корректный rules/manifest.json: "} + e.what());
     }

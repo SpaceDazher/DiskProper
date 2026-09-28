@@ -1424,7 +1424,7 @@ TrashStatus readManifest(std::string_view transactionDir, core::TrashTransaction
     if (read != TrashStatus::Ok) return read;
 
     try {
-        txOut = core::parseManifest(text, path);
+        txOut = core::parseTrashManifest(text, path);
     } catch (const core::TrashError&) {
         return TrashStatus::Corrupt;  // битый JSON или чужая схема — это не транзакция
     } catch (const std::bad_alloc&) {

@@ -130,7 +130,7 @@ std::string serializeTrashManifest(const UndoTransaction& tx, int indent = 2);
 // Разбор манифеста. Бросает UndoError с указанием файла и поля.
 // Терпимость к полям будущих версий намеренная (игнорируются), но версия схемы
 // проверяется строго: неизвестная версия — отказ.
-UndoTransaction parseTrashManifest(std::string_view text, const std::string& origin);
+UndoTransaction parseUndoManifest(std::string_view text, const std::string& origin);
 
 // storedPath обязан быть относительным и не содержать «..»/корня: манифест может
 // оказаться подделанным или приехать из повреждённого состояния, а путь из него

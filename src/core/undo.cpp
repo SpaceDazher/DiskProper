@@ -396,7 +396,7 @@ std::string serializeTrashManifest(const UndoTransaction& tx, int indent) {
     return root.dump(indent);
 }
 
-UndoTransaction parseTrashManifest(std::string_view text, const std::string& origin) {
+UndoTransaction parseUndoManifest(std::string_view text, const std::string& origin) {
     json::Value root;
     try {
         root = json::parse(text);

@@ -128,7 +128,7 @@ inline constexpr std::size_t kMaxManifestFiles = 4096u;
 // Любое нарушение формата — RuleSyncError с указанием места: неизвестное поле,
 // отсутствующий файл, неверный тип, повтор пути, путь вне набора («../»,
 // абсолютный, диск), не-шестнадцатеричный хеш, схема не из поддерживаемых.
-Manifest parseManifest(std::string_view text, std::string_view origin = "manifest.json");
+Manifest parseRuleSetManifest(std::string_view text, std::string_view origin = "manifest.json");
 
 // Сравнение версий «1.2.3»: числовые компоненты, недостающие считаются
 // нулями, поэтому «1.2» == «1.2.0». Не-числовая компонента — RuleSyncError
