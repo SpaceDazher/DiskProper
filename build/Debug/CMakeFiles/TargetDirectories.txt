@@ -1,0 +1,5 @@
+D:/Project/MrProper/build/Debug/CMakeFiles/mrproper_core.dir
+D:/Project/MrProper/build/Debug/CMakeFiles/mrproper_unit_tests.dir
+D:/Project/MrProper/build/Debug/CMakeFiles/RUN_TESTS.dir
+D:/Project/MrProper/build/Debug/CMakeFiles/ALL_BUILD.dir
+D:/Project/MrProper/build/Debug/CMakeFiles/ZERO_CHECK.dir
