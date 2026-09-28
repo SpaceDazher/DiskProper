@@ -367,7 +367,7 @@ TrashTransaction transactionFromJson(const json::Value& value, const std::string
 
 std::string serializeManifest(const TrashTransaction& tx, int indent) { return toJson(tx).dump(indent); }
 
-TrashTransaction parseManifest(std::string_view text, const std::string& origin) {
+TrashTransaction parseTrashManifest(std::string_view text, const std::string& origin) {
     // json::ParseError ловим и переименовываем: движок ловит один тип ошибок
     // корзины, иначе «битый манифест» ушёл бы в отдельную ветку обработки.
     try {

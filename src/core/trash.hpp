@@ -138,7 +138,7 @@ TrashItem itemFromJson(const json::Value& value, const std::string& origin);
 TrashTransaction transactionFromJson(const json::Value& value, const std::string& origin);
 
 std::string serializeManifest(const TrashTransaction& tx, int indent = 2);
-TrashTransaction parseManifest(std::string_view text, const std::string& origin = "manifest.json");
+TrashTransaction parseTrashManifest(std::string_view text, const std::string& origin = "trash-manifest.json");
 
 // ---------------------------------------------------------------------------
 // Пути

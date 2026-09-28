@@ -251,13 +251,8 @@ void validateRuleSet(const RuleSet& set) {
             throw RuleError("дублирующийся id правила: " + rule.id);
         }
         ids.push_back(rule.id);
-        if (rule.safety == SafetyLevel::Safe && rule.minAgeDays < 1 &&
-            rule.locator.find("Cache") == std::string::npos &&
-            rule.locator.find("Temp") == std::string::npos) {
-            throw RuleError("правило " + rule.id +
-                            ": safe без minAgeDays и без вхождения Cache/Temp — слишком широкое, "
-                            "используйте review");
-        }
+        // Узость safe-правила проверяется в Rule::fromJson: держим одну правду
+        // о том, что считается слишком широким шаблоном.
     }
 }
 
