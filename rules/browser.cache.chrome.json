@@ -1,0 +1,112 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "browser.cache.chrome",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\Cache\\**",
+      "requiresProcessesClosed": [
+        "chrome"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш Google Chrome",
+        "en": "Google Chrome cache"
+      },
+      "note": "HTTP-кэш Chromium в каталоге Cache профиля (современный формат — подкаталог Cache_Data со служебными index/data_N и объектами f_*; в очень старых версиях объекты лежали прямо в Cache). Записи одноразовые: следующий заход на сайт скачает страницу заново, офлайн-данные сайтов сюда не попадают — они лежат в Service Worker\\CacheStorage и чистятся отдельным правилом. В шаблоне стоит одиночный «*» вместо Default, так покрыты все профили пользователя (Default, Profile 1, Profile 2, Guest Profile, System Profile): каталоги профилей лежат рядом с Crashpad и ShaderCache, а одиночный «*» не пересекает границу каталога, поэтому в правило попадают только каталоги кэша. Возрастного порога нет (0 дней, как в примере правила Edge из SPEC FR-4): держать кэш «до последнего» бессмысленно, он растёт и снижает отдачу SSD. Нужен закрытый Chrome — у работающего браузера файлы кэша заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся. Cookies, пароли и история этой строке не принадлежат: это категория browser.history с ручным подтверждением."
+    },
+    {
+      "id": "browser.cache.chrome.code",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\Code Cache\\**",
+      "requiresProcessesClosed": [
+        "chrome"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш кода Google Chrome (Code Cache)",
+        "en": "Google Chrome code cache"
+      },
+      "note": "Code Cache — скомпилированный V8-код JavaScript и WebAssembly (подкаталоги js и wasm). Удаление обратимо, но платится временем: скрипты тяжёлых сайтов компилируются заново при первом открытии, поэтому такую строку имеет смысл чистить не чаще, чем раз в месяц, и отдельно от основного кэша. Уровень safe — по SPEC FR-3 (кэш), строка в плане и отчёте показывается отдельно, чтобы пользователь видел, за что отвечает. Обратите внимание: «Code Cache» не пересекается с «Cache» основного правила — литералы сегментов разные."
+    },
+    {
+      "id": "browser.cache.chrome.gpu",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\GPUCache\\**",
+      "requiresProcessesClosed": [
+        "chrome"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш GPU Google Chrome",
+        "en": "Google Chrome GPU cache"
+      },
+      "note": "GPUCache — кэш скомпилированной графики и шейдеров, которые Chrome компилирует через Dawn. Пересобирается при следующем запуске браузера, единственная цена очистки — первые страницы после неё открываются чуть дольше. Кэши шейдеров вне профиля (D3DSCache, NVIDIA/AMD) принадлежат категории shadercache и здесь намеренно не дублируются, чтобы один и тот же файл не попадал в две очистки."
+    },
+    {
+      "id": "browser.cache.chrome.serviceworker",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\Service Worker\\CacheStorage\\**",
+      "requiresProcessesClosed": [
+        "chrome"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш Service Worker в Google Chrome",
+        "en": "Google Chrome service worker cache"
+      },
+      "note": "Service Worker CacheStorage — «Service Worker Cache» из SPEC FR-3: офлайн-данные, которые сайт положил в Cache Storage через сервис-воркер. Правило указывает на CacheStorage, а не на весь каталог «Service Worker» намеренно: рядом лежат ScriptCache (скомпилированные скрипты) и Database (реестр регистраций сервис-воркеров), а реестр нужен браузеру для нормальной работы и в перечне FR-3 не числится. Последствие очистки одно: офлайн-версия установленного PWA или web-приложения придёт заново из сети. Учётные записи не затрагиваются — cookies и токены лежат в Network и относятся к browser.history, которую включают только вручную."
+    },
+    {
+      "id": "browser.cache.chrome.dawn",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\*Dawn*Cache\\**",
+      "requiresProcessesClosed": [
+        "chrome"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш Dawn в Google Chrome",
+        "en": "Google Chrome Dawn cache"
+      },
+      "note": "Кэш графического стека Dawn во всех вариантах имени каталога: DawnCache (старый), DawnWebGPUCache и GraphiteDawnCache (современный Chromium). Одно правило вместо трёх почти одинаковых: «*Dawn*Cache» — это сегмент, в котором есть Dawn и который на нём заканчивается; первый «*» — каталог профиля, оба остальных работают внутри сегмента и границу каталога не пересекают, поэтому под шаблон попадают только каталоги кэша Dawn. На части сборок и версий такого каталога нет — это норма, кандидатов просто не будет."
+    },
+    {
+      "id": "browser.cache.chrome.old",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\Old\\**",
+      "minAgeDays": 1,
+      "requiresProcessesClosed": [
+        "chrome"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Старый кэш Google Chrome (Old)",
+        "en": "Google Chrome legacy cache (Old)"
+      },
+      "note": "Каталог Old из перечня SPEC FR-3 (на одном уровне с Cache, Code Cache, GPUCache и blob_storage). Встречается только в старых версиях браузера, где в нём оставался кэш в устаревшем формате; в современных Chrome его обычно нет, и отсутствие каталога правилу не мешает — кандидатов не будет. Отсюда осторожность с формулировкой: locator не содержит имени «Cache», а движок не принимает safe-правило без возрастного порога (проверка узости safe-правил в core/rules.cpp), поэтому здесь стоит minAgeDays 1 — сутки не меняют смысла кэша, зато правило не сможет снести содержимое, если в старой версии под этим именем окажется что-то ещё. Если каталог не вы встретили — правило можно смело отключить."
+    },
+    {
+      "id": "browser.cache.chrome.blob",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\blob_storage\\**",
+      "minAgeDays": 1,
+      "requiresProcessesClosed": [
+        "chrome"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Хранилище блобов Google Chrome (blob_storage)",
+        "en": "Google Chrome blob storage"
+      },
+      "note": "blob_storage — хранилище блобов, которые Chrome создаёт для сайтов, работающих с File System Access API; в SPEC FR-3 этот каталог перечислен явно, поэтому он покрыт наравне с остальным кэшем. Обычные сайты API не пользуются, а для сайта, который писал данные «в файлы» через браузер, после очистки данные придётся получить заново и, возможно, подтвердить доступ к каталогу. Строка показывается отдельной с этим объяснением в отчёте. К cookies, истории и сохранённым паролям отношения не имеет. Порог в 1 день — не про возраст данных, а про формулировку правила: имя каталога blob_storage не содержит маркера «Cache», а движок не принимает safe-правило без возрастного порога (проверка узости safe-правил в core/rules.cpp)."
+    }
+  ]
+}

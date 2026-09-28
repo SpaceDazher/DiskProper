@@ -9,6 +9,16 @@
 #      и безопасная замена их отсутствия;
 #   3) install-цели, CPack и финальный проход по общим флагам.
 #
+# Политика сборки разнесена по модулям в cmake/ (все — владелец W01/задача 01,
+# кроме cmake/warnings.cmake, который принадлежит задаче 03):
+#   MrProperOptions.cmake     опции MRPROPER_*
+#   MrProperWarnings.cmake    /W4 /WX и строгий набор
+#   MrProperSanitizers.cmake  ASan/UBSan
+#   MrProperDependencies.cmake vcpkg или FetchContent (SPEC §8 Этап 0)
+#   MrProperInstall.cmake     install-цели и CPack
+#   MrProperStyle.cmake       цели формата и статического анализа
+#   MrProperHelpers.cmake     отчёт о конфигурации и финальный проход
+#
 # Списки исходников намеренно НЕ перечисляются: волны W02-W18 добавляют
 # модули по одному файлу, и жёсткий список означал бы, что модуль молча не
 # попадёт в сборку, пока кто-то не вспомнит дописать строку. Перечень берётся
@@ -48,16 +58,26 @@ if(NOT DEFINED CMAKE_EXPORT_COMPILE_COMMANDS)
 endif()
 # CMake 3.20 выдаёт compile_commands.json только генераторам Makefiles и Ninja,
 # а на генераторе Visual Studio опция молча игнорируется: clang-tidy и IDE
-# ждут файл, которого не будет. Предупреждение называет рабочую альтернативу.
-if(CMAKE_EXPORT_COMPILE_COMMANDS
-   AND NOT CMAKE_GENERATOR MATCHES "Ninja"
-   AND NOT CMAKE_GENERATOR MATCHES "Makefiles")
-    message(WARNING
-        "[MrProper] CMAKE_EXPORT_COMPILE_COMMANDS включён, но генератор «${CMAKE_GENERATOR}» "
-        "его не поддерживает (CMake 3.20 умеет только Makefiles и Ninja): "
-        "compile_commands.json не появится, clang-tidy и IDE запускать нечем. "
-        "Рабочий путь — пресет ninja-debug (генератор Ninja из состава Visual Studio)")
+# ждут файл, которого не будет. Предупреждение показывается только когда файл
+# запросили явно (-DCMAKE_EXPORT_COMPILE_COMMANDS=ON или пресетом): при
+# собственном значении по умолчанию это не чья-то ошибка, а известное
+# свойство генератора, и предупреждение в каждом логе сборки только учит
+# игнорировать предупреждения. Рабочая альтернатива — пресет ninja-debug.
+get_property(_mrproper_cc_type CACHE CMAKE_EXPORT_COMPILE_COMMANDS PROPERTY TYPE)
+set(MRPROPER_COMPILE_COMMANDS_SUPPORTED TRUE)
+if(NOT CMAKE_GENERATOR MATCHES "Ninja" AND NOT CMAKE_GENERATOR MATCHES "Makefiles")
+    set(MRPROPER_COMPILE_COMMANDS_SUPPORTED FALSE)
 endif()
+if(CMAKE_EXPORT_COMPILE_COMMANDS AND NOT MRPROPER_COMPILE_COMMANDS_SUPPORTED)
+    if(_mrproper_cc_type STREQUAL "UNINITIALIZED")
+        message(WARNING
+            "[MrProper] CMAKE_EXPORT_COMPILE_COMMANDS=ON запрошен явно, но генератор "
+            "«${CMAKE_GENERATOR}» его не поддерживает (CMake 3.20 умеет только Makefiles "
+            "и Ninja): compile_commands.json не появится. Рабочий путь — пресет "
+            "ninja-debug (генератор Ninja из состава Visual Studio)")
+    endif()
+endif()
+unset(_mrproper_cc_type)
 
 # tools\build.bat передаёт -DCMAKE_BUILD_TYPE, а генератор Visual Studio
 # multi-config: конфигурацию выбирает --config, значение CMAKE_BUILD_TYPE на неё
@@ -83,6 +103,8 @@ include(MrProperOptions)     # опции проекта
 include(MrProperHelpers)     # общие функции (финальный проход, отчёт)
 include(MrProperWarnings)    # /W4 /WX, -Wall -Wextra -Wpedantic, MRPROPER_WARNINGS_READY
 include(MrProperSanitizers)  # ASan/UBSan по опции MRPROPER_SANITIZE
+include(MrProperDependencies) # vcpkg или FetchContent для внешних зависимостей
+include(MrProperStyle)       # цели mrproper-format / mrproper-format-check / mrproper-tidy
 
 # Политика предупреждений в двух частях по разным причинам:
 #   cmake/MrProperWarnings.cmake — базовая планка /W4 /WX, раздаётся на уровне

@@ -1,0 +1,135 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "shadercache.directx",
+      "category": "shadercache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\D3DSCache\\**",
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш шейдеров DirectX",
+        "en": "DirectX shader cache"
+      },
+      "note": "Компилированные шейдеры DirectX. ОС и приложения пересобирают их по мере надобности, платим только временем компиляции при первом запуске игры. Файлы активной сессии заняты и будут пропущены по FR-6."
+    },
+    {
+      "id": "shadercache.nvidia.dx",
+      "category": "shadercache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\NVIDIA\\DXCache\\**",
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш шейдеров NVIDIA (DXCache)",
+        "en": "NVIDIA DX shader cache"
+      },
+      "note": "Драйверный кэш шейдеров NVIDIA DirectX в профиле пользователя. Пересобирается драйвером автоматически."
+    },
+    {
+      "id": "shadercache.nvidia.gl",
+      "category": "shadercache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\NVIDIA\\GLCache\\**",
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш шейдеров NVIDIA (GLCache)",
+        "en": "NVIDIA GL shader cache"
+      },
+      "note": "Кэш шейдеров OpenGL драйвера NVIDIA в профиле пользователя. Пересобирается драйвером автоматически."
+    },
+    {
+      "id": "shadercache.nvidia.compute",
+      "category": "shadercache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\NVIDIA\\ComputeCache\\**",
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш вычислений NVIDIA (ComputeCache)",
+        "en": "NVIDIA compute cache"
+      },
+      "note": "CUDA/OptiX-кэш драйвера NVIDIA. Удаление заставляет вычисления пересобирать кэш при первом запуске — на тяжёлых задачах это заметная потеря времени, поэтому правило оставлено safe по спецификации (SPEC FR-3), а не по умолчанию отключено."
+    },
+    {
+      "id": "shadercache.nvidia.nv",
+      "category": "shadercache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\NVIDIA Corporation\\NV_Cache\\**",
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш шейдеров NVIDIA (NV_Cache)",
+        "en": "NVIDIA NV_Cache"
+      },
+      "note": "Кэш шейдеров, который драйверы NVIDIA создают в профиле пользователя по пути NVIDIA Corporation. Встречается не на всех версиях драйверов — отсутствие каталога для правила не является ошибкой."
+    },
+    {
+      "id": "shadercache.nvidia.nv.machine",
+      "category": "shadercache",
+      "safety": "safe",
+      "locator": "%ProgramData%\\NVIDIA Corporation\\NV_Cache\\**",
+      "title": {
+        "ru": "Кэш шейдеров NVIDIA (NV_Cache, общесистемный)",
+        "en": "NVIDIA NV_Cache (machine-wide)"
+      },
+      "note": "Общесистемный кэш драйвера NVIDIA. ProgramData не входит в белый список защищённых каталогов (SPEC FR-6), поэтому каталог доступен для очистки."
+    },
+    {
+      "id": "shadercache.amd.dx",
+      "category": "shadercache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\AMD\\DxCache\\**",
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш шейдеров AMD (DxCache)",
+        "en": "AMD DX shader cache"
+      },
+      "note": "Драйверный кэш шейдеров AMD DirectX в профиле пользователя. Пересобирается драйвером автоматически."
+    },
+    {
+      "id": "shadercache.amd.dxc",
+      "category": "shadercache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\AMD\\DxcCache\\**",
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш шейдеров AMD (DxcCache)",
+        "en": "AMD DXC shader cache"
+      },
+      "note": "Кэш шейдеров нового поколения (DirectX Shader Compiler) в профиле пользователя. Пересобирается драйвером автоматически."
+    },
+    {
+      "id": "shadercache.amd.gl",
+      "category": "shadercache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\AMD\\GLCache\\**",
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш шейдеров AMD (GLCache)",
+        "en": "AMD GL shader cache"
+      },
+      "note": "Кэш шейдеров OpenGL драйвера AMD в профиле пользователя. Встречается не на всех версиях драйверов."
+    },
+    {
+      "id": "shadercache.amd.vk",
+      "category": "shadercache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\AMD\\VkCache\\**",
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш шейдеров AMD (Vulkan)",
+        "en": "AMD Vulkan shader cache"
+      },
+      "note": "Кэш шейдеров Vulkan драйвера AMD в профиле пользователя. Встречается не на всех версиях драйверов."
+    },
+    {
+      "id": "shadercache.amd.dx.machine",
+      "category": "shadercache",
+      "safety": "safe",
+      "locator": "%ProgramData%\\AMD\\DxCache\\**",
+      "title": {
+        "ru": "Кэш шейдеров AMD (общесистемный)",
+        "en": "AMD shader cache (machine-wide)"
+      },
+      "note": "Общесистемный кэш драйвера AMD. ProgramData не входит в белый список защищённых каталогов (SPEC FR-6), поэтому каталог доступен для очистки."
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "icon.font.cache.explorer",
+      "category": "icon.font.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer\\iconcache*.db",
+      "minAgeDays": 2,
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш значков Проводника",
+        "en": "Explorer icon cache"
+      },
+      "note": "iconcache*.db в профиле пользователя. ОС пересобирает кэш при следующем обращении к значкам, поэтому содержимое восстановимо. Порог 2 дня: файлы, изменённые сегодня, Проводник активно переписывает и они почти всегда заняты — удаление не даёт ничего, кроме лишних блокировок. Занятые файлы движок пропустит по FR-6."
+    },
+    {
+      "id": "icon.font.cache.explorer.thumbnails",
+      "category": "icon.font.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer\\thumbcache_*.db",
+      "minAgeDays": 2,
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш миниатюр Проводника",
+        "en": "Explorer thumbnail cache"
+      },
+      "note": "thumbcache_*.db рядом с кэшем значков. Пересоздаётся по требованию при предпросмотре, платится только CPU. Порог 2 дня — по той же причине, что и для кэша значков. Назначение правила совпадает с категорией thumbnails (SPEC FR-3), чтобы один файл не считался дважды: правило thumbnails должно исключать этот путь."
+    },
+    {
+      "id": "icon.font.cache.fonts",
+      "category": "icon.font.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\FontCache\\*",
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш шрифтов (профиль пользователя)",
+        "en": "User font cache"
+      },
+      "note": "Пользовательская копия данных службы Windows Font Cache. Часть файлов служба держит открытыми — занятые элементы движок пропустит по FR-6, содержимое восстановится при следующем запуске службы. Системный кэш в ServiceProfiles сознательно не описан: он лежит в защищённом каталоге Windows, и движок всё равно не должен его трогать (SPEC FR-6, белый список)."
+    }
+  ]
+}

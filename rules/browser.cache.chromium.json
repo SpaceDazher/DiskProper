@@ -1,0 +1,362 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "browser.cache.brave",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\*\\Cache\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "brave"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш Brave (Cache)",
+        "en": "Brave cache"
+      },
+      "note": "Кэш HTTP-ресурсов профиля Brave: %LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\<профиль>\\Cache (современные версии кладут данные в Cache\\Cache_Data, шаблон покрывает оба уровня). Сегмент «*» — имена профилей Default, Profile N, Guest Profile и переименованные, поэтому правило работает без списка профилей. Кэш восстанавливается сам при следующем обращении к сайту: платим только повторной загрузкой трафика. Категория browser.cache помечена Safe в SPEC §4 FR-3, но требует закрытия браузера — работающий Brave держит файлы открытыми, поэтому указано имя процесса brave, а занятые элементы движок пропустит по FR-6 (Restart Manager, Skip). Данные профиля (History, Cookies, Login Data, Web Data, Favicons) сюда сознательно не вошли: они описаны в browser.history с уровнем review и по умолчанию выключены (SPEC §4 FR-3). В этом файле только Brave, Vivaldi и Opera: у Chrome и Edge свои файлы правил, и пересекающиеся локаторы задвоили бы кандидатов в плане."
+    },
+    {
+      "id": "browser.cache.brave.code",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\*\\Code Cache\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "brave"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Скомпилированный код Brave (Code Cache)",
+        "en": "Brave compiled code cache"
+      },
+      "note": "Code Cache профиля — результат компиляции JavaScript и WebAssembly (подкаталоги js, wasm). Содержимое восстановимо: при следующем открытии сайтов браузер компилирует скрипты заново, поэтому Safe и minAgeDays=0 — платим CPU, а не данными пользователя. Общий каталог с файлами кэша (Cache, Cache_Data) сюда не попадает: «Code Cache» — самостоятельный сегмент пути, шаблоны не пересекаются."
+    },
+    {
+      "id": "browser.cache.brave.gpu",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\*\\GPUCache\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "brave"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Графический кэш Brave (GPUCache)",
+        "en": "Brave GPU cache"
+      },
+      "note": "GPUCache профиля — скомпилированные шейдеры и кэш текстур, которые GPU-процесс браузера использует для ускорения отрисовки. Пересоздаётся драйвером видеокарты при следующем открытии сайтов с WebGL/WebGPU, содержимое не несёт пользовательских данных, поэтому Safe без возрастного порога. Шейдерные кэши драйверов видеокарт (D3DSCache, NVIDIA/AMD) сюда не входят — они в категории shadercache (SPEC §4 FR-3), чтобы один и тот же файл не считался в двух категориях."
+    },
+    {
+      "id": "browser.cache.brave.serviceworker",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\*\\Service Worker\\CacheStorage\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "brave"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Офлайн-кэш сайтов Brave (Service Worker CacheStorage)",
+        "en": "Brave site offline cache (Service Worker CacheStorage)"
+      },
+      "note": "CacheStorage — то, что service worker сайта положил через Cache API для работы офлайн (SPEC §4 FR-3, «Service Worker Cache»). Содержимое восстановится при следующем онлайн-визите, но до этого офлайн-режим сайта не заработает — об этом честно предупреждает текст правила в интерфейсе. Соседний ScriptCache (скомпилированные скрипты service worker) намеренно НЕ чистим: он же исключён в примере правила Edge из SPEC §4 FR-4, и адреса скриптов после очистки браузер восстанавливает заметно дольше. Database и ScriptCache под шаблон не подпадают — это другие сегменты пути."
+    },
+    {
+      "id": "browser.cache.brave.dawn",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\*\\*Dawn*Cache\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "brave"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш WebGPU Brave (DawnCache)",
+        "en": "Brave WebGPU cache (DawnCache)"
+      },
+      "note": "Кэш WebGPU-бэкенда Dawn, названный в SPEC §4 FR-3. Один и тот же кэш в разных версиях Chromium называется по-разному: DawnCache, DawnWebGPUCache (старые сборки) и GraphiteDawnCache (сборки на Graphite). Схема правил не умеет перечисление через фигурные скобки, а три отдельных правила на одно и то же содержимое дали бы три кандидата на один каталог, поэтому имя каталога описано шаблоном «*Dawn*Cache» — он покрывает все три варианта и не выходит за пределы каталогов кэша профиля (второй «*» — сегмент с именем профиля)."
+    },
+    {
+      "id": "browser.cache.brave.old",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\*\\Old\\**",
+      "minAgeDays": 1,
+      "requiresProcessesClosed": [
+        "brave"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Остатки кэша Brave после миграции профиля (Old)",
+        "en": "Brave leftover cache after profile migration (Old)"
+      },
+      "note": "Каталог Old, который Chromium-браузеры оставляют в профиле после миграции (переименование профиля, восстановление, переход на новую мажорную версию): внутри лежит старый кэш, который браузер больше не читает и не обновляет. Правило из SPEC §4 FR-3 («Old/»). Порог 1 день, а не 0: имя каталога не содержит «Cache», а загрузчик правил (core/rules.cpp) не принимает правило уровня safe без возрастного порога и без узнаваемого имени кэша — для остатков миграции возраст всё равно всегда проходит, а свежие каталоги в этой ветке и не появляются."
+    },
+    {
+      "id": "browser.cache.brave.blob",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\*\\blob_storage\\**",
+      "minAgeDays": 1,
+      "requiresProcessesClosed": [
+        "brave"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Файлы blob-ссылок Brave (blob_storage)",
+        "en": "Brave blob storage files"
+      },
+      "note": "blob_storage — файлы, на которые ссылались blob:-ссылки страниц (скачанные из памяти документы, превью, данные веб-приложений); имя каталога пришло из SPEC §4 FR-3. Пока вкладка открыта, ссылка жива, поэтому правило требует закрытого браузера (процесс brave) и пропустит занятое по FR-6. Порог 1 день — по той же причине, что в правиле Old: в имени каталога нет «Cache», а правило safe без minAgeDays валидатор не принимает. Пользовательские файлы, скачанные обычной загрузкой, лежат в профиле в других каталогах и это правило их не касается."
+    },
+    {
+      "id": "browser.cache.vivaldi",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Vivaldi\\User Data\\*\\Cache\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "vivaldi"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш Vivaldi (Cache)",
+        "en": "Vivaldi cache"
+      },
+      "note": "Кэш HTTP-ресурсов профиля Vivaldi: %LOCALAPPDATA%\\Vivaldi\\User Data\\<профиль>\\Cache (данные в Cache\\Cache_Data — шаблон покрывает оба уровня). В отличие от Chrome и Brave, Vivaldi держит профиль в локальной папке пользователя, а не в общей Local\\… — путь задан именно так, иного расположения правило не выдумывает. Сегмент «*» покрывает Default, Profile N и переименованные профили. Кэш пересоздаётся при следующем обращении к сайту, поэтому Safe; требуется закрытый браузер (процесс vivaldi), занятое пропускается по FR-6. История, cookies и пароли (browser.history, review, по умолчанию выключено) в это правило не входят."
+    },
+    {
+      "id": "browser.cache.vivaldi.code",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Vivaldi\\User Data\\*\\Code Cache\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "vivaldi"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Скомпилированный код Vivaldi (Code Cache)",
+        "en": "Vivaldi compiled code cache"
+      },
+      "note": "Code Cache профиля Vivaldi — компиляция JavaScript и WebAssembly (js, wasm). Восстанавливается сам, платим CPU при следующем открытии сайтов, поэтому Safe и minAgeDays=0. Не пересекается с Cache: «Code Cache» — отдельный сегмент пути, а не подкаталог Cache."
+    },
+    {
+      "id": "browser.cache.vivaldi.gpu",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Vivaldi\\User Data\\*\\GPUCache\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "vivaldi"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Графический кэш Vivaldi (GPUCache)",
+        "en": "Vivaldi GPU cache"
+      },
+      "note": "GPUCache профиля Vivaldi — скомпилированные шейдеры и текстуры для ускорения отрисовки. Пересоздаётся драйвером видеокарты, пользовательских данных не содержит, поэтому Safe без порога возраста. Драйверные шейдерные кэши (D3DSCache, NVIDIA, AMD) в это правило не входят: они в категории shadercache, чтобы один файл не учитывался дважды."
+    },
+    {
+      "id": "browser.cache.vivaldi.serviceworker",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Vivaldi\\User Data\\*\\Service Worker\\CacheStorage\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "vivaldi"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Офлайн-кэш сайтов Vivaldi (Service Worker CacheStorage)",
+        "en": "Vivaldi site offline cache (Service Worker CacheStorage)"
+      },
+      "note": "CacheStorage service worker'а — офлайн-копии сайтов, созданные через Cache API (SPEC §4 FR-3, «Service Worker Cache»). Восстановится при следующем онлайн-визите, до этого офлайн-режим сайта не заработает. ScriptCache не чистим — он исключён и в примере правила Edge из SPEC §4 FR-4. Database и ScriptCache под шаблон не попадают: это другие сегменты пути."
+    },
+    {
+      "id": "browser.cache.vivaldi.dawn",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Vivaldi\\User Data\\*\\*Dawn*Cache\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "vivaldi"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш WebGPU Vivaldi (DawnCache)",
+        "en": "Vivaldi WebGPU cache (DawnCache)"
+      },
+      "note": "Кэш WebGPU-бэкенда Dawn (SPEC §4 FR-3). Название каталога менялось между версиями Chromium: DawnCache, DawnWebGPUCache, GraphiteDawnCache. В схеме правил нет перечисления через фигурные скобки, а три правила на один каталог дали бы три кандидата на одни и те же файлы, поэтому описан шаблон «*Dawn*Cache» — он покрывает все три имени и не выходит за каталоги профиля."
+    },
+    {
+      "id": "browser.cache.vivaldi.old",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Vivaldi\\User Data\\*\\Old\\**",
+      "minAgeDays": 1,
+      "requiresProcessesClosed": [
+        "vivaldi"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Остатки кэша Vivaldi после миграции профиля (Old)",
+        "en": "Vivaldi leftover cache after profile migration (Old)"
+      },
+      "note": "Каталог Old — остатки старого кэша после переименования, восстановления или смены мажорной версии профиля Vivaldi (SPEC §4 FR-3, «Old/»); браузер его больше не использует. Порог 1 день: имя каталога не содержит «Cache», а core/rules.cpp отклоняет правило safe без возрастного порога и без узнаваемого имени кэша; для остатков миграции возраст всегда проходит."
+    },
+    {
+      "id": "browser.cache.vivaldi.blob",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Vivaldi\\User Data\\*\\blob_storage\\**",
+      "minAgeDays": 1,
+      "requiresProcessesClosed": [
+        "vivaldi"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Файлы blob-ссылок Vivaldi (blob_storage)",
+        "en": "Vivaldi blob storage files"
+      },
+      "note": "blob_storage профиля Vivaldi — файлы за blob:-ссылками страниц (SPEC §4 FR-3, «blob_storage»). Пока вкладка открыта, ссылка жива: правило требует закрытого браузера (процесс vivaldi), занятое пропускается по FR-6. Порог 1 день по той же причине, что в правиле Old: в имени нет «Cache», а правило safe без minAgeDays валидатор не принимает."
+    },
+    {
+      "id": "browser.cache.opera",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%APPDATA%\\Opera Software\\**\\Cache\\**",
+      "locatorExcludes": [
+        "%APPDATA%\\Opera Software\\**\\*Extension*\\**"
+      ],
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "opera"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш Opera (Cache)",
+        "en": "Opera cache"
+      },
+      "note": "Opera — единственный браузер в этом файле, который держит профиль в роуминге: %APPDATA%\\Opera Software\\<канал>\\Cache, где канал — Opera Stable, Opera GX Stable, Opera Developer, Opera Beta, Opera Neon или Opera Air. У канала кэш лежит на верхнем уровне, у именованных профилей — на уровень ниже, поэтому в шаблоне стоит «**»: он покрывает оба случая одним правилом, без задвоения кандидатов. Каталоги расширений (Extensions, Extension State, Local Extension Settings и подобные) исключены: под шаблон с «**» попал бы любой каталог с именем Cache внутри данных расширения, а это уже не кэш браузера. Правило опирается на переменную %APPDATA%: если платформенный слой её не отдал, правило остаётся неактивным, а набор помечается как частично неразрешённый (core/rules.cpp) — выдумывать путь вместо роуминга нельзя. Каталог установки (%LOCALAPPDATA%\\Programs\\Opera, %ProgramFiles%\\Opera) не чистим никогда: это файлы программы. История и cookies — в browser.history (review, выключено по умолчанию)."
+    },
+    {
+      "id": "browser.cache.opera.code",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%APPDATA%\\Opera Software\\**\\Code Cache\\**",
+      "locatorExcludes": [
+        "%APPDATA%\\Opera Software\\**\\*Extension*\\**"
+      ],
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "opera"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Скомпилированный код Opera (Code Cache)",
+        "en": "Opera compiled code cache"
+      },
+      "note": "Code Cache профиля Opera — компиляция JavaScript и WebAssembly. Пересоздаётся при следующем открытии сайтов, поэтому Safe и minAgeDays=0. Как и в правиле Cache, каталоги расширений исключены: с неограниченным «**» под шаблон иначе попадали бы одноимённые папки внутри данных расширений."
+    },
+    {
+      "id": "browser.cache.opera.gpu",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%APPDATA%\\Opera Software\\**\\GPUCache\\**",
+      "locatorExcludes": [
+        "%APPDATA%\\Opera Software\\**\\*Extension*\\**"
+      ],
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "opera"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Графический кэш Opera (GPUCache)",
+        "en": "Opera GPU cache"
+      },
+      "note": "GPUCache профиля Opera — шейдеры и текстуры для ускорения отрисовки. Восстанавливается драйвером видеокарты, пользовательских данных не содержит: Safe без порога возраста. Шейдерные кэши драйверов (D3DSCache, NVIDIA, AMD) остаются в категории shadercache — двойного учёта не будет."
+    },
+    {
+      "id": "browser.cache.opera.serviceworker",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%APPDATA%\\Opera Software\\**\\Service Worker\\CacheStorage\\**",
+      "locatorExcludes": [
+        "%APPDATA%\\Opera Software\\**\\*Extension*\\**"
+      ],
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "opera"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Офлайн-кэш сайтов Opera (Service Worker CacheStorage)",
+        "en": "Opera site offline cache (Service Worker CacheStorage)"
+      },
+      "note": "CacheStorage service worker'а Opera — офлайн-копии сайтов из Cache API (SPEC §4 FR-3). Восстановится при следующем онлайн-визите, до этого офлайн-режим сайта не заработает. ScriptCache не чистим (исключён в примере правила Edge из SPEC §4 FR-4), Database и ScriptCache под шаблон не подпадают. Каталоги расширений исключены по той же причине, что и в остальных правилах Opera."
+    },
+    {
+      "id": "browser.cache.opera.dawn",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%APPDATA%\\Opera Software\\**\\*Dawn*Cache\\**",
+      "locatorExcludes": [
+        "%APPDATA%\\Opera Software\\**\\*Extension*\\**"
+      ],
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "opera"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш WebGPU Opera (DawnCache)",
+        "en": "Opera WebGPU cache (DawnCache)"
+      },
+      "note": "Кэш WebGPU-бэкенда Dawn (SPEC §4 FR-3). Имя каталога менялось между версиями Chromium — DawnCache, DawnWebGPUCache, GraphiteDawnCache, — а перечисления в схеме правил нет, поэтому описан шаблон «*Dawn*Cache». Каталоги расширений исключены, чтобы под «**» не попал одноимённый каталог внутри данных расширения."
+    },
+    {
+      "id": "browser.cache.opera.old",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%APPDATA%\\Opera Software\\**\\Old\\**",
+      "locatorExcludes": [
+        "%APPDATA%\\Opera Software\\**\\*Extension*\\**"
+      ],
+      "minAgeDays": 1,
+      "requiresProcessesClosed": [
+        "opera"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Остатки кэша Opera после миграции профиля (Old)",
+        "en": "Opera leftover cache after profile migration (Old)"
+      },
+      "note": "Каталог Old — остатки старого кэша профиля Opera после переименования, восстановления или смены мажорной версии (SPEC §4 FR-3, «Old/»). Порог 1 день: имя каталога не содержит «Cache», а core/rules.cpp не принимает правило safe без возрастного порога и без узнаваемого имени кэша; для остатков миграции возраст всегда проходит. С неограниченным «**» в шаблоне каталоги расширений исключены отдельно."
+    },
+    {
+      "id": "browser.cache.opera.blob",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%APPDATA%\\Opera Software\\**\\blob_storage\\**",
+      "locatorExcludes": [
+        "%APPDATA%\\Opera Software\\**\\*Extension*\\**"
+      ],
+      "minAgeDays": 1,
+      "requiresProcessesClosed": [
+        "opera"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Файлы blob-ссылок Opera (blob_storage)",
+        "en": "Opera blob storage files"
+      },
+      "note": "blob_storage профиля Opera — файлы за blob:-ссылками страниц (SPEC §4 FR-3, «blob_storage»). Пока вкладка открыта, ссылка жива: нужно закрытие браузера (процесс opera), занятое пропускается по FR-6. Порог 1 день по той же причине, что в правиле Old: в имени каталога нет «Cache», а правило safe без minAgeDays валидатор не принимает. Каталоги расширений исключены."
+    }
+  ]
+}

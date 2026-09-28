@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "delivery.opt.cache",
+      "category": "delivery.opt",
+      "safety": "review",
+      "locator": "C:\\Windows\\SoftwareDistribution\\DeliveryOptimization\\**",
+      "minAgeDays": 7,
+      "requiresProcessesClosed": ["DoSvc"],
+      "title": {
+        "ru": "Кэш доставки оптимизации (DoSvc)",
+        "en": "Delivery Optimization cache (DoSvc)"
+      },
+      "note": "Кэш службы доставки оптимизации в C:\\Windows\\SoftwareDistribution\\DeliveryOptimization. Служба сама решает, что хранить и как долго, поэтому элементы выключены по умолчанию (review) и показываются с оценкой и возрастом. Порог 7 дней совпадает со сроком хранения по умолчанию: свежие загрузки ещё могут раздаваться соседним устройствам, трогать их незачем. Пока DoSvc работает, файлы заняты, элемент попадёт в «пропущено (занято)», а не удалится. Кэш сетевой службы в C:\\Windows\\ServiceProfiles и состояние в C:\\ProgramData\\Microsoft\\Windows\\DeliveryOptimization в правило сознательно не входят: они сбрасываются средствами самой службы, а не удалением файлов."
+    }
+  ]
+}

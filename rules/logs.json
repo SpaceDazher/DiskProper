@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "logs.system",
+      "category": "logs",
+      "safety": "safe",
+      "locator": "C:\\Windows\\Logs\\**",
+      "minAgeDays": 14,
+      "requiresProcessesClosed": [
+        "msiexec",
+        "TiWorker",
+        "TrustedInstaller"
+      ],
+      "title": {
+        "ru": "Журналы Windows (CBS, DISM, Panther)",
+        "en": "Windows logs (CBS, DISM, Panther)"
+      },
+      "note": "Журналы обслуживания Windows: C:\\Windows\\Logs целиком, включая CBS (сборки компонентов), DISM и Panther (установка и обновление) — отдельными правилами они не описываются, потому что лежат внутри этого дерева и задваивались бы в плане. Порог 14 дней (SPEC §4 FR-3) оставляет свежую диагностику и убирает накопившиеся логи. Службы обслуживания должны быть закрыты, занятые файлы движок пропускает."
+    },
+    {
+      "id": "logs.local",
+      "category": "logs",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\**\\Logs\\**\\*.log",
+      "minAgeDays": 14,
+      "title": {
+        "ru": "Журналы приложений",
+        "en": "Application logs"
+      },
+      "note": "Журналы приложений из подкаталогов Logs (%LOCALAPPDATA%\\…\\Logs, SPEC §4 FR-3). Берутся только файлы *.log: иначе под правило попали бы базы и файлы состояния приложений, которые лежат рядом с журналами. Порог 14 дней — как у системных журналов."
+    }
+  ]
+}

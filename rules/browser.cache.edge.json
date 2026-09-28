@@ -1,0 +1,112 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "browser.cache.edge",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\Cache\\**",
+      "requiresProcessesClosed": [
+        "msedge"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш Microsoft Edge",
+        "en": "Microsoft Edge cache"
+      },
+      "note": "HTTP-кэш Chromium в каталоге Cache профиля Edge (современный формат — подкаталог Cache_Data со служебными index/data_N и объектами f_*). Записи одноразовые: следующий заход на сайт скачает страницу заново, офлайн-данные сайтов сюда не попадают — они лежат в Service Worker\\CacheStorage и чистятся отдельным правилом. В шаблоне одиночный «*» вместо Default, так покрыты все профили пользователя (Default, Profile 1, Profile 2, Guest Profile, System Profile): каталоги профилей лежат рядом с Crashpad и ShaderCache, а одиночный «*» не пересекает границу каталога, поэтому в правило попадают только каталоги кэша. Возрастного порога нет (0 дней — как в примере правила этого файла в SPEC FR-4): кэш растёт и снижает отдачу SSD, держать его «до последнего» незачем. Нужен закрытый Edge — у работающего браузера файлы заняты, они попадут в «пропущено (занято)» по FR-6. Cookies, пароли и история этой строке не принадлежат: это категория browser.history с ручным подтверждением. Данные WebView2 (msedgewebview2) сюда не попадают намеренно: они лежат в отдельных каталогах приложений, которые используют встроенный браузер, и общие для нескольких программ."
+    },
+    {
+      "id": "browser.cache.edge.code",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\Code Cache\\**",
+      "requiresProcessesClosed": [
+        "msedge"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш кода Microsoft Edge (Code Cache)",
+        "en": "Microsoft Edge code cache"
+      },
+      "note": "Code Cache — скомпилированный V8-код JavaScript и WebAssembly (подкаталоги js и wasm). Удаление обратимо, но платится временем: скрипты тяжёлых сайтов компилируются заново при первом открытии, поэтому строку стоит чистить не чаще, чем раз в месяц и отдельно от основного кэша. Уровень safe — по SPEC FR-3. «Code Cache» не пересекается с «Cache» основного правила: литералы сегментов разные, один файл не попадёт в две очистки."
+    },
+    {
+      "id": "browser.cache.edge.gpu",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\GPUCache\\**",
+      "requiresProcessesClosed": [
+        "msedge"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш GPU Microsoft Edge",
+        "en": "Microsoft Edge GPU cache"
+      },
+      "note": "GPUCache — кэш скомпилированной графики и шейдеров Edge. Пересобирается при следующем запуске браузера, единственная цена очистки — первые страницы после неё открываются чуть дольше. Кэши шейдеров вне профиля (D3DSCache, NVIDIA/AMD) принадлежат категории shadercache и здесь намеренно не дублируются."
+    },
+    {
+      "id": "browser.cache.edge.serviceworker",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\Service Worker\\CacheStorage\\**",
+      "requiresProcessesClosed": [
+        "msedge"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш Service Worker в Microsoft Edge",
+        "en": "Microsoft Edge service worker cache"
+      },
+      "note": "Service Worker CacheStorage — «Service Worker Cache» из SPEC FR-3: офлайн-данные, которые сайт положил в Cache Storage через сервис-воркер. Правило бьёт по CacheStorage, а не по всему каталогу «Service Worker», — рядом лежат ScriptCache (скомпилированные скрипты) и Database (реестр регистраций сервис-воркеров). Реестр нужен браузеру, в перечне FR-3 его нет, и в примере правила из SPEC FR-4 ScriptCache тоже вынесен из очистки — эта строка следует тому же решению. Последствие очистки одно: офлайн-версия установленного PWA или web-приложения придёт заново из сети; учётные записи не затрагиваются, cookies и токены лежат в Network и относятся к browser.history."
+    },
+    {
+      "id": "browser.cache.edge.dawn",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\*Dawn*Cache\\**",
+      "requiresProcessesClosed": [
+        "msedge"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш Dawn в Microsoft Edge",
+        "en": "Microsoft Edge Dawn cache"
+      },
+      "note": "Кэш графического стека Dawn во всех вариантах имени каталога: DawnCache (старый), DawnWebGPUCache и GraphiteDawnCache (современный Chromium). Одно правило вместо трёх почти одинаковых: «*Dawn*Cache» — это сегмент, в котором есть Dawn и который на нём заканчивается; первый «*» — каталог профиля, оба остальных работают внутри сегмента и границу каталога не пересекают, поэтому под шаблон попадают только каталоги кэша Dawn. На части версий такого каталога нет — это норма, кандидатов не будет."
+    },
+    {
+      "id": "browser.cache.edge.old",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\Old\\**",
+      "minAgeDays": 1,
+      "requiresProcessesClosed": [
+        "msedge"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Старый кэш Microsoft Edge (Old)",
+        "en": "Microsoft Edge legacy cache (Old)"
+      },
+      "note": "Каталог Old из перечня SPEC FR-3 (на одном уровне с Cache, Code Cache, GPUCache и blob_storage). Встречается только в старых версиях браузера, где в нём оставался кэш в устаревшем формате; в современных Edge его обычно нет, и отсутствие каталога правилу не мешает. Осторожность с формулировкой та же, что у остальных safe-правил: locator не содержит имени «Cache», а движок не принимает safe-правило без возрастного порога (проверка узости в core/rules.cpp), поэтому стоит minAgeDays 1 — сутки не меняют смысла кэша, зато правило не снесёт содержимое, если в старой версии под этим именем окажется что-то ещё. Если каталог вы не встречали, строку можно отключить."
+    },
+    {
+      "id": "browser.cache.edge.blob",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\blob_storage\\**",
+      "minAgeDays": 1,
+      "requiresProcessesClosed": [
+        "msedge"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Хранилище блобов Microsoft Edge (blob_storage)",
+        "en": "Microsoft Edge blob storage"
+      },
+      "note": "blob_storage — хранилище блобов, которые Edge создаёт для сайтов, работающих с File System Access API; в SPEC FR-3 этот каталог перечислен явно, поэтому покрыт наравне с остальным кэшем. Обычные сайты API не пользуются, а для сайта, который писал данные «в файлы» через браузер, после очистки данные придётся получить заново и, возможно, подтвердить доступ к каталогу. Строка показывается отдельной с этим объяснением. К cookies, истории и сохранённым паролям отношения не имеет. Порог в 1 день — не про возраст данных, а про формулировку правила: имя каталога blob_storage не содержит маркера «Cache», а движок не принимает safe-правило без возрастного порога (проверка узости safe-правил в core/rules.cpp)."
+    }
+  ]
+}

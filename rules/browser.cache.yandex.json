@@ -1,0 +1,124 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "browser.cache.yandex",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\*\\Cache\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "browser",
+        "YandexBrowser"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш Яндекс.Браузера (Cache)",
+        "en": "Yandex Browser cache"
+      },
+      "note": "Кэш HTTP-ресурсов профиля Яндекс.Браузера: %LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\<профиль>\\Cache (данные лежат в Cache\\Cache_Data — шаблон покрывает оба уровня). Сегмент «*» — имена профилей Default, Profile N и переименованных, поэтому список профилей в правиле не нужен. Кэш пересоздаётся при следующем обращении к сайту, категория browser.cache помечена Safe в SPEC §4 FR-3. Важная особенность: исполняемый файл Яндекс.Браузера называется browser.exe, поэтому в requiresProcessesClosed указано имя browser — Restart Manager найдёт и процесс браузера. Имя общее с другими приложениями, и это безопасная сторона ошибки: если запущено чужое browser.exe, кандидат попадёт в «пропущено (занято)», но не будет удалён. Имя YandexBrowser в том же списке — старые сборки и обновлятор; несуществующее имя процесса просто ничего не блокирует. История, cookies, пароли и закладки в это правило не входят: они в browser.history с уровнем review и по умолчанию выключены (SPEC §4 FR-3). Описано только штатное расположение профиля в профиле пользователя: неизвестные пути движок не удаляет никогда (SPEC §10)."
+    },
+    {
+      "id": "browser.cache.yandex.code",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\*\\Code Cache\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "browser",
+        "YandexBrowser"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Скомпилированный код Яндекс.Браузера (Code Cache)",
+        "en": "Yandex Browser compiled code cache"
+      },
+      "note": "Code Cache профиля Яндекс.Браузера — компиляция JavaScript и WebAssembly (js, wasm). Восстановим, платим CPU при следующем открытии сайтов, поэтому Safe и minAgeDays=0. С каталогом Cache не пересекается: «Code Cache» — отдельный сегмент пути. Процессы те же, что в первом правиле файла: browser (актуальные сборки) и YandexBrowser (старые)."
+    },
+    {
+      "id": "browser.cache.yandex.gpu",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\*\\GPUCache\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "browser",
+        "YandexBrowser"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Графический кэш Яндекс.Браузера (GPUCache)",
+        "en": "Yandex Browser GPU cache"
+      },
+      "note": "GPUCache профиля Яндекс.Браузера — скомпилированные шейдеры и кэш текстур. Пересоздаётся драйвером видеокарты, пользовательских данных не содержит, поэтому Safe без возрастного порога. Драйверные шейдерные кэши (D3DSCache, NVIDIA, AMD) в правило не входят: они в категории shadercache, чтобы один файл не учитывался в двух категориях."
+    },
+    {
+      "id": "browser.cache.yandex.serviceworker",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\*\\Service Worker\\CacheStorage\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "browser",
+        "YandexBrowser"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Офлайн-кэш сайтов Яндекс.Браузера (Service Worker CacheStorage)",
+        "en": "Yandex Browser site offline cache (Service Worker CacheStorage)"
+      },
+      "note": "CacheStorage service worker'а — офлайн-копии сайтов, созданные через Cache API (SPEC §4 FR-3, «Service Worker Cache»). Восстановятся при следующем онлайн-визите, до этого офлайн-режим сайта не заработает. ScriptCache не чистим — он исключён и в примере правила Edge из SPEC §4 FR-4. Сегменты Database и ScriptCache под шаблон не подпадают: это другие каталоги пути."
+    },
+    {
+      "id": "browser.cache.yandex.dawn",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\*\\*Dawn*Cache\\**",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "browser",
+        "YandexBrowser"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш WebGPU Яндекс.Браузера (DawnCache)",
+        "en": "Yandex Browser WebGPU cache (DawnCache)"
+      },
+      "note": "Кэш WebGPU-бэкенда Dawn (SPEC §4 FR-3). Название каталога менялось между версиями Chromium: DawnCache, DawnWebGPUCache, GraphiteDawnCache. Перечисления в схеме правил нет, а три отдельных правила дали бы три кандидата на одни и те же файлы, поэтому описан шаблон «*Dawn*Cache» — он покрывает все три имени и не выходит за каталоги профиля."
+    },
+    {
+      "id": "browser.cache.yandex.old",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\*\\Old\\**",
+      "minAgeDays": 1,
+      "requiresProcessesClosed": [
+        "browser",
+        "YandexBrowser"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Остатки кэша Яндекс.Браузера после миграции профиля (Old)",
+        "en": "Yandex Browser leftover cache after profile migration (Old)"
+      },
+      "note": "Каталог Old — остатки старого кэша после переименования, восстановления или смены мажорной версии профиля Яндекс.Браузера (SPEC §4 FR-3, «Old/»); браузер его больше не использует. Порог 1 день, а не 0: имя каталога не содержит «Cache», а загрузчик правил (core/rules.cpp) отклоняет правило уровня safe без возрастного порога и без узнаваемого имени кэша — для остатков миграции возраст всё равно всегда проходит."
+    },
+    {
+      "id": "browser.cache.yandex.blob",
+      "category": "browser.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\*\\blob_storage\\**",
+      "minAgeDays": 1,
+      "requiresProcessesClosed": [
+        "browser",
+        "YandexBrowser"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Файлы blob-ссылок Яндекс.Браузера (blob_storage)",
+        "en": "Yandex Browser blob storage files"
+      },
+      "note": "blob_storage профиля Яндекс.Браузера — файлы, на которые ссылались blob:-ссылки страниц (SPEC §4 FR-3, «blob_storage»). Пока вкладка открыта, ссылка жива: правило требует закрытого браузера (процесс browser), занятое пропускается по FR-6. Порог 1 день по той же причине, что в правиле Old: в имени каталога нет «Cache», а правило safe без minAgeDays валидатор не принимает. Обычные загрузки пользователя в этом каталоге не лежат, поэтому затрагиваются только blob-ссылки."
+    }
+  ]
+}

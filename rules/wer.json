@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "wer",
+      "category": "wer",
+      "safety": "safe",
+      "locator": "C:\\ProgramData\\Microsoft\\Windows\\WER\\**",
+      "minAgeDays": 7,
+      "title": {
+        "ru": "Отчёты об ошибках Windows (WER)",
+        "en": "Windows Error Reporting (WER)"
+      },
+      "note": "Отчёты Windows Error Reporting: C:\\ProgramData\\Microsoft\\Windows\\WER (ReportQueue, ReportArchive, Temp). Это накопленные отчёты о падениях приложений и самой Windows; порог 7 дней оставляет свежие отчёты на выгрузку и разбор, старые — чистый мусор. Дампы памяти (.dmp) в правило не попадают: они в категориях crash.dumps и memory.dumps."
+    }
+  ]
+}

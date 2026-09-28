@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "prefetch.files",
+      "category": "prefetch",
+      "safety": "review",
+      "locator": "C:\\Windows\\Prefetch\\**\\*.pf",
+      "minAgeDays": 30,
+      "title": {
+        "ru": "Prefetch Windows",
+        "en": "Windows Prefetch"
+      },
+      "note": "Записи Prefetch (файлы *.pf) ускоряют запуск программ и нужны при отладке, а места сами по себе почти не дают — поэтому review и выключено по умолчанию. Порог 30 дней: записи часто запускаемых программ ОС перезаписывает за дни и их удаление заметно. Путь задан литералом C:\\Windows: если Windows на другом диске, кандидатов не будет."
+    }
+  ]
+}

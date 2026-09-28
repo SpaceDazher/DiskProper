@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "firefox.cache.cache2",
+      "category": "firefox.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\*\\cache2\\**",
+      "requiresProcessesClosed": ["firefox"],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш веб-страниц Firefox (cache2)",
+        "en": "Firefox web page cache (cache2)"
+      },
+      "note": "Дисковый кэш Firefox в формате cache2 (начиная с Firefox 35): %LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\<профиль>\\cache2. Теряются только сетевые копии страниц, картинок и скриптов — браузер скачает их заново, платим скоростью первых загрузок. Рядом в том же профиле лежат prefs.js, places.sqlite и logins.json: это данные пользователя, правило их не затрагивает, потому что называет только каталог cache2. Категория firefox.cache объявлена Safe в SPEC §4 FR-3, поэтому возрастной порог не нужен: содержимое восстановимо полностью. Требуется закрытый Firefox, занятые файлы движок пропустит по FR-6. Каталога cache2 у пользователя может не быть — отсутствие каталога ошибкой не считается."
+    },
+    {
+      "id": "firefox.cache.startup",
+      "category": "firefox.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\*\\startupCache\\**",
+      "requiresProcessesClosed": ["firefox"],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Стартовый кэш Firefox (startupCache)",
+        "en": "Firefox startup cache (startupCache)"
+      },
+      "note": "Скомпилированный при первом запуске код интерфейса и служебных модулей: %LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\<профиль>\\startupCache. Firefox пересобирает его при следующем старте самостоятельно, поэтому по SPEC §4 FR-3 (firefox.cache = Safe) очистка безопасна; цена — несколько секунд на первый запуск после неё. Кэш общий для всех окон и вкладок, поэтому правило требует закрытого браузера, а не только закрытой вкладки."
+    },
+    {
+      "id": "firefox.cache.offline",
+      "category": "firefox.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\*\\offlineCache\\**",
+      "requiresProcessesClosed": ["firefox"],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Офлайн-кэш Firefox (offlineCache)",
+        "en": "Firefox offline cache (offlineCache)"
+      },
+      "note": "Кэш страниц, помеченных сайтами как «доступно офлайн», и служебные данные этого режима: %LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\<профиль>\\offlineCache. Каталог прямо назван в SPEC §4 FR-3 и отнесён там к Safe: после удаления офлайн-страницы придётся скачать заново, а кэш пересоберётся при первом обращении. Данные пользователя (история, закладки, пароли, расширения) лежат в других файлах профиля и правилом не затрагиваются."
+    },
+    {
+      "id": "firefox.cache.shader",
+      "category": "firefox.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\*\\shader-cache\\**",
+      "requiresProcessesClosed": ["firefox"],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш шейдеров Firefox (shader-cache)",
+        "en": "Firefox shader cache (shader-cache)"
+      },
+      "note": "Кэш скомпилированных шейдеров WebRender и ANGLE: %LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\<профиль>\\shader-cache. Браузер компилирует их заново при следующем запуске, платим несколькими лишними кадрами при отрисовке. Не путать с категорией shadercache (D3DSCache, кэши драйверов NVIDIA и AMD): здесь только кэш шейдеров самого Firefox, и он остаётся в категории firefox.cache по SPEC §4 FR-3, поэтому PlanBuilder не считает его дважды — пересечения с правилами категории shadercache нет, пути разные."
+    },
+    {
+      "id": "firefox.cache.legacy",
+      "category": "firefox.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\*\\Cache\\**",
+      "requiresProcessesClosed": ["firefox"],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Старый кэш Firefox (Cache, до Firefox 35)",
+        "en": "Legacy Firefox cache (pre-cache2)"
+      },
+      "note": "Каталог Cache в формате, который Firefox использовал до версии 35: %LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\<профиль>\\Cache. Остаётся у пользователей, чей профиль так и не мигрировал с очень старой версии браузера, и иногда занимает сотни мегабайт. На современных установках каталога нет — правило просто не даёт кандидатов, отсутствие каталога ошибкой не считается. Содержимое — те же сетевые копии страниц, поэтому safety=safe. Не пересекается с cache2: это разные каталоги с разными именами, двойного счёта в плане не будет."
+    }
+  ]
+}

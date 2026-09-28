@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "wsl.vhdx.report.distro.store",
+      "category": "wsl.vhdx.report",
+      "safety": "risky",
+      "locator": "%LOCALAPPDATA%\\Packages\\*\\LocalState\\ext4.vhdx",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "wsl",
+        "wslhost",
+        "wslservice",
+        "vmmemWSL"
+      ],
+      "title": {
+        "ru": "WSL: образы дистрибутивов из Microsoft Store",
+        "en": "WSL: Store distro disk images"
+      },
+      "note": "Виртуальные жёсткие диски WSL2-дистрибутивов, установленных из Microsoft Store: %LOCALAPPDATA%\\Packages\\<пакет>\\LocalState\\ext4.vhdx. В SPEC §4 FR-3 такой категории нет — это расширение набора, и оно сделано по образцу winsxs.report и installer.cache: только оценка. Уровень risky не из-за файловой системы, а из-за смысла: файл ext4.vhdx — это весь дистрибутив, его удаление равносильно удалению данных гостевой системы. Risky по SPEC §4 FR-4 скрыт по умолчанию и показывается только через «показать все» с подтверждением. minAgeDays=0 намеренно: возраст файла не делает его безопаснее, а в отчёте нужен реальный объём. Важно: у разреженного VHDX логический размер (свойства файла) заметно больше аллоцированного — освободится именно аллоцированный, поэтому отчёт может показывать число меньше ожидаемого. Место освобождается не удалением, а сжатием: wsl --manage <дистрибутив> --set-sparse true после wsl --shutdown (для старых сборок — Optimize-VHD/diskpart compact). Импортированные дистрибутивы, лежащие вне Packages (например, на диске D:), этим правилом не ловятся: их пути хранятся в реестре, и их должен показать провайдер, а не шаблон пути."
+    },
+    {
+      "id": "wsl.vhdx.report.distro.wsl",
+      "category": "wsl.vhdx.report",
+      "safety": "risky",
+      "locator": "%LOCALAPPDATA%\\wsl\\**\\ext4.vhdx",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "wsl",
+        "wslhost",
+        "wslservice",
+        "vmmemWSL"
+      ],
+      "title": {
+        "ru": "WSL: образы дистрибутивов новой схемы установки",
+        "en": "WSL: disk images from the new install layout"
+      },
+      "note": "Новая схема установки дистрибутивов (wsl --install, WSL Store-версии 2.x и новее) кладёт образы в %LOCALAPPDATA%\\wsl\\<дистрибутив>\\ext4.vhdx, а не в Packages. Без этого правила такая установка в отчёте не видна вообще, поэтому оно идёт отдельной строкой, хотя смысл ровно тот же, что у wsl.vhdx.report.distro.store: только оценка, risky, скрыт по умолчанию. Очистки нет — только сжатие после wsl --shutdown."
+    },
+    {
+      "id": "wsl.vhdx.report.docker.desktop",
+      "category": "wsl.vhdx.report",
+      "safety": "risky",
+      "locator": "%LOCALAPPDATA%\\Docker\\wsl\\**\\*.vhdx",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "Docker Desktop",
+        "com.docker.backend",
+        "com.docker.build",
+        "dockerd",
+        "vmmemWSL"
+      ],
+      "title": {
+        "ru": "Docker Desktop: образ WSL2 с образами, слоями и кэшем сборки",
+        "en": "Docker Desktop: WSL2 disk with images, layers and build cache"
+      },
+      "note": "Рабочий диск Docker Desktop на бэкенде WSL2: %LOCALAPPDATA%\\Docker\\wsl\\disk\\docker_data.vhdx в свежих версиях и %LOCALAPPDATA%\\Docker\\wsl\\data\\ext4.vhdx в версиях до 4.x — шаблон покрывает оба. Внутри лежат образы, слои и кэш сборок: они не «мусор» в бытовом смысле, из них собираются образы и запускаются контейнеры, поэтому risky и скрыт по умолчанию (SPEC §4 FR-4). Оценка без удаления. Правильный порядок освобождения места: docker system df для разбора, затем docker system prune / docker builder prune / docker image prune, затем wsl --shutdown и только после этого сжатие образа — простое удаление файла уничтожает все контейнеры и образы разом. Число в отчёте — аллоцированный размер, у разреженного образа он меньше логического."
+    },
+    {
+      "id": "wsl.vhdx.report.docker.hyperv",
+      "category": "wsl.vhdx.report",
+      "safety": "risky",
+      "locator": "%ProgramData%\\DockerDesktop\\vm-data\\*.vhdx",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "Docker Desktop",
+        "com.docker.backend",
+        "vmcompute",
+        "vmmem"
+      ],
+      "title": {
+        "ru": "Docker Desktop: диск виртуальной машины (Hyper-V)",
+        "en": "Docker Desktop: virtual machine disk (Hyper-V)"
+      },
+      "note": "Вариант Docker Desktop без WSL2 — бэкенд на Hyper-V: рабочий диск виртуальной машины лежит в %ProgramData%\\DockerDesktop\\vm-data. На WSL2-хосте каталога обычно нет, и правило просто неактивно — это нормально и не ошибка. Смысл и уровень те же: только оценка, risky, скрыт по умолчанию, удаление файла равносильно потере всех образов и контейнеров. Порядок освобождения: docker system prune внутри виртуальной машины, затем сжатие VHDX средствами Hyper-V (Optimize-VHD, виртуальная машина должна быть выключена)."
+    }
+  ]
+}

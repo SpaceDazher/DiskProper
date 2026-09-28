@@ -1,0 +1,634 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "browser.history.chrome.history",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\History*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "chrome"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "История посещений: Google Chrome",
+        "en": "Browsing history: Google Chrome"
+      },
+      "note": "База SQLite с журналом посещений: адреса, заголовки, число и время визитов; в той же базе лежит история загрузок, поэтому после очистки список «Загрузки» тоже опустеет. «History*» берёт и служебные History-journal/History-wal. Восстановление — из корзины приложения (FR-7) и частично из облачной синхронизации, если она была включена. Review и выключено по умолчанию, как требует SPEC §4 FR-3 для browser.history: история не мусор, её удаление — осознанное решение. Путь: %LOCALAPPDATA%\\Google\\Chrome\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили (Default, Profile N, Guest Profile, System Profile). Нужен закрытый Chrome (chrome.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся. Строка не пересекается с browser.cache: там Cache, Code Cache, GPUCache, Service Worker, DawnCache, Old и blob_storage — другие имена файлов, поэтому один файл не попадёт в две очистки (у PlanBuilder дедупликации кандидатов по пути нет)."
+    },
+    {
+      "id": "browser.history.chrome.cookies",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\Cookies*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "chrome"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Cookies: Google Chrome",
+        "en": "Cookies: Google Chrome"
+      },
+      "note": "База cookie: идентификаторы сессий, значения и предпочтения сайтов, включая флаги согласия на cookie. После удаления пользователь выйдет из всех аккаунтов, сайты заново спросят согласие, а часть сайтов потребует повторного входа. «Cookies*» покрывает и Cookies-journal/Cookies-wal. Review, выключено по умолчанию: выход из аккаунтов — это последствие, а не побочный эффект уборки мусора. Путь: %LOCALAPPDATA%\\Google\\Chrome\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили (Default, Profile N, Guest Profile, System Profile). Нужен закрытый Chrome (chrome.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.chrome.passwords",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\Login Data*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "chrome"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Сохранённые пароли: Google Chrome",
+        "en": "Saved passwords: Google Chrome"
+      },
+      "note": "База сохранённых логинов с зашифрованными паролями; «Login Data*» покрывает и «Login Data For Account» с учётными записями Google. Удаление необратимо для паролей, которых нет в облаке: их придётся вводить заново или менять на стороне сайта. Отдельная строка намеренно: её можно снять, оставив историю и cookies, — ради освобождения места она не нужна, а цена ошибки максимальна во всей категории. Отмена возможна только из корзины приложения и пока транзакция не схлопнулась (FR-7). Путь: %LOCALAPPDATA%\\Google\\Chrome\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили (Default, Profile N, Guest Profile, System Profile). Нужен закрытый Chrome (chrome.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.chrome.autofill",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\Web Data*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "chrome"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Автозаполнение и сохранённые карты: Google Chrome",
+        "en": "Autofill and saved cards: Google Chrome"
+      },
+      "note": "Адреса автозаполнения, сохранённые банковские карты (номера лежат в этом же файле) и ярлыки поисковиков: после удаления всё это вводится заново, часть ярлыков — вручную. Отдельная строка с review, а не «очистить профиль целиком»: платёжные данные не должны теряться вместе с кэшем. Путь: %LOCALAPPDATA%\\Google\\Chrome\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили (Default, Profile N, Guest Profile, System Profile). Нужен закрытый Chrome (chrome.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.chrome.favicons",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\*\\Favicons*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "chrome"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш значков сайтов: Google Chrome",
+        "en": "Favicon cache: Google Chrome"
+      },
+      "note": "Кэш значков сайтов (файл базы SQLite). По сути это кэш — пересобирается при следующих посещениях, цена нулевая, но SPEC §4 FR-3 относит значки к browser.history, поэтому review вместе со всей категорией: включать стоит вместе с историей. Путь: %LOCALAPPDATA%\\Google\\Chrome\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили (Default, Profile N, Guest Profile, System Profile). Нужен закрытый Chrome (chrome.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.edge.history",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\History*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "msedge"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "История посещений: Microsoft Edge",
+        "en": "Browsing history: Microsoft Edge"
+      },
+      "note": "База SQLite с журналом посещений: адреса, заголовки, число и время визитов; в той же базе лежит история загрузок, поэтому после очистки список «Загрузки» тоже опустеет. «History*» берёт и служебные History-journal/History-wal. Восстановление — из корзины приложения (FR-7) и частично из облачной синхронизации, если она была включена. Review и выключено по умолчанию, как требует SPEC §4 FR-3 для browser.history: история не мусор, её удаление — осознанное решение. Путь: %LOCALAPPDATA%\\Microsoft\\Edge\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили, включая Guest Profile. Нужен закрытый Microsoft Edge (msedge.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся. WebView2 (msedgewebview2.exe) данных профиля браузера не касается и в список не входит."
+    },
+    {
+      "id": "browser.history.edge.cookies",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\Cookies*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "msedge"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Cookies: Microsoft Edge",
+        "en": "Cookies: Microsoft Edge"
+      },
+      "note": "База cookie: идентификаторы сессий, значения и предпочтения сайтов, включая флаги согласия на cookie. После удаления пользователь выйдет из всех аккаунтов, сайты заново спросят согласие, а часть сайтов потребует повторного входа. «Cookies*» покрывает и Cookies-journal/Cookies-wal. Review, выключено по умолчанию: выход из аккаунтов — это последствие, а не побочный эффект уборки мусора. Путь: %LOCALAPPDATA%\\Microsoft\\Edge\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили, включая Guest Profile. Нужен закрытый Microsoft Edge (msedge.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.edge.passwords",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\Login Data*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "msedge"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Сохранённые пароли: Microsoft Edge",
+        "en": "Saved passwords: Microsoft Edge"
+      },
+      "note": "База сохранённых логинов с зашифрованными паролями; «Login Data*» покрывает и «Login Data For Account» с учётными записями Google. Удаление необратимо для паролей, которых нет в облаке: их придётся вводить заново или менять на стороне сайта. Отдельная строка намеренно: её можно снять, оставив историю и cookies, — ради освобождения места она не нужна, а цена ошибки максимальна во всей категории. Отмена возможна только из корзины приложения и пока транзакция не схлопнулась (FR-7). Путь: %LOCALAPPDATA%\\Microsoft\\Edge\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили, включая Guest Profile. Нужен закрытый Microsoft Edge (msedge.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.edge.autofill",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\Web Data*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "msedge"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Автозаполнение и сохранённые карты: Microsoft Edge",
+        "en": "Autofill and saved cards: Microsoft Edge"
+      },
+      "note": "Адреса автозаполнения, сохранённые банковские карты (номера лежат в этом же файле) и ярлыки поисковиков: после удаления всё это вводится заново, часть ярлыков — вручную. Отдельная строка с review, а не «очистить профиль целиком»: платёжные данные не должны теряться вместе с кэшем. Путь: %LOCALAPPDATA%\\Microsoft\\Edge\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили, включая Guest Profile. Нужен закрытый Microsoft Edge (msedge.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.edge.favicons",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\Favicons*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "msedge"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш значков сайтов: Microsoft Edge",
+        "en": "Favicon cache: Microsoft Edge"
+      },
+      "note": "Кэш значков сайтов (файл базы SQLite). По сути это кэш — пересобирается при следующих посещениях, цена нулевая, но SPEC §4 FR-3 относит значки к browser.history, поэтому review вместе со всей категорией: включать стоит вместе с историей. Путь: %LOCALAPPDATA%\\Microsoft\\Edge\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили, включая Guest Profile. Нужен закрытый Microsoft Edge (msedge.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.brave.history",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\*\\History*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "brave"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "История посещений: Brave",
+        "en": "Browsing history: Brave"
+      },
+      "note": "База SQLite с журналом посещений: адреса, заголовки, число и время визитов; в той же базе лежит история загрузок, поэтому после очистки список «Загрузки» тоже опустеет. «History*» берёт и служебные History-journal/History-wal. Восстановление — из корзины приложения (FR-7) и частично из облачной синхронизации, если она была включена. Review и выключено по умолчанию, как требует SPEC §4 FR-3 для browser.history: история не мусор, её удаление — осознанное решение. Путь: %LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Brave (brave.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся. Путь канонический для установки на пользователя; при переносе каталога данных Brave на другой диск правило просто не найдёт кандидатов."
+    },
+    {
+      "id": "browser.history.brave.cookies",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\*\\Cookies*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "brave"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Cookies: Brave",
+        "en": "Cookies: Brave"
+      },
+      "note": "База cookie: идентификаторы сессий, значения и предпочтения сайтов, включая флаги согласия на cookie. После удаления пользователь выйдет из всех аккаунтов, сайты заново спросят согласие, а часть сайтов потребует повторного входа. «Cookies*» покрывает и Cookies-journal/Cookies-wal. Review, выключено по умолчанию: выход из аккаунтов — это последствие, а не побочный эффект уборки мусора. Путь: %LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Brave (brave.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.brave.passwords",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\*\\Login Data*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "brave"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Сохранённые пароли: Brave",
+        "en": "Saved passwords: Brave"
+      },
+      "note": "База сохранённых логинов с зашифрованными паролями; «Login Data*» покрывает и «Login Data For Account» с учётными записями Google. Удаление необратимо для паролей, которых нет в облаке: их придётся вводить заново или менять на стороне сайта. Отдельная строка намеренно: её можно снять, оставив историю и cookies, — ради освобождения места она не нужна, а цена ошибки максимальна во всей категории. Отмена возможна только из корзины приложения и пока транзакция не схлопнулась (FR-7). Путь: %LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Brave (brave.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.brave.autofill",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\*\\Web Data*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "brave"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Автозаполнение и сохранённые карты: Brave",
+        "en": "Autofill and saved cards: Brave"
+      },
+      "note": "Адреса автозаполнения, сохранённые банковские карты (номера лежат в этом же файле) и ярлыки поисковиков: после удаления всё это вводится заново, часть ярлыков — вручную. Отдельная строка с review, а не «очистить профиль целиком»: платёжные данные не должны теряться вместе с кэшем. Путь: %LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Brave (brave.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.brave.favicons",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\*\\Favicons*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "brave"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш значков сайтов: Brave",
+        "en": "Favicon cache: Brave"
+      },
+      "note": "Кэш значков сайтов (файл базы SQLite). По сути это кэш — пересобирается при следующих посещениях, цена нулевая, но SPEC §4 FR-3 относит значки к browser.history, поэтому review вместе со всей категорией: включать стоит вместе с историей. Путь: %LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Brave (brave.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.vivaldi.history",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Vivaldi\\User Data\\*\\History*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "vivaldi"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "История посещений: Vivaldi",
+        "en": "Browsing history: Vivaldi"
+      },
+      "note": "База SQLite с журналом посещений: адреса, заголовки, число и время визитов; в той же базе лежит история загрузок, поэтому после очистки список «Загрузки» тоже опустеет. «History*» берёт и служебные History-journal/History-wal. Восстановление — из корзины приложения (FR-7) и частично из облачной синхронизации, если она была включена. Review и выключено по умолчанию, как требует SPEC §4 FR-3 для browser.history: история не мусор, её удаление — осознанное решение. Путь: %LOCALAPPDATA%\\Vivaldi\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Vivaldi (vivaldi.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся. У Vivaldi каталог данных называется User Data — как у остальных браузеров на движке Chromium."
+    },
+    {
+      "id": "browser.history.vivaldi.cookies",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Vivaldi\\User Data\\*\\Cookies*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "vivaldi"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Cookies: Vivaldi",
+        "en": "Cookies: Vivaldi"
+      },
+      "note": "База cookie: идентификаторы сессий, значения и предпочтения сайтов, включая флаги согласия на cookie. После удаления пользователь выйдет из всех аккаунтов, сайты заново спросят согласие, а часть сайтов потребует повторного входа. «Cookies*» покрывает и Cookies-journal/Cookies-wal. Review, выключено по умолчанию: выход из аккаунтов — это последствие, а не побочный эффект уборки мусора. Путь: %LOCALAPPDATA%\\Vivaldi\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Vivaldi (vivaldi.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.vivaldi.passwords",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Vivaldi\\User Data\\*\\Login Data*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "vivaldi"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Сохранённые пароли: Vivaldi",
+        "en": "Saved passwords: Vivaldi"
+      },
+      "note": "База сохранённых логинов с зашифрованными паролями; «Login Data*» покрывает и «Login Data For Account» с учётными записями Google. Удаление необратимо для паролей, которых нет в облаке: их придётся вводить заново или менять на стороне сайта. Отдельная строка намеренно: её можно снять, оставив историю и cookies, — ради освобождения места она не нужна, а цена ошибки максимальна во всей категории. Отмена возможна только из корзины приложения и пока транзакция не схлопнулась (FR-7). Путь: %LOCALAPPDATA%\\Vivaldi\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Vivaldi (vivaldi.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.vivaldi.autofill",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Vivaldi\\User Data\\*\\Web Data*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "vivaldi"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Автозаполнение и сохранённые карты: Vivaldi",
+        "en": "Autofill and saved cards: Vivaldi"
+      },
+      "note": "Адреса автозаполнения, сохранённые банковские карты (номера лежат в этом же файле) и ярлыки поисковиков: после удаления всё это вводится заново, часть ярлыков — вручную. Отдельная строка с review, а не «очистить профиль целиком»: платёжные данные не должны теряться вместе с кэшем. Путь: %LOCALAPPDATA%\\Vivaldi\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Vivaldi (vivaldi.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.vivaldi.favicons",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Vivaldi\\User Data\\*\\Favicons*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "vivaldi"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш значков сайтов: Vivaldi",
+        "en": "Favicon cache: Vivaldi"
+      },
+      "note": "Кэш значков сайтов (файл базы SQLite). По сути это кэш — пересобирается при следующих посещениях, цена нулевая, но SPEC §4 FR-3 относит значки к browser.history, поэтому review вместе со всей категорией: включать стоит вместе с историей. Путь: %LOCALAPPDATA%\\Vivaldi\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Vivaldi (vivaldi.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.yandex.history",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\*\\History*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "browser"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "История посещений: Яндекс.Браузер",
+        "en": "Browsing history: Yandex Browser"
+      },
+      "note": "База SQLite с журналом посещений: адреса, заголовки, число и время визитов; в той же базе лежит история загрузок, поэтому после очистки список «Загрузки» тоже опустеет. «History*» берёт и служебные History-journal/History-wal. Восстановление — из корзины приложения (FR-7) и частично из облачной синхронизации, если она была включена. Review и выключено по умолчанию, как требует SPEC §4 FR-3 для browser.history: история не мусор, её удаление — осознанное решение. Путь: %LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Яндекс.Браузер (browser.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся. Исполняемый файл Яндекс.Браузера — browser.exe, а имя это общее для сторонних программ: закрыть приложение может попросить лишнее, что безопаснее удаления при работающем браузере."
+    },
+    {
+      "id": "browser.history.yandex.cookies",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\*\\Cookies*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "browser"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Cookies: Яндекс.Браузер",
+        "en": "Cookies: Yandex Browser"
+      },
+      "note": "База cookie: идентификаторы сессий, значения и предпочтения сайтов, включая флаги согласия на cookie. После удаления пользователь выйдет из всех аккаунтов, сайты заново спросят согласие, а часть сайтов потребует повторного входа. «Cookies*» покрывает и Cookies-journal/Cookies-wal. Review, выключено по умолчанию: выход из аккаунтов — это последствие, а не побочный эффект уборки мусора. Путь: %LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Яндекс.Браузер (browser.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.yandex.passwords",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\*\\Login Data*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "browser"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Сохранённые пароли: Яндекс.Браузер",
+        "en": "Saved passwords: Yandex Browser"
+      },
+      "note": "База сохранённых логинов с зашифрованными паролями; «Login Data*» покрывает и «Login Data For Account» с учётными записями Google. Удаление необратимо для паролей, которых нет в облаке: их придётся вводить заново или менять на стороне сайта. Отдельная строка намеренно: её можно снять, оставив историю и cookies, — ради освобождения места она не нужна, а цена ошибки максимальна во всей категории. Отмена возможна только из корзины приложения и пока транзакция не схлопнулась (FR-7). Путь: %LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Яндекс.Браузер (browser.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.yandex.autofill",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\*\\Web Data*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "browser"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Автозаполнение и сохранённые карты: Яндекс.Браузер",
+        "en": "Autofill and saved cards: Yandex Browser"
+      },
+      "note": "Адреса автозаполнения, сохранённые банковские карты (номера лежат в этом же файле) и ярлыки поисковиков: после удаления всё это вводится заново, часть ярлыков — вручную. Отдельная строка с review, а не «очистить профиль целиком»: платёжные данные не должны теряться вместе с кэшем. Путь: %LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Яндекс.Браузер (browser.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.yandex.favicons",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\*\\Favicons*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "browser"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш значков сайтов: Яндекс.Браузер",
+        "en": "Favicon cache: Yandex Browser"
+      },
+      "note": "Кэш значков сайтов (файл базы SQLite). По сути это кэш — пересобирается при следующих посещениях, цена нулевая, но SPEC §4 FR-3 относит значки к browser.history, поэтому review вместе со всей категорией: включать стоит вместе с историей. Путь: %LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили. Нужен закрытый Яндекс.Браузер (browser.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.opera.history",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Opera Software\\Opera*Stable\\**\\History*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "opera",
+        "opera_gx"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "История посещений: Opera",
+        "en": "Browsing history: Opera"
+      },
+      "note": "База SQLite с журналом посещений: адреса, заголовки, число и время визитов; в той же базе лежит история загрузок, поэтому после очистки список «Загрузки» тоже опустеет. «History*» берёт и служебные History-journal/History-wal. Восстановление — из корзины приложения (FR-7) и частично из облачной синхронизации, если она была включена. Review и выключено по умолчанию, как требует SPEC §4 FR-3 для browser.history: история не мусор, её удаление — осознанное решение. Путь: %USERPROFILE%\\AppData\\Roaming\\Opera Software\\Opera Stable, каталог данных выбирается маской «Opera*Stable», а «**» берёт и раскладку с подкаталогом профиля. Нужен закрытый Opera (opera.exe или opera_gx.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся. «Opera*Stable» берёт ещё и Opera GX Stable, а ложные совпадения ограничены точным именем файла. Путь — это %APPDATA%\\Opera Software\\Opera Stable, записанный через %USERPROFILE%\\AppData\\Roaming: набор правил использует только переменные, гарантированно присутствующие в карте окружения загрузчика, иначе правило молча не сработает."
+    },
+    {
+      "id": "browser.history.opera.cookies",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Opera Software\\Opera*Stable\\**\\Cookies*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "opera",
+        "opera_gx"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Cookies: Opera",
+        "en": "Cookies: Opera"
+      },
+      "note": "База cookie: идентификаторы сессий, значения и предпочтения сайтов, включая флаги согласия на cookie. После удаления пользователь выйдет из всех аккаунтов, сайты заново спросят согласие, а часть сайтов потребует повторного входа. «Cookies*» покрывает и Cookies-journal/Cookies-wal. Review, выключено по умолчанию: выход из аккаунтов — это последствие, а не побочный эффект уборки мусора. Путь: %USERPROFILE%\\AppData\\Roaming\\Opera Software\\Opera Stable, каталог данных выбирается маской «Opera*Stable», а «**» берёт и раскладку с подкаталогом профиля. Нужен закрытый Opera (opera.exe или opera_gx.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.opera.passwords",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Opera Software\\Opera*Stable\\**\\Login Data*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "opera",
+        "opera_gx"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Сохранённые пароли: Opera",
+        "en": "Saved passwords: Opera"
+      },
+      "note": "База сохранённых логинов с зашифрованными паролями; «Login Data*» покрывает и «Login Data For Account» с учётными записями Google. Удаление необратимо для паролей, которых нет в облаке: их придётся вводить заново или менять на стороне сайта. Отдельная строка намеренно: её можно снять, оставив историю и cookies, — ради освобождения места она не нужна, а цена ошибки максимальна во всей категории. Отмена возможна только из корзины приложения и пока транзакция не схлопнулась (FR-7). Путь: %USERPROFILE%\\AppData\\Roaming\\Opera Software\\Opera Stable, каталог данных выбирается маской «Opera*Stable», а «**» берёт и раскладку с подкаталогом профиля. Нужен закрытый Opera (opera.exe или opera_gx.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.opera.autofill",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Opera Software\\Opera*Stable\\**\\Web Data*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "opera",
+        "opera_gx"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Автозаполнение и сохранённые карты: Opera",
+        "en": "Autofill and saved cards: Opera"
+      },
+      "note": "Адреса автозаполнения, сохранённые банковские карты (номера лежат в этом же файле) и ярлыки поисковиков: после удаления всё это вводится заново, часть ярлыков — вручную. Отдельная строка с review, а не «очистить профиль целиком»: платёжные данные не должны теряться вместе с кэшем. Путь: %USERPROFILE%\\AppData\\Roaming\\Opera Software\\Opera Stable, каталог данных выбирается маской «Opera*Stable», а «**» берёт и раскладку с подкаталогом профиля. Нужен закрытый Opera (opera.exe или opera_gx.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.opera.favicons",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Opera Software\\Opera*Stable\\**\\Favicons*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "opera",
+        "opera_gx"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш значков сайтов: Opera",
+        "en": "Favicon cache: Opera"
+      },
+      "note": "Кэш значков сайтов (файл базы SQLite). По сути это кэш — пересобирается при следующих посещениях, цена нулевая, но SPEC §4 FR-3 относит значки к browser.history, поэтому review вместе со всей категорией: включать стоит вместе с историей. Путь: %USERPROFILE%\\AppData\\Roaming\\Opera Software\\Opera Stable, каталог данных выбирается маской «Opera*Stable», а «**» берёт и раскладку с подкаталогом профиля. Нужен закрытый Opera (opera.exe или opera_gx.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.firefox.history",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\*\\places.sqlite*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "firefox"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "История посещений и закладки: Mozilla Firefox",
+        "en": "Browsing history and bookmarks: Mozilla Firefox"
+      },
+      "note": "База Firefox: журнал посещений, метаданные сайтов и закладки пользователя лежат в одном файле, поэтому очистка стирает и закладки. Правило вынесено отдельной строкой, чтобы это было видно в плане ДО подтверждения, а не после удаления. «places.sqlite*» покрывает -wal, -shm и -journal. Синхронизация восстанавливает историю лишь частично, полная отмена — корзина приложения (FR-7). Review, выключено по умолчанию (SPEC §4 FR-3). Путь: %USERPROFILE%\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили (abc.default-release, профили dev-редакции, отдельные). Нужен закрытый Firefox (firefox.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся. Путь — это %APPDATA%\\Mozilla\\Firefox\\Profiles, записанный через %USERPROFILE%\\AppData\\Roaming: набор правил использует только переменные, гарантированно присутствующие в карте окружения загрузчика, иначе правило молча не сработает."
+    },
+    {
+      "id": "browser.history.firefox.cookies",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\*\\cookies.sqlite*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "firefox"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Cookies: Mozilla Firefox",
+        "en": "Cookies: Mozilla Firefox"
+      },
+      "note": "База cookie Firefox: идентификаторы сессий и предпочтения сайтов. После удаления — выход из всех аккаунтов, повторный запрос согласия и на части сайтов повторный вход. «cookies.sqlite*» покрывает -wal, -shm и -journal. Review, выключено по умолчанию: последствия здесь осознанные, а не технические. Путь: %USERPROFILE%\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили (abc.default-release, профили dev-редакции, отдельные). Нужен закрытый Firefox (firefox.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.firefox.passwords",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\*\\logins.json",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "firefox"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Сохранённые пароли: Mozilla Firefox",
+        "en": "Saved passwords: Mozilla Firefox"
+      },
+      "note": "Сохранённые пароли в зашифрованном виде, ключ лежит отдельно в key4.db (в старых профилях key3.db). key4.db/key3.db в правила намеренно НЕ входят: удаление ключа при живом logins.json сделало бы хранилище нерасшифровываемым, то есть потерялись бы и те пароли, которые пользователь хотел сохранить. Удаление logins.json необратимо, отмена — из корзины приложения (FR-7). Отдельная строка, чтобы отказ от неё не стоил истории и cookies. Путь: %USERPROFILE%\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили (abc.default-release, профили dev-редакции, отдельные). Нужен закрытый Firefox (firefox.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.firefox.formhistory",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\*\\formhistory.sqlite*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "firefox"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "История форм и автозаполнение: Mozilla Firefox",
+        "en": "Form history and autofill: Mozilla Firefox"
+      },
+      "note": "История форм и автозаполнение Firefox — аналог Web Data у Chromium: значения, которые пользователь вводил в формы, после удаления вводятся заново. Номеров карт здесь не хранится, но адреса, имена и телефоны да. Отдельная строка с review, чтобы автозаполнение можно было очистить, не трогая историю и пароли. Путь: %USERPROFILE%\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили (abc.default-release, профили dev-редакции, отдельные). Нужен закрытый Firefox (firefox.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.firefox.favicons",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\*\\favicons.sqlite*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "firefox"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш значков сайтов: Mozilla Firefox",
+        "en": "Favicon cache: Mozilla Firefox"
+      },
+      "note": "Кэш значков сайтов Firefox (аналог каталога Favicons у Chromium): пересобирается при следующих посещениях, но SPEC §4 FR-3 относит значки к browser.history, поэтому review вместе со всей категорией. Путь: %USERPROFILE%\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles, каталог профиля выбирается одиночным «*», поэтому строка покрывает все профили (abc.default-release, профили dev-редакции, отдельные). Нужен закрытый Firefox (firefox.exe): у работающего браузера файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.thunderbird.history",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Thunderbird\\Profiles\\*\\places.sqlite*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "thunderbird"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "История посещений (индекс): Mozilla Thunderbird",
+        "en": "Browsing history index: Mozilla Thunderbird"
+      },
+      "note": "places.sqlite в Thunderbird — индекс истории и папок: темы, отправители, даты, счётчики непрочитанного. Сами письма лежат в файлах ящиков и этой строке не принадлежат, но накопленная история, разметка папок и счётчики будут потеряны. Глобальная база «Global Storage\\history.sqlite» намеренно не описана правилом: по SPEC §10 путь, не совпавший ни с одним правилом, никогда не удаляется, а очистка глобального индекса истории — потеря данных, а не уборка мусора. Review, выключено по умолчанию (SPEC §4 FR-3). Путь: %USERPROFILE%\\AppData\\Roaming\\Thunderbird\\Profiles, каталог профиля выбирается одиночным «*», поэтому строка покрывает и основной профиль, и профили дополнительных почтовых учётных записей. Нужен закрытый Thunderbird (thunderbird.exe): у работающего клиента файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся. Путь — это %APPDATA%\\Thunderbird\\Profiles, записанный через %USERPROFILE%\\AppData\\Roaming: набор правил использует только переменные, гарантированно присутствующие в карте окружения загрузчика, иначе правило молча не сработает."
+    },
+    {
+      "id": "browser.history.thunderbird.cookies",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Thunderbird\\Profiles\\*\\cookies.sqlite*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "thunderbird"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Cookies: Mozilla Thunderbird",
+        "en": "Cookies: Mozilla Thunderbird"
+      },
+      "note": "cookies.sqlite Thunderbird — cookie веб-страниц писем и веб-интерфейса почты: после удаления веб-интерфейс потребует повторного входа, на сами письма это не влияет. «cookies.sqlite*» покрывает -wal, -shm и -journal. Review, выключено по умолчанию. Путь: %USERPROFILE%\\AppData\\Roaming\\Thunderbird\\Profiles, каталог профиля выбирается одиночным «*», поэтому строка покрывает и основной профиль, и профили дополнительных почтовых учётных записей. Нужен закрытый Thunderbird (thunderbird.exe): у работающего клиента файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.thunderbird.passwords",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Thunderbird\\Profiles\\*\\logins.json",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "thunderbird"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Сохранённые пароли от ящиков: Mozilla Thunderbird",
+        "en": "Saved account passwords: Mozilla Thunderbird"
+      },
+      "note": "logins.json — сохранённые пароли от почтовых ящиков и учётных записей IMAP/SMTP. Потеря необратима без корзины приложения: ящик перестанет обновляться, пока пароль не введён заново. key4.db в правила не входит намеренно, как и в правилах Firefox: удаление ключа при живом logins.json сделало бы хранилище нерасшифровываемым. Отдельная строка, чтобы её можно было снять, не теряя историю и cookies. Путь: %USERPROFILE%\\AppData\\Roaming\\Thunderbird\\Profiles, каталог профиля выбирается одиночным «*», поэтому строка покрывает и основной профиль, и профили дополнительных почтовых учётных записей. Нужен закрытый Thunderbird (thunderbird.exe): у работающего клиента файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    },
+    {
+      "id": "browser.history.thunderbird.favicons",
+      "category": "browser.history",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\AppData\\Roaming\\Thunderbird\\Profiles\\*\\favicons.sqlite*",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "thunderbird"
+      ],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш значков писем: Mozilla Thunderbird",
+        "en": "Favicon cache: Mozilla Thunderbird"
+      },
+      "note": "favicons.sqlite — кэш значков в списке писем: пересобирается при следующих письмах, но SPEC §4 FR-3 относит значки к browser.history, поэтому review вместе со всей категорией. Путь: %USERPROFILE%\\AppData\\Roaming\\Thunderbird\\Profiles, каталог профиля выбирается одиночным «*», поэтому строка покрывает и основной профиль, и профили дополнительных почтовых учётных записей. Нужен закрытый Thunderbird (thunderbird.exe): у работающего клиента файлы профиля заняты, они попадут в «пропущено (занято)» по FR-6, а не удалятся."
+    }
+  ]
+}

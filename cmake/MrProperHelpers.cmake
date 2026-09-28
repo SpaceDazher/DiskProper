@@ -106,6 +106,11 @@ function(mrproper_print_config_summary)
     else()
         set(_werror "нет")
     endif()
+    if(MRPROPER_COMPILE_COMMANDS_SUPPORTED)
+        set(_cc "да, база компиляции пригодна для clang-tidy")
+    else()
+        set(_cc "генератор «${CMAKE_GENERATOR}» не пишет compile_commands.json; путь — пресет ninja-debug")
+    endif()
     set(_lines
         "проект:      ${PROJECT_NAME} ${PROJECT_VERSION}"
         "генератор:   ${CMAKE_GENERATOR}"
@@ -115,6 +120,7 @@ function(mrproper_print_config_summary)
         "тесты:       ${_tests}"
         "предупреждения как ошибки: ${_werror}, строгий набор: ${MRPROPER_STRICT_WARNINGS}"
         "санитайзеры: ${MRPROPER_SANITIZE}"
+        "compile_commands.json: ${_cc}"
         "install:     префикс «${CMAKE_INSTALL_PREFIX}», тесты в составе: ${MRPROPER_INSTALL_TESTS}, CPack: ${MRPROPER_ENABLE_CPACK}"
     )
     message(STATUS "[MrProper] конфигурация сборки:")
@@ -132,6 +138,9 @@ endfunction()
 function(mrproper_finalize_configure)
     if(COMMAND mrproper_apply_app_resources)
         mrproper_apply_app_resources()
+    endif()
+    if(COMMAND mrproper_report_dependencies)
+        mrproper_report_dependencies()
     endif()
     mrproper_print_config_summary()
 endfunction()

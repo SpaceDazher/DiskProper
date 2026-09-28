@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "firefox.cache.thunderbird.cache2",
+      "category": "firefox.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Thunderbird\\Profiles\\*\\cache2\\**",
+      "requiresProcessesClosed": ["thunderbird"],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш веб-страниц Thunderbird (cache2)",
+        "en": "Thunderbird web page cache (cache2)"
+      },
+      "note": "Дисковый кэш Thunderbird в формате cache2: %LOCALAPPDATA%\\Thunderbird\\Profiles\\<профиль>\\cache2 — тот же движок, что и у Firefox, поэтому каталог назван в SPEC §4 FR-3 вместе с остальными (firefox.cache, примечание «то же для Thunderbird»), и категория правила — тоже firefox.cache. Затрагиваются только служебные страницы писем (подписи, ссылки на вложения) и данные проверки ссылок; почта, папки и настройки аккаунтов лежат в других файлах профиля и правилом не затрагиваются. Требуется закрытый Thunderbird, занятые файлы движок пропустит по FR-6."
+    },
+    {
+      "id": "firefox.cache.thunderbird.startup",
+      "category": "firefox.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Thunderbird\\Profiles\\*\\startupCache\\**",
+      "requiresProcessesClosed": ["thunderbird"],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Стартовый кэш Thunderbird (startupCache)",
+        "en": "Thunderbird startup cache (startupCache)"
+      },
+      "note": "Скомпилированный код интерфейса и почтовых модулей: %LOCALAPPDATA%\\Thunderbird\\Profiles\\<профиль>\\startupCache. Пересобирается при следующем старте, поэтому по SPEC §4 FR-3 очистка безопасна; платим несколькими секундами на первом запуске. Общий на все окна и учётные записи, поэтому требуется закрытый Thunderbird."
+    },
+    {
+      "id": "firefox.cache.thunderbird.offline",
+      "category": "firefox.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Thunderbird\\Profiles\\*\\offlineCache\\**",
+      "requiresProcessesClosed": ["thunderbird"],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Офлайн-кэш Thunderbird (offlineCache)",
+        "en": "Thunderbird offline cache (offlineCache)"
+      },
+      "note": "Кэш офлайн-страниц в локальном профиле: %LOCALAPPDATA%\\Thunderbird\\Profiles\\<профиль>\\offlineCache. Правило намеренно ограничено локальным профилем: в перемещаемом профиле Thunderbird (%USERPROFILE%\\AppData\\Roaming\\Thunderbird\\Profiles) одноимённый каталог хранит офлайн-выгрузку новостных групп, а это данные пользователя, а не пересобираемый кэш, поэтому в правило он не входит. Почтовые хранилища (Mail, ImapMail, OfflineStore) — не подкаталоги offlineCache и правилом не затрагиваются. Каталога в локальном профиле может не оказаться: тогда правило просто неактивно, ошибкой это не считается."
+    },
+    {
+      "id": "firefox.cache.thunderbird.shader",
+      "category": "firefox.cache",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Thunderbird\\Profiles\\*\\shader-cache\\**",
+      "requiresProcessesClosed": ["thunderbird"],
+      "groupByProfile": true,
+      "title": {
+        "ru": "Кэш шейдеров Thunderbird (shader-cache)",
+        "en": "Thunderbird shader cache (shader-cache)"
+      },
+      "note": "Кэш скомпилированных шейдеров WebRender и ANGLE: %LOCALAPPDATA%\\Thunderbird\\Profiles\\<профиль>\\shader-cache. Пересобирается при следующем запуске, платим несколькими лишними кадрами при отрисовке писем. Категория — firefox.cache (SPEC §4 FR-3, «то же для Thunderbird»); с категорией shadercache не пересекается, пути разные, двойного счёта в плане не будет."
+    }
+  ]
+}

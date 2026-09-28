@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "version": "2026.09.1",
+  "minAppVersion": "0.1.0",
+  "rules": [
+    {
+      "id": "installer.cache.packages",
+      "category": "installer.cache",
+      "safety": "risky",
+      "locator": "C:\\Windows\\Installer\\**\\*.msi",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": ["msiexec", "setup"],
+      "title": {
+        "ru": "Кэш установщика Windows: пакеты MSI",
+        "en": "Windows Installer cache: MSI packages"
+      },
+      "note": "Только оценка. .msi/.msp из C:\\Windows\\Installer нужны для удаления, изменения и восстановления уже установленных программ, поэтому уровень risky: элемент скрыт по умолчанию (FR-4) и требует двойного подтверждения (FR-9). minAgeDays=0 — в оценку попадает весь каталог, число честное, а не «устаревшая часть»; фильтра по возрасту здесь нет намеренно. Сжатие и очистку этого каталога делает StartComponentCleanup/DISM, руками не трогать (SPEC §4 FR-3)."
+    },
+    {
+      "id": "installer.cache.patches",
+      "category": "installer.cache",
+      "safety": "risky",
+      "locator": "C:\\Windows\\Installer\\**\\*.msp",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": ["msiexec", "setup"],
+      "title": {
+        "ru": "Кэш установщика Windows: патчи MSP",
+        "en": "Windows Installer cache: MSP patches"
+      },
+      "note": "Только оценка. Патчи .msp применяются при обновлении уже установленных продуктов: удаление файла не всегда ломает удаление программы, но лишает возможности откатить или починить её. Уровень risky, по умолчанию скрыт."
+    },
+    {
+      "id": "installer.cache.temp",
+      "category": "installer.cache",
+      "safety": "risky",
+      "locator": "C:\\Windows\\Installer\\**\\*.tmp",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": ["msiexec", "setup"],
+      "title": {
+        "ru": "Кэш установщика Windows: временные остатки",
+        "en": "Windows Installer cache: temporary leftovers"
+      },
+      "note": "Только оценка. Остатки распаковки (*.tmp) выглядят безобиднее пакетов, но лежат в системном каталоге, который движок защищает белым списком (FR-6), а Windows Installer держит их открытыми во время установки. Уровень risky, по умолчанию скрыт: оценку показываем, удаление не предлагаем."
+    }
+  ]
+}

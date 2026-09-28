@@ -1,0 +1,127 @@
+{
+  "schemaVersion": 1,
+  "version": "2026.09.1",
+  "minAppVersion": "0.1.0",
+  "files": [
+    {
+      "path": "browser.cache.chrome.json",
+      "sha256": "661f16cb0288620c27668475cc9973a6231c491b0a64f7b8f13accb7a2060914",
+      "size": 10598
+    },
+    {
+      "path": "browser.cache.chromium.json",
+      "sha256": "beeb2eee62e6b35fa027548dbfbbf02172f33cc557b172f6050b73098d562be5",
+      "size": 26159
+    },
+    {
+      "path": "browser.cache.edge.json",
+      "sha256": "91e28a7e14c26731a233047917751535d14797047e2704364d9a2be7c93b0b7b",
+      "size": 10397
+    },
+    {
+      "path": "browser.cache.firefox.json",
+      "sha256": "5c73f2984cae3026eeed4414237a235f8e750ff19021980f143c5537558ee05c",
+      "size": 6392
+    },
+    {
+      "path": "browser.cache.thunderbird.json",
+      "sha256": "03e5e55812a008986496b8f3aa279553b6eb871754b02e183084b6436ab53866",
+      "size": 4757
+    },
+    {
+      "path": "browser.cache.yandex.json",
+      "sha256": "4b1b90295b704e025d99921ec6f36cfb45487b271c699e6a1ded255adea0ce53",
+      "size": 9282
+    },
+    {
+      "path": "browser.history.json",
+      "sha256": "d8895f68f5627489a1daef454c44fb39baad674add847841205fc0991370e60e",
+      "size": 64225
+    },
+    {
+      "path": "crash.dumps.json",
+      "sha256": "7836367baedc05311e1dae75e3c833f3f57638a961fe11522b76c8e9f3269dfc",
+      "size": 2103
+    },
+    {
+      "path": "delivery.opt.json",
+      "sha256": "97e586a8b414a41b1cc9746447429d7a79200a4e925c95e826b51340518d99b3",
+      "size": 1549
+    },
+    {
+      "path": "dev.caches.json",
+      "sha256": "c301ce15a31f002c69b9c95fdd15c9c954ae1f26cabdb5899902c201688e2a3f",
+      "size": 7411
+    },
+    {
+      "path": "icon.font.cache.json",
+      "sha256": "cc7b8e53eadc5056078e90ea0b069a4dd7c451b3106223e086067c81634ca703",
+      "size": 2868
+    },
+    {
+      "path": "installer.cache.json",
+      "sha256": "1b6eb51fd57a95c62ffe4bee2a808085ed07653dfc823bba8808e99fd642324b",
+      "size": 2981
+    },
+    {
+      "path": "logs.json",
+      "sha256": "349a0ae2e6a25dcd439f70797a2038685d5c74499c70dfafdf8877ef0cbb67d7",
+      "size": 1850
+    },
+    {
+      "path": "memory.dumps.json",
+      "sha256": "09d354bc1e8d739e029613478558cd1780cc4bd7b2dc9c14b4edd893315692a7",
+      "size": 1507
+    },
+    {
+      "path": "ms.update.json",
+      "sha256": "6a8ee8358c073239146dcc631827998a39086c681635f485a12573d7f16fc985",
+      "size": 1456
+    },
+    {
+      "path": "prefetch.json",
+      "sha256": "22df198b12a32ff57b2f641aa6269c6afb5b17a88a862ed2ead6bb558fdacde9",
+      "size": 897
+    },
+    {
+      "path": "recycle.bin.json",
+      "sha256": "1372964c32a330df9ed29093d5b22eae5a040ec8da9fef83dacc27e9efad80aa",
+      "size": 1722
+    },
+    {
+      "path": "shadercache.json",
+      "sha256": "336d2405aa74054c9d3bdefc084e8559a02f91ec2221a8c9099a82a1d4c051f0",
+      "size": 6337
+    },
+    {
+      "path": "temp.system.json",
+      "sha256": "649e6479f517ad93819c4fdfc6c3b276a862cf538698c213d1d892e06c62a4e4",
+      "size": 930
+    },
+    {
+      "path": "temp.user.json",
+      "sha256": "0eba6bcb89a9ffb3aaf1eaf662c29367b4b1d7ee0d7a87a4084315edd669cd28",
+      "size": 2092
+    },
+    {
+      "path": "user.bigfiles.json",
+      "sha256": "7a64ee7639e184823750d675db834349163f3bd500a6634e25b773dffa8ef7cf",
+      "size": 5974
+    },
+    {
+      "path": "wer.json",
+      "sha256": "7ae87793d61024f780036634d70d222945c70e5cbd693dfc6961fb87a16ff1fc",
+      "size": 865
+    },
+    {
+      "path": "winsxs.report.json",
+      "sha256": "1ac260215a9a2d69127fae4ce3299cc4f2f5fb9d3fd7e72019a64d40c1bbd16a",
+      "size": 1557
+    },
+    {
+      "path": "wsl.vhdx.report.json",
+      "sha256": "7f2e64c379f6250f33eb7df42ecbfa4d07c91d73e44d23347b96ea406b14ad6f",
+      "size": 6743
+    }
+  ]
+}

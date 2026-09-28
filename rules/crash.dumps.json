@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "crash.dumps.app",
+      "category": "crash.dumps",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\CrashDumps\\**\\*.dmp",
+      "minAgeDays": 30,
+      "title": {
+        "ru": "Дампы аварий приложений",
+        "en": "Application crash dumps"
+      },
+      "note": "Дампы упавших приложений (каталог CrashDumps в профиле пользователя). Свежий дамп почти всегда нужен для разбора падения, поэтому порог 30 дней. Safety=review: выключено по умолчанию и включается только вручную."
+    },
+    {
+      "id": "crash.dumps.minidump",
+      "category": "crash.dumps",
+      "safety": "review",
+      "locator": "C:\\Windows\\Minidump\\**\\*.dmp",
+      "minAgeDays": 30,
+      "title": {
+        "ru": "Минидампы Windows (BSOD)",
+        "en": "Windows minidumps (BSOD)"
+      },
+      "note": "Минидампы после синего экрана. Нужны для анализа причины падения системы, поэтому 30 дней и review. Путь задан литералом C:\\Windows: если Windows на другом диске, кандидатов не будет."
+    },
+    {
+      "id": "crash.dumps.memory",
+      "category": "crash.dumps",
+      "safety": "review",
+      "locator": "C:\\Windows\\MEMORY.DMP",
+      "minAgeDays": 30,
+      "title": {
+        "ru": "Полный дамп памяти MEMORY.DMP",
+        "en": "Full memory dump (MEMORY.DMP)"
+      },
+      "note": "Полный дамп оперативной памяти после BSOD, размер равен объёму ОЗУ. Самый ценный файл для разбора синего экрана: порог 30 дней, review, по умолчанию выключено. Путь задан литералом C:\\Windows: если Windows на другом диске, кандидата не будет."
+    }
+  ]
+}

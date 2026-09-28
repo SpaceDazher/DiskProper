@@ -1,0 +1,102 @@
+{
+  "schemaVersion": 1,
+  "version": "2026.09.1",
+  "minAppVersion": "0.1.0",
+  "rules": [
+    {
+      "id": "user.bigfiles.downloads",
+      "category": "user.bigfiles",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\Downloads\\**",
+      "locatorExcludes": [
+        "%USERPROFILE%\\Downloads\\**\\*.crdownload",
+        "%USERPROFILE%\\Downloads\\**\\*.part",
+        "%USERPROFILE%\\Downloads\\**\\*.partial",
+        "%USERPROFILE%\\Downloads\\**\\desktop.ini",
+        "%USERPROFILE%\\Downloads\\**\\Thumbs.db"
+      ],
+      "minAgeDays": 90,
+      "groupByProfile": true,
+      "title": {
+        "ru": "Крупные файлы: загрузки",
+        "en": "Large files: Downloads"
+      },
+      "note": "Пользовательские данные, а не мусор: уровень review, элемент не удаляется без явного подтверждения, операция идёт через корзину приложения и отменяема (FR-7). minAgeDays=90 — фильтр возраста из FR-3. Порог «больше 1 ГБ» задаёт провайдер сканера: в схеме правил (core/rules.cpp, список допустимых полей) поля размера нет, а неизвестное поле — ошибка загрузки (ADR-008), поэтому выразить его в JSON нельзя."
+    },
+    {
+      "id": "user.bigfiles.videos",
+      "category": "user.bigfiles",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\Videos\\**",
+      "locatorExcludes": [
+        "%USERPROFILE%\\Videos\\**\\*.tmp",
+        "%USERPROFILE%\\Videos\\**\\desktop.ini",
+        "%USERPROFILE%\\Videos\\**\\Thumbs.db"
+      ],
+      "minAgeDays": 90,
+      "groupByProfile": true,
+      "title": {
+        "ru": "Крупные файлы: видео",
+        "en": "Large files: Videos"
+      },
+      "note": "Видео и записи экрана — самая частая причина «диск заполнился» в профиле пользователя. Пользовательские данные: уровень review, удаление только по подтверждению, через корзину приложения. Возраст 90 дней; порог «больше 1 ГБ» применяет сканер — поля размера в схеме правил нет."
+    },
+    {
+      "id": "user.bigfiles.documents",
+      "category": "user.bigfiles",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\Documents\\**",
+      "locatorExcludes": [
+        "%USERPROFILE%\\Documents\\**\\~$*",
+        "%USERPROFILE%\\Documents\\**\\*.tmp",
+        "%USERPROFILE%\\Documents\\**\\desktop.ini",
+        "%USERPROFILE%\\Documents\\**\\Thumbs.db"
+      ],
+      "minAgeDays": 90,
+      "groupByProfile": true,
+      "title": {
+        "ru": "Крупные файлы: документы",
+        "en": "Large files: Documents"
+      },
+      "note": "Рабочие файлы: самый ценный класс данных, поэтому уровень review и подтверждение по каждому элементу, удаление — в корзину приложения с возможностью отмены. Исключены временные файлы Office (~$*) и служебные. Возраст 90 дней; порог «больше 1 ГБ» применяет сканер — поля размера в схеме правил нет."
+    },
+    {
+      "id": "user.bigfiles.desktop",
+      "category": "user.bigfiles",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\Desktop\\**",
+      "locatorExcludes": [
+        "%USERPROFILE%\\Desktop\\**\\*.tmp",
+        "%USERPROFILE%\\Desktop\\**\\desktop.ini",
+        "%USERPROFILE%\\Desktop\\**\\Thumbs.db"
+      ],
+      "minAgeDays": 90,
+      "groupByProfile": true,
+      "title": {
+        "ru": "Крупные файлы: рабочий стол",
+        "en": "Large files: Desktop"
+      },
+      "note": "На рабочем столе Windows собирает то, что нигде не лежит: ISO-образы, образы виртуальных машин, дампы. Пользовательские данные: уровень review, подтверждение на каждый элемент, удаление в корзину приложения. Возраст 90 дней; порог «больше 1 ГБ» применяет сканер — поля размера в схеме правил нет."
+    },
+    {
+      "id": "user.bigfiles.profile-root",
+      "category": "user.bigfiles",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\*.*",
+      "locatorExcludes": [
+        "%USERPROFILE%\\ntuser.dat*",
+        "%USERPROFILE%\\*.lnk",
+        "%USERPROFILE%\\*.log",
+        "%USERPROFILE%\\*.tmp",
+        "%USERPROFILE%\\*.etl"
+      ],
+      "minAgeDays": 90,
+      "groupByProfile": true,
+      "title": {
+        "ru": "Крупные файлы: корень профиля",
+        "en": "Large files: profile root"
+      },
+      "note": "Только файлы с расширением, лежащие прямо в корне профиля (одиночный «*» не пересекает границу каталога, поэтому вложенные каталоги и AppData сюда не попадают — их описывают другие правила: temp.user, browser.cache, crash.dumps, npm.pip.cache; пересечение дало бы один и тот же файл в двух очистках). Исключены профили NTUSER.DAT, ярлыки, логи и временные файлы. Уровень review, возраст 90 дней, порог «больше 1 ГБ» применяет сканер — поля размера в схеме правил нет."
+    }
+  ]
+}

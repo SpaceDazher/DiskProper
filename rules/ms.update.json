@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "ms.update.download",
+      "category": "ms.update",
+      "safety": "safe",
+      "locator": "C:\\Windows\\SoftwareDistribution\\Download\\**",
+      "minAgeDays": 7,
+      "requiresProcessesClosed": [
+        "wuauserv",
+        "bits",
+        "TrustedInstaller",
+        "TiWorker"
+      ],
+      "title": {
+        "ru": "Загруженные пакеты обновлений Windows",
+        "en": "Windows Update downloaded packages"
+      },
+      "note": "Пакеты, скачанные Windows Update в C:\\Windows\\SoftwareDistribution\\Download: недостающие система скачает заново, а удалённые файлы на откат обновления не нужны. Порог 7 дней (SPEC §4 FR-3: остановка wuauserv/bits на время операции) нужен, чтобы не задеть обновление, которое уже скачано, но ещё не установлено. Пока службы wuauserv и BITS работают, файлы заняты: их останавливает операция с повышенными правами, без неё элемент попадёт в «пропущено (занято)», а не удалится. Путь задан литералом C:\\Windows: если Windows на другом диске, кандидатов не будет."
+    }
+  ]
+}

@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "npm.pip.cache.npm",
+      "category": "npm.pip.cache",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\npm-cache",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "node",
+        "npm",
+        "npx"
+      ],
+      "title": {
+        "ru": "Кэш npm: пакеты и метаданные",
+        "en": "npm cache: packages and metadata"
+      },
+      "note": "Категория npm.pip.cache из SPEC §4 FR-3: кэш npm в стандартном месте Windows. Уровень review, а не safe: содержимое кэша переиспользуется npm при следующей установке, офлайн-сборка без сети после очистки не пройдёт, а «npm cache clean --force» — команда самого инструмента, а не файловая операция. Locator указывает на каталог целиком, без шаблонов, по конвенции набора (см. winsxs.report.json): элемент попадает в отчёт одной оценкой размера и не раскрывается списком файлов, поэтому случайно выбрав его нельзя стереть половину кэша. minAgeDays=0 намеренно — в отчёте нужен честный полный объём, а не «устаревшая часть»; возрастной фильтр у кэша бессмысленен. Правильный способ очистки — npm cache clean --force, поэтому элемент требует явного подтверждения (SPEC §4 FR-4)."
+    },
+    {
+      "id": "npm.pip.cache.npm.cacache",
+      "category": "npm.pip.cache",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\.npm\\_cacache",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "node",
+        "npm",
+        "npx"
+      ],
+      "title": {
+        "ru": "Кэш npm: каталог _cacache в профиле",
+        "en": "npm cache: _cacache directory in the profile"
+      },
+      "note": "Второе стандартное расположение того же кэша npm: каталог ~/.npm/_cacache появляется при npm cache config set cache внутри профиля пользователя (часто так настроен в CI-образах и на рабочих машинах с переносом кэша на большой диск). Отдельным правилом, а не подстановкой, потому что путь задаётся пользователем и не выводится из %LOCALAPPDATA%. Условия те же: оценка без перечисления, review, minAgeDays=0."
+    },
+    {
+      "id": "npm.pip.cache.pip",
+      "category": "npm.pip.cache",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\pip\\Cache",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "python",
+        "python3",
+        "pip"
+      ],
+      "title": {
+        "ru": "Кэш pip: загруженные пакеты и http-кэш",
+        "en": "pip cache: downloaded packages and HTTP cache"
+      },
+      "note": "Кэш pip в стандартном месте Windows (%LOCALAPPDATA%\\pip\\Cache, SPEC §4 FR-3). Внутри лежат и тела скачанных пакетов, и http-кэш: обе части восстанавливаются повторной загрузкой, но офлайн-установка перестанет работать, поэтому review, а не safe. Очистка инструментом — pip cache purge; пока элемент только в отчёте, удаление из приложения не предлагается."
+    },
+    {
+      "id": "npm.pip.cache.nuget.packages",
+      "category": "npm.pip.cache",
+      "safety": "review",
+      "locator": "%USERPROFILE%\\.nuget\\packages",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "dotnet",
+        "nuget",
+        "msbuild",
+        "devenv"
+      ],
+      "title": {
+        "ru": "NuGet: глобальная папка пакетов",
+        "en": "NuGet: global packages folder"
+      },
+      "note": "Самый крупный элемент категории и самый опасный из «просто кэшей»: %USERPROFILE%\\.nuget\\packages (SPEC §4 FR-3) — не кэш в смысле одноразовых данных, а распакованные пакеты, из которых MSBuild/NuGet собирает проекты без обращения к сети. Удаление каталога не ломает установленные программы, но обрушивает офлайн-сборку и все решения с PackageReference до восстановления из источников. Поэтому locator без шаблонов: элемент оценивается целиком и не перечисляется, а не «файлы пакетов можно снести выборочно». minAgeDays=0 — возраст пакета ничего не значит: старый пакет из transitive-зависимости может быть нужен прямо сейчас. Очистка — nuget locals all -clear."
+    },
+    {
+      "id": "npm.pip.cache.nuget.http",
+      "category": "npm.pip.cache",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\NuGet\\v3-cache",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "dotnet",
+        "nuget",
+        "msbuild"
+      ],
+      "title": {
+        "ru": "NuGet: http-кэш v3",
+        "en": "NuGet: v3 HTTP cache"
+      },
+      "note": "Http-кэш NuGet (%LOCALAPPDATA%\\NuGet\\v3-cache): ответы и частичные загрузки с nuget.org и корпоративных фидов. В отличие от глобальной папки пакетов это действительно кэш, но он ускоряет восстановление и переживает офлайн-сборку, поэтому уровень review и явное подтверждение, а не safe. Оценка без перечисления содержимого."
+    },
+    {
+      "id": "npm.pip.cache.nuget.plugins",
+      "category": "npm.pip.cache",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\NuGet\\plugins-cache",
+      "minAgeDays": 0,
+      "requiresProcessesClosed": [
+        "dotnet",
+        "nuget",
+        "msbuild",
+        "devenv"
+      ],
+      "title": {
+        "ru": "NuGet: кэш плагинов и credential- providers",
+        "en": "NuGet: plugins and credential providers cache"
+      },
+      "note": "Кэш NuGet-плагинов и провайдеров учётных данных (%LOCALAPPDATA%\\NuGet\\plugins-cache). Попадает в ту же категорию npm.pip.cache, потому что это кэш инструмента сборки, а не системный мусор. Обычно мал, но на машинах с корпоративной авторизацией разрастается. Review, оценка без перечисления, minAgeDays=0."
+    }
+  ]
+}

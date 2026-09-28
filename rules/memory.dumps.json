@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "memory.dumps.livekernel",
+      "category": "memory.dumps",
+      "safety": "review",
+      "locator": "C:\\Windows\\LiveKernelReports\\**\\*.dmp",
+      "minAgeDays": 30,
+      "title": {
+        "ru": "Дампы LiveKernelReports",
+        "en": "LiveKernelReports dumps"
+      },
+      "note": "Дампы ядра и видеодрайвера: таймауты GPU (TDR), срабатывание watchdog, зависание системы. Отдельные файлы занимают сотни мегабайт, поэтому чистятся только старше 30 дней. Путь задан литералом C:\\Windows: если Windows на другом диске, кандидатов не будет."
+    },
+    {
+      "id": "memory.dumps.wer",
+      "category": "memory.dumps",
+      "safety": "review",
+      "locator": "%LOCALAPPDATA%\\Microsoft\\Windows\\WER\\**\\*.dmp",
+      "minAgeDays": 30,
+      "title": {
+        "ru": "Пользовательские отчёты WER с дампами",
+        "en": "User WER reports with dumps"
+      },
+      "note": "Дампы из пользовательских отчётов об ошибках (ReportQueue и ReportArchive в профиле). Категория wer из ProgramData сюда не входит: пересечения с другими правилами набора быть не должно. Порог 30 дней, review."
+    }
+  ]
+}

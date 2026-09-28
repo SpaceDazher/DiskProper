@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "temp.user",
+      "category": "temp.user",
+      "safety": "safe",
+      "locator": "%LOCALAPPDATA%\\Temp\\**",
+      "locatorExcludes": [
+        "%LOCALAPPDATA%\\Temp\\**\\unins*.exe",
+        "%LOCALAPPDATA%\\Temp\\**\\is-*.tmp"
+      ],
+      "minAgeDays": 2,
+      "title": {
+        "ru": "Временные файлы пользователя",
+        "en": "User temporary files"
+      },
+      "note": "Временные файлы текущего пользователя: распакованные установщики, промежуточные данные приложений, кэш распаковки. Порог 2 дня (SPEC §4 FR-3) — свежие файлы не трогаем, в них могут лежать незавершённые операции приложений. Деинсталляторы (unins*.exe) и временные файлы Inno Setup (is-*.tmp) исключены: по ним выполняется откат удалённой программы."
+    },
+    {
+      "id": "temp.user.env",
+      "category": "temp.user",
+      "safety": "safe",
+      "locator": "%TEMP%\\**",
+      "locatorExcludes": [
+        "%LOCALAPPDATA%\\Temp\\**",
+        "%TEMP%\\**\\unins*.exe",
+        "%TEMP%\\**\\is-*.tmp"
+      ],
+      "minAgeDays": 2,
+      "title": {
+        "ru": "Временные файлы (%TEMP%, если папка отделена от профиля)",
+        "en": "Temporary files (%TEMP% when outside the profile)"
+      },
+      "note": "Второй источник категории temp.user — переменная %TEMP% (SPEC §4 FR-3). Обычно %TEMP% указывает на %LOCALAPPDATA%\\Temp, и тогда всё дерево исключено, чтобы кандидаты не задваивались в плане; при переносе TEMP на другой диск покрытие сохраняется. Если переменная не задана, правило просто неактивно."
+    }
+  ]
+}

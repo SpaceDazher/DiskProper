@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "temp.system",
+      "category": "temp.system",
+      "safety": "safe",
+      "locator": "C:\\Windows\\Temp\\**",
+      "minAgeDays": 7,
+      "requiresProcessesClosed": [
+        "msiexec",
+        "wusa",
+        "TiWorker",
+        "TrustedInstaller"
+      ],
+      "title": {
+        "ru": "Системные временные файлы",
+        "en": "System temporary files"
+      },
+      "note": "Временная папка Windows C:\\Windows\\Temp. Порог 7 дней (SPEC §4 FR-3): файлы свежее недели могут принадлежать идущей установке или обновлению. Правило просит закрыть установщики и службы обслуживания, занятые файлы движок помечает как Skip (locked) и удаляет остальное."
+    }
+  ]
+}

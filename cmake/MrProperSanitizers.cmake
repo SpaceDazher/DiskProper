@@ -10,7 +10,9 @@
 # Совместимость:
 #   MSVC   — /fsanitize=address с 19.29 (VS 2019 16.9),
 #            /fsanitize=undefined с 19.36 (VS 2022 17.6).
-#            ASan у MSVC требует /INCREMENTAL:NO и несовместим с /RTC.
+#            ASan у MSVC требует отключённой инкрементальной компоновки.
+#            В линковку /fsanitize=address не передаётся: link.exe его не
+#            знает (LNK4044). Рантайм подтягивает линкер сам.
 #   GCC/Clang — address и undefined доступны везде.
 # ---------------------------------------------------------------------------
 include_guard(GLOBAL)
@@ -39,8 +41,17 @@ function(mrproper_sanitizer_options out_compile out_link)
                         "MRPROPER_SANITIZE=address требует MSVC 19.29+ (VS 2019 16.9+); "
                         "сейчас ${CMAKE_CXX_COMPILER_VERSION}")
                 endif()
-                list(APPEND _compile /fsanitize=address /INCREMENTAL:NO)
-                list(APPEND _link /fsanitize=address /INCREMENTAL:NO)
+                # /fsanitize=address — флаг КОМПИЛЯТОРА, и только его. В компоновку
+                # он не передаётся: link.exe 19.29 его не знает и печатает
+                # «LNK4044: нераспознанный параметр /fsanitize=address;
+                # игнорируется» на каждый линкующий проект. Рантайм ASan и так
+                # подтягивается автоматически: компилятор встраивает ссылку на
+                # него в объектные файлы, а линкер разрешает её сам — при условии
+                # отключённой инкрементальной компоновки.
+                list(APPEND _compile /fsanitize=address)
+                # /INCREMENTAL:NO — реальное требование линковщика: с
+                # инкрементальной компоновкой ASan не инициализируется.
+                list(APPEND _link /INCREMENTAL:NO)
                 # C5072: оптимизатор сообщает, что ASan запретил встраивание
                 # функции. Это не дефект кода, а прямое следствие проверки, но
                 # проект собирает с /WX, поэтому диагностика гасится явно.
@@ -50,7 +61,6 @@ function(mrproper_sanitizer_options out_compile out_link)
                     list(APPEND _dropped "undefined (MSVC ${CMAKE_CXX_COMPILER_VERSION} не поддерживает)")
                 else()
                     list(APPEND _compile /fsanitize=undefined)
-                    list(APPEND _link /fsanitize=undefined)
                 endif()
             endif()
         endforeach()
@@ -69,16 +79,19 @@ function(mrproper_sanitizer_options out_compile out_link)
     endif()
     if(MSVC AND _compile MATCHES "fsanitize=address")
         # Рантайм ASan в Visual Studio 2019 (19.29-19.35) помечен preview: на
-        # проверенной машине (VS 2019 16.11) и отладочный, и динамический
-        # рантайм не инициализируются, процесс падает с 0xC0000142 без
-        # единого сообщения. Предупреждение на этапе configure честнее, чем
-        # запуск собранной программы с пустым выводом.
+        # проверенной машине (MSVC 19.29, VS 2019 16.11) проект собирается, но
+        # процесс не стартует — выход с кодом 66 (STATUS_DLL_INIT_FAILED) и
+        # пустым выводом, даже если подложить clang_rt.asan*.dll рядом с exe.
+        # Предупреждение на этапе configure честнее, чем запуск собранной
+        # программы с пустым выводом, который выглядит как «тесты не нашлись».
         if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19.36)
             message(WARNING
                 "[MrProper] MSVC ${CMAKE_CXX_COMPILER_VERSION} (Visual Studio 2019): "
-                "рантайм AddressSanitizer помечен preview и может не инициализироваться "
-                "(процесс завершится с 0xC0000142). Надёжная проверка санитайзеров — "
-                "пресеты wsl-debug / wsl-release с GCC или Clang, либо Visual Studio 2022 17.x")
+                "рантайм AddressSanitizer помечен preview. Сборка пройдёт, но процесс "
+                "не запустится — код 66 (STATUS_DLL_INIT_FAILED) и пустой вывод "
+                "(проверено на этой машине: tools\\test.bat Debug, 19.29.30159.0). "
+                "Надёжная проверка санитайзеров — пресеты wsl-debug / wsl-release "
+                "с GCC или Clang, либо Visual Studio 2022 17.x")
         endif()
     endif()
     set(${out_compile} "${_compile}" PARENT_SCOPE)
@@ -102,11 +115,24 @@ function(mrproper_enable_sanitizers_to_directory)
         add_link_options(${_link})
     endif()
     if(MSVC AND _compile MATCHES "fsanitize=address")
-        # ASan у MSVC требует отключённой инкрементальной компоновки. Флаг
-        # /INCREMENTAL:NO в командной строке генератор Visual Studio
-        # отбрасывает (он управляет свойством LinkIncremental), поэтому
-        # отключаем инкрементальность свойством каталога: иначе линковщик
-        # пропускает инициализацию ASan и процесс падает с 0xC0000142.
-        set_property(DIRECTORY PROPERTY LINK_INCREMENTAL FALSE)
+        # ASan у MSVC требует отключённой инкрементальной компоновки.
+        #
+        # Свойство ставится на цели явно, а не через свойство каталога
+        # LINK_INCREMENTAL и не флагом /INCREMENTAL:NO. На этой машине
+        # (CMake 3.20, генератор Visual Studio 16 2019) проверено, что оба
+        # способа не доходят до .vcxproj — в Link/AdditionalOptions флага нет,
+        # а <LinkIncremental> остаётся пустым элементом, значение которого
+        # зависит от того, как его трактует MSBuild, то есть от версии
+        # MSBuild. Цикл по фактическим целям бьёт по свойству цели напрямую —
+        # это единственный путь, который генератор записывает в файл как есть.
+        # Инерционность включительно, а не выключительно: если у слоя
+        # переопределена своя, её решение должно выиграть.
+        get_property(_mrproper_asan_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+        foreach(_target IN LISTS _mrproper_asan_targets)
+            get_target_property(_target_incremental ${_target} LINK_INCREMENTAL)
+            if(NOT _target_incremental)
+                set_target_properties(${_target} PROPERTIES LINK_INCREMENTAL OFF)
+            endif()
+        endforeach()
     endif()
 endfunction()

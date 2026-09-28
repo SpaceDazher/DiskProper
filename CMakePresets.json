@@ -226,6 +226,36 @@
       "name": "wsl-release",
       "configurePreset": "wsl-release",
       "jobs": 0
+    },
+    {
+      "name": "format",
+      "configurePreset": "debug",
+      "targets": [
+        "mrproper-format"
+      ],
+      "configuration": "Debug",
+      "displayName": "MrProper: clang-format -i по исходникам (SPEC §9.1)",
+      "description": "Форматирование в стиле .clang-format. Цель объявлена с EXCLUDE_FROM_ALL, поэтому обычная сборка tools\\build.bat её не запускает"
+    },
+    {
+      "name": "format-check",
+      "configurePreset": "debug",
+      "targets": [
+        "mrproper-format-check"
+      ],
+      "configuration": "Debug",
+      "displayName": "MrProper: проверка формата без правки файлов",
+      "description": "Ненулевой код возврата означает «формат нарушен» — это ворота для CI, они обязаны уметь падать"
+    },
+    {
+      "name": "tidy",
+      "configurePreset": "debug",
+      "targets": [
+        "mrproper-tidy"
+      ],
+      "configuration": "Debug",
+      "displayName": "MrProper: clang-tidy по compile_commands.json",
+      "description": "Нужен каталог с compile_commands.json: MRPROPER_COMPILE_COMMANDS=<каталог> либо пресет ninja-debug. Генератор Visual Studio CMake 3.20 этот файл не пишет"
     }
   ],
   "testPresets": [
