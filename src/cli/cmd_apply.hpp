@@ -32,13 +32,24 @@
 //     пропуск reparse) — это FR-6 и зона engine::CleanupExecutor; здесь они не
 //     дублируются, иначе две реализации разойдутся.
 //
-//  3. Скан и исполнитель операций не выдумываются. На момент написания модуля
-//     engine::ScanCoordinator и CleanupExecutor ещё не собраны, а правило
-//     команды — не придумывать чужой API. Поэтому оба внедряются:
-//     ApplyEnvironment::candidates (где взять кандидатов) и
-//     ApplyEnvironment::executeOperation (как выполнить операцию). Без
-//     подключённого исполнителя --execute честно отказывает с кодом NoExecutor,
-//     а не изображает очистку.
+//  3. Скан и исполнитель операций не выдумываются, а внедряются. Правило
+//     команды — не придумывать чужой API: движок уже собран
+//     (engine::ScanCoordinator и engine::CleanupExecutor, волна G1), и его
+//     подключение живёт в makeFileEnvironment(), а не в разборе аргументов.
+//     Через ApplyEnvironment проходят три точки: candidates (где взять
+//     кандидатов), executeOperation (выполнить одну операцию — осталось для
+//     вызывающих, у которых есть свой исполнитель), liveScan и executePlan
+//     (настоящий путь CLI: живой скан и настоящий исполнитель целиком).
+//     Пока исполнитель не подключён, --execute честно отказывает с кодом
+//     NoExecutor, а не изображает очистку.
+//
+//  4. Удаление идёт по кандидатам ЖИВОГО скана, а не по файлу. Список из
+//     --candidates для удаления запрещён (FR-5: план — снимок, а не разрешение
+//     навсегда), поэтому `apply --execute` без --candidates сам разворачивает
+//     правила из --rules, обходит ФС и строит план по только что увиденному.
+//     Набор правил нужен исполнителю и отдельно: корень правила — это граница
+//     проверки «путь внутри корня» (FR-6), а без него любая операция была бы
+//     SkippedOutsideRoot.
 //
 // Формат машинного вывода (--json), как его читает CI:
 //
@@ -57,13 +68,16 @@
 #include <cstdint>
 #include <functional>
 #include <iosfwd>
+#include <memory>
 #include <optional>
+#include <ostream>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "core/model.hpp"
 #include "core/plan.hpp"
+#include "core/rules.hpp"
 
 namespace mrproper::cli {
 
@@ -116,6 +130,18 @@ struct ApplyOptions {
     // явное действие человека, как галочка на экране «Очистка»; профиль
     // everything берёт Review и без этого ключа.
     bool includeReview{false};
+
+    // --rules <каталог> — набор правил для ЖИВОГО скана. Только этот путь
+    // пригоден для удаления: кандидаты берутся из только что увиденной файловой
+    // системы, а не из файла (FR-5). Пусто — живого скана нет, и тогда
+    // кандидаты можно взять только из --candidates (то есть план без удаления).
+    std::string rulesPath;
+
+    // --trash-root <каталог> — куда складывать корзину приложения (FR-7).
+    // Пусто — %ProgramData%\MrProper\Trash (platform::defaultTrashRoot).
+    // Ключ существует не для красоты: песочница проверки и CI обязаны держать
+    // транзакции в своём каталоге, а не в чужом ProgramData.
+    std::string trashRoot;
 };
 
 // Разбор аргументов команды (без имени команды: caller отдаёт только хвост).
@@ -144,6 +170,7 @@ struct ApplyIo {
 // Строки не фатальны: ошибка одной операции не отменяет остальные (FR-6).
 struct OperationResult {
     bool ok{};                       // операция выполнена
+    std::string status;              // что именно сделано: Deleted, Trashed, AlreadyGone, Locked, …
     std::uint64_t freedBytes{};      // фактически освобождено (аллоцированный размер, FR-4)
     std::string transactionId;       // txId корзины приложения для Trash (FR-7), пусто для Delete
     std::string detail;              // HRESULT/текст платформы; при ошибке — обязателен
@@ -161,6 +188,66 @@ using OperationExecutor =
 // подключён, --candidates <файл>. false + error означает «источника нет».
 using CandidateSource = std::function<bool(std::vector<core::CleanupCandidate>&, std::string& error)>;
 
+// Кандидаты вместе с манифестами и набором правил, из которого их собрали.
+//
+// Набор правил едет вместе с кандидатами не для красоты: исполнитель выводит
+// из него корень правила, а корень — это граница проверки «путь внутри корня
+// правила» (FR-6). Без него любая операция закончилась бы SkippedOutsideRoot,
+// то есть удаление было бы невозможно в принципе.
+struct LiveScan {
+    std::vector<core::CleanupCandidate> candidates;
+    std::vector<core::CandidateManifest> manifests;
+    std::shared_ptr<const core::RuleSet> rules;
+};
+
+// Живой скан по набору правил из каталога (--rules). Второй параметр —
+// человеческий канал: прогресс обхода идёт в stderr, потому что stdout в
+// режиме --json остаётся машинным (§6.2).
+using LiveScanSource = std::function<bool(const std::string& rulesPath, const std::vector<std::string>& categories,
+                                          std::ostream& humanChannel, LiveScan& out, std::string& error)>;
+
+// Что исполнителю нужно на фазе проверки и при переносе в корзину. Указатели,
+// а не значения: те же объекты живут в отчёте команды, а копия плана на
+// тысячи строк здесь была бы второй правдой о том, что собираются удалить.
+struct PlanExecutionInput {
+    const std::vector<core::CleanupCandidate>* candidates{};
+    const std::vector<core::CandidateManifest>* manifests{};
+    const core::CleanupPlan* plan{};
+    // Набор правил, по которому шёл скан. nullptr — корни правил неизвестны, и
+    // тогда исполнитель не сможет проверить принадлежность корню (FR-6).
+    const core::RuleSet* rules{};
+    std::string trashRoot;    // пусто — корзина приложения по умолчанию (FR-7)
+    std::string appVersion;   // пишется в манифест транзакции
+    // Куда писать ход операций. nullptr — молча: команда печатает итог сама.
+    std::ostream* progress{nullptr};
+};
+
+// Что исполнитель сделал с одним кандидатом. Индекс — позиция кандидата в том
+// списке, который ушёл исполнителю (инвариант §6.3).
+struct PlanExecutionItem {
+    bool ok{};                   // цель достигнута: удалено, перенесено в корзину или уже отсутствовало
+    std::string status;          // Deleted | Trashed | AlreadyGone | Locked | Protected | …
+    std::uint64_t freedBytes{};  // фактически освобождено
+    std::string transactionId;   // транзакция корзины, если был перенос (FR-7)
+    std::string detail;          // причина: HRESULT платформы или «почему пропустили»
+};
+
+// Итог прогона целиком.
+struct PlanExecution {
+    std::vector<PlanExecutionItem> items;  // по одному на кандидата, в том же порядке
+    std::uint64_t freedBytes{};
+    std::string transactionId;  // транзакция корзины прогона, если была (FR-7)
+    bool aborted{false};         // прогон прерван отменой
+    std::string abortReason;
+    std::string summary;  // итоговая строка движка для stderr
+};
+
+// Исполнитель всего плана целиком (engine::CleanupExecutor). false — прогон не
+// состоялся (dry-run, нечего делать, чек-лист разошёлся с планом, отмена до
+// старта), и тогда out.abortReason объясняет почему: молча вывести «удалено 0
+// байт» после такого отказа было бы враньём о результате.
+using PlanExecutor = std::function<bool(const PlanExecutionInput&, PlanExecution&)>;
+
 // Снимок состояния (FR-5): версия, PID, время — их знает платформа, ядро
 // оставляет поля пустыми и ждёт их от сюда.
 using SnapshotContextProvider = std::function<core::PlanSnapshotContext()>;
@@ -172,12 +259,20 @@ using ConfirmationPrompt = std::function<bool(const std::string& question, std::
 struct ApplyEnvironment {
     CandidateSource candidates;                // пусто → только --candidates
     OperationExecutor executeOperation;        // пусто → --execute откажется (NoExecutor)
+    LiveScanSource liveScan;                   // пусто → --rules не работает
+    PlanExecutor executePlan;                  // пусто → --execute откажется (NoExecutor)
     SnapshotContextProvider snapshotContext;   // пусто → снимок без версии/PID/времени
     ConfirmationPrompt ask;                    // пусто → вопрос задаётся в err, ответ читается из io.in
+    // Версия приложения для снимка состояния и манифеста транзакции корзины
+    // (FR-7). Пусто — версия не выдумывается.
+    std::string appVersion;
 };
 
-// Готовое окружение «как есть»: кандидаты из --candidates, исполнителя нет.
-// Удобно вызывающему, который пока умеет только показать план.
+// Готовое окружение настоящей программы: кандидаты — живой скан по --rules,
+// операции выполняет engine::CleanupExecutor вместе со своими проверками FR-6,
+// снимок состояния знает версию и PID процесса. Команда, у которой своё
+// окружение (тесты, библиотека), остаётся переносимой: движок подключается
+// только здесь, а не в разборе аргументов и не в построении плана.
 ApplyEnvironment makeFileEnvironment();
 
 // Вопрос в err, ответ — одна строка из in. Возвращает false, если строку
@@ -196,6 +291,7 @@ struct ExecutionSummary {
     std::uint64_t freedBytes{};   // фактически освобождено
     bool aborted{};               // исполнитель попросил остановиться
     std::string abortReason;      // чем остановился (пусто при aborted == false)
+    std::string transactionId;    // транзакция корзины прогона (FR-7), пусто — переноса не было
     std::vector<core::PlanOperation> operations;  // ровно те, что ушли исполнителю
     std::vector<OperationResult> results;         // параллельный вектор: results[i] к operations[i]
     std::vector<core::PlanOperation> notRun;      // начать не успели: план показан, но не выполнен
@@ -204,6 +300,10 @@ struct ExecutionSummary {
 struct ApplyReport {
     std::vector<core::CleanupCandidate> candidates;  // по ним построен план; нужны исполнителю и отчёту
     std::vector<core::CandidateManifest> manifests;  // что каждому кандидату разрешено удалять (F-01)
+    // Набор правил, по которому шёл живой скан: нужен исполнителю для корня
+    // правила (FR-6). Пусто — кандидаты пришли из файла, а удалять по файлу
+    // запрещено, поэтому корень и не понадобится.
+    std::shared_ptr<const core::RuleSet> rules;
     core::CleanupPlan plan;        // что решил core::plan
     core::DryRunReport dryRun;     // тот же список операций текстом (FR-5)
     core::PlanSnapshot snapshot;   // снимок состояния перед исполнением (FR-5)

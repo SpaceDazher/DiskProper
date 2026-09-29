@@ -260,6 +260,41 @@ std::string comparablePath(std::string_view path) {
     return text;
 }
 
+// Расширенная форма Win32 обратно в путь модели.
+//
+// Нормализация через GetFinalPathNameByHandleW(..., VOLUME_NAME_DOS) всегда
+// возвращает путь с префиксом «\\?\» («\\?\C:\Users\x»), и такой путь не равен
+// ни локатору правила, ни пути, который пришёл от скана. Проверка фазы C
+// «путь всё ещё соответствует локатору» сравнивает эти два текста напрямую, и
+// без снятия префикса КАЖДАЯ операция заканчивалась бы SkippedOutsideRoot — то
+// есть удаление было бы невозможно в принципе, при полностью корректном
+// плане. В отчёте, в журнале и в манифесте транзакции путь тоже должен быть в
+// виде модели (§6.3), иначе «путь, не совпавший ни с одним правилом» нельзя
+// ни найти в логе, ни вернуть при отмене (FR-7).
+//
+// Виды, которые приходят от платформы:
+//   «\\?\C:\…»          → «C:\…»
+//   «\\?\UNC\srv\shr\…» → «\\srv\shr\…»
+//   «\\?\Volume{…}\…»   → как есть: у тома по GUID нет короткой формы, и
+//                          выдумывать её нельзя (такой путь просто не совпадёт с
+//                          локатором и будет пропущен — безопасный исход).
+std::string plainPath(std::string_view extended) {
+    constexpr std::string_view kExtended = R"(\\?\UNC\)";
+    constexpr std::string_view kExtendedAny = R"(\\?\)";
+    if (extended.size() <= kExtendedAny.size() || extended.substr(0, kExtendedAny.size()) != kExtendedAny) {
+        return std::string(extended);
+    }
+    const std::string_view tail = extended.substr(kExtendedAny.size());
+    if (tail.size() >= 3u && tail[0] >= 'A' && tail[0] <= 'Z' && tail[1] == ':' &&
+        (tail[2] == '\\' || tail[2] == '/')) {
+        return std::string(tail);
+    }
+    if (extended.size() > kExtended.size() && extended.substr(0, kExtended.size()) == kExtended) {
+        return R"(\\)" + std::string(extended.substr(kExtended.size()));
+    }
+    return std::string(extended);
+}
+
 // Имя элемента транзакции корзины для одного пути из списка:
 // «item-000001.000042». Нумерация с ведущими нулями — чтобы имена в
 // каталоге транзакции читались по порядку, и чтобы core::isValidPayloadName
@@ -668,13 +703,12 @@ void CleanupExecutor::checkItem(const core::CleanupCandidate& candidate, ItemRep
     // 2. Нормализация, корень правила, белый список, reparse.
     const vfs_paths::RootGuard root = vfs_paths::prepareRoot(item.ruleRoot);
     const vfs_paths::Guard guard = vfs_paths::checkRuleRoot(item.path, root);
+    if (!guard.normalized.empty()) item.path = plainPath(guard.normalized);
     if (!guard.allowed()) {
-        if (!guard.normalized.empty()) item.path = guard.normalized;
         item.hr = hresultOrZero(guard.lastError);
         skipItem(item, outcomeOf(guard.verdict));
         return;
     }
-    if (!guard.normalized.empty()) item.path = guard.normalized;
     if (token.stop_requested()) {
         skipItem(item, ItemOutcome::NotStarted);
         return;
@@ -1119,6 +1153,9 @@ const core::CandidateManifest* CleanupExecutor::manifestForItem(const ItemReport
 }
 
 void CleanupExecutor::deleteAllowedList(ItemReport& item, const core::AllowedSet& allowed) {
+    // ВРЕМЕННО H4 (будет откачено): печатаем item.ruleRoot ДО создания view.
+    std::printf("[H4DIAG] deleteAllowedList item.ruleRoot=[%s] len=%zu entries=%zu\n", item.ruleRoot.c_str(),
+                item.ruleRoot.size(), allowed.entries.size());
     vfs::DeleteOptions deleteOptions;
     deleteOptions.allowedRoot = wide(item.ruleRoot);
     deleteOptions.maxAttempts = options_.deleteAttempts;
@@ -1584,6 +1621,34 @@ void CleanupExecutor::finishTrash(RunContext& run, ExecutionReport& report) {
         return;
     }
     run.ledger.commit(run.txId);
+    // Манифест перезаписывается ПОСЛЕ commit — и это не «на всякий случай».
+    // Состояние committed означает «отменять можно», а состояние open читается
+    // движком отмены как «манифест ещё не записан» (engine::undo_service,
+    // §7.2): транзакция лежала бы на диске целиком, а восстановить её было бы
+    // нельзя, то есть FR-7 «перенос отменяем» оказался бы неправдой. Запись
+    // идемпотентна, а файл маленький — платим за это одной перезаписью.
+    const platform::TrashStatus committedStatus = platform::writeManifest(run.trashDir, *tx, run.trashOptions);
+    if (committedStatus != platform::TrashStatus::Ok) {
+        {
+            std::lock_guard lock(run.errorsMutex);
+            ExecutionError error;
+            error.path = run.trashDir;
+            error.code = "trash-commit";
+            error.message = "состояние транзакции не записано: элементы перенесены, но отмена их недоступна (" +
+                            platform::formatStatus(committedStatus, 0) + ")";
+            if (report.errors.size() < options_.maxReportedErrors) {
+                report.errors.push_back(std::move(error));
+            } else {
+                ++report.errorsDropped;
+            }
+        }
+        if (options_.logFailures) {
+            core::LogFields fields = pathField(run.trashDir);
+            fields.push_back(core::logField("txid", run.txId));
+            fields.push_back(core::logField("status", platform::toString(committedStatus)));
+            core::logError(kEventManifest, "состояние транзакции корзины не записано", std::move(fields));
+        }
+    }
     if (options_.logFailures) {
         core::LogFields fields = addField(pathField(run.trashDir), "items", tx->itemCount());
         fields = addField(std::move(fields), "bytes", tx->totalBytes());

@@ -98,6 +98,17 @@ const char* profileLabel(SelectionProfile profile) {
     return "рекомендуемый";
 }
 
+// Один отказ «уровень элемента не входит в то, что берётся по умолчанию»
+// в двух формулировках: уровень не входит и кто это задал — профиль или потолок
+// уровня. Формулировка одна, потому что решение одно: safe-only и recommended с
+// потолком safe отсекают Review одинаково, и текст причины не имеет права
+// выдавать это за два разных решения (SPEC §12 — план объясняет свой выбор).
+std::string safetyCeilingReason(SafetyLevel safety, std::string_view ceiling) {
+    return "уровень " + std::string(safetyToken(safety)) + " не входит в потолок отбора по умолчанию (" +
+           std::string(ceiling) + "); взять его может только человек — галочкой или профилем «выбрать всё» "
+           "(SPEC §4 FR-3, FR-4)";
+}
+
 // Имена приложений, удерживающих файлы: «msedge, Photos».
 std::string describeLockers(const CleanupCandidate& candidate) {
     std::string names;
@@ -396,10 +407,11 @@ SelectionDecision decideCandidate(const CleanupCandidate& candidate, const PlanO
     // 7. Профиль отбора и порог уверенности.
     switch (options.profile) {
         case SelectionProfile::SafeOnly:
+            // Отказ тот же, что у recommended с потолком safe, — отличается
+            // только токен (profile-filtered) и то, кто задал потолок: профиль.
             if (candidate.safety != SafetyLevel::Safe) {
                 decision.skip = SkipReason::ProfileFiltered;
-                decision.reason = "профиль «только безопасное»: элемент помечен " +
-                                  std::string(safetyToken(candidate.safety));
+                decision.reason = safetyCeilingReason(candidate.safety, "профиль «только безопасное»");
                 return decision;
             }
             break;
@@ -414,13 +426,13 @@ SelectionDecision decideCandidate(const CleanupCandidate& candidate, const PlanO
             // оказывалось бы слабее умолчания.
             if (candidate.safety == SafetyLevel::Risky && options.allowRisky) break;
             if (safetyRank(candidate.safety) > safetyRank(options.maxDefaultSafety)) {
+                // Review и уровни выше него — один и тот же отказ от потолка
+                // по умолчанию; токены разные, потому что по ним видно, что
+                // человек собирался включить (см. SkipReason в plan.hpp).
                 const bool review = candidate.safety == SafetyLevel::Review;
                 decision.skip = review ? SkipReason::ReviewOffByDefault : SkipReason::ProfileFiltered;
-                decision.reason = review
-                                      ? "уровень Review выключен по умолчанию: выбрать его может только "
-                                        "человек — галочкой или профилем «выбрать всё» (SPEC §4 FR-3, FR-4)"
-                                      : "уровень " + std::string(safetyToken(candidate.safety)) +
-                                        " выше уровня, разрешённого по умолчанию (SPEC §4 FR-4)";
+                decision.reason = safetyCeilingReason(candidate.safety, "потолок " +
+                                                                  std::string(safetyToken(options.maxDefaultSafety)));
                 return decision;
             }
             break;

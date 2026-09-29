@@ -1175,6 +1175,76 @@ TEST(plan_selectionReviewOffByDefault) {
     CHECK(validatePlan(list, enabled).empty());
 }
 
+// Пункт 4: safe-only и recommended с потолком safe отсекают Review ОДНИМ решением
+// (элемент не выбран ни при каком подтверждении), и отличаться у них может
+// только название причины — по нему человек видит, что собирался включить.
+// Токены ProfileFiltered и ReviewOffByDefault намеренно разные: их различие
+// проверяет сценарий Test-FullCycle (tests/e2e/Test-FullCycle.ps1, проверка
+// «plan --profile safe-only совпадает с recommended при потолке safe»).
+TEST(plan_safetyCeilingSkipReasonsMeanOneDecision) {
+    std::vector<CleanupCandidate> list;
+    list.push_back(candidate("temp", SafetyLevel::Safe, 90, kSmall));       // 0 — берётся обоими
+    list.push_back(candidate("browser.history", SafetyLevel::Review, 80, kMedium));  // 1 — отсекается
+    const std::vector<CandidateManifest> manifests = fullRootManifests(list);
+
+    PlanOptions safeOnly;                       // профиль «осторожный»
+    safeOnly.profile = SelectionProfile::SafeOnly;
+    safeOnly.maxDefaultSafety = SafetyLevel::Safe;
+    PlanOptions recommended;                    // умолчание приложения: потолок safe
+    recommended.profile = SelectionProfile::Recommended;
+    recommended.maxDefaultSafety = SafetyLevel::Safe;
+
+    const CleanupPlan byProfile = buildPlan(list, safeOnly, &manifests);
+    const CleanupPlan byCeiling = buildPlan(list, recommended, &manifests);
+
+    // Решение одно: тот же объём, тот же набор операций, тот же элемент не
+    // выбран — различаются только токен и текст причины.
+    CHECK_EQ(byProfile.totals.selectedCount, byCeiling.totals.selectedCount);
+    CHECK_EQ(byProfile.totals.selectedBytes, byCeiling.totals.selectedBytes);
+    CHECK_EQ(byProfile.totals.allCount, byCeiling.totals.allCount);
+    CHECK_EQ(byProfile.operationIndexes().size(), std::size_t{1});
+    CHECK_EQ(byCeiling.operationIndexes().size(), std::size_t{1});
+    // Оба отказа — одна цифра агрегатов: «сколько отсечено уровнем, не входящим
+    // в потолок по умолчанию». Ни один не запрет правила (isRuleBlock).
+    CHECK_EQ(byProfile.totals.profileFilteredCount, std::size_t{1});
+    CHECK_EQ(byCeiling.totals.profileFilteredCount, std::size_t{1});
+    CHECK(!isRuleBlock(SkipReason::ProfileFiltered));
+    CHECK(!isRuleBlock(SkipReason::ReviewOffByDefault));
+
+    // Отчёты живут до конца проверки: указатель на строку «не трогаем» после
+    // смерти временного DryRunReport смотрел бы в освобождённую память.
+    const DryRunReport byProfileReport = makeDryRunReport(list, byProfile);
+    const DryRunReport byCeilingReport = makeDryRunReport(list, byCeiling);
+    const PlanOperation* profileSkip = nullptr;
+    const PlanOperation* ceilingSkip = nullptr;
+    for (const PlanOperation& op : byProfileReport.untouched) {
+        if (list[op.candidateIndex].safety == SafetyLevel::Review) profileSkip = &op;
+    }
+    for (const PlanOperation& op : byCeilingReport.untouched) {
+        if (list[op.candidateIndex].safety == SafetyLevel::Review) ceilingSkip = &op;
+    }
+    CHECK(profileSkip != nullptr);
+    CHECK(ceilingSkip != nullptr);
+    if (profileSkip == nullptr || ceilingSkip == nullptr) return;
+
+    CHECK(profileSkip->skip == SkipReason::ProfileFiltered);
+    CHECK(ceilingSkip->skip == SkipReason::ReviewOffByDefault);
+    // Не выбран: действие не удаляющее, и обещать ему байты нельзя (§6.3).
+    CHECK(profileSkip->action == PlanAction::Keep);
+    CHECK(ceilingSkip->action == PlanAction::Keep);
+    CHECK_EQ(profileSkip->bytes, std::uint64_t{0});
+    CHECK_EQ(ceilingSkip->bytes, std::uint64_t{0});
+
+    // Формулировка одна: обе причины называют уровень, который не входит, и то,
+    // что взять его может только человек (§12 — план объясняет свой выбор).
+    // Слова разные — по ним видно, что именно человек собирался включить.
+    CHECK(profileSkip->reason.find("review") != std::string::npos);
+    CHECK(ceilingSkip->reason.find("review") != std::string::npos);
+    CHECK(profileSkip->reason.find("потолок") != std::string::npos);
+    CHECK(ceilingSkip->reason.find("потолок") != std::string::npos);
+    CHECK(profileSkip->reason != ceilingSkip->reason);
+}
+
 // ------------------------------------------------- уровень риска и «почему это мусор»
 //
 // review-05 F-01: единственное подтверждение перед удалением (FR-5, dry-run)

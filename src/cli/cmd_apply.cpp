@@ -3,9 +3,9 @@
 // Контракт и разбор решений описаны в cmd_apply.hpp; здесь — код. Порядок
 // функций повторяет порядок жизни команды:
 //
-//   разбор аргументов → источник кандидатов → фильтр по категориям →
-//   core::buildPlan → core::validatePlan → показ (dry-run) → [подтверждение] →
-//   core::DryRunGate → выполнение → итог.
+//   разбор аргументов → источник кандидатов (живой скан или файл) → фильтр по
+//   категориям → core::buildPlan → core::validatePlan → показ (dry-run) →
+//   [подтверждение] → core::DryRunGate → выполнение → итог.
 //
 // Проверки, которые нельзя пропустить (каждая с комментарием «почему»):
 //   * validatePlan до показа и до исполнения — инварианты §6.3, а нарушенный
@@ -16,24 +16,51 @@
 //     совпасть с токеном дословно (регистр и пробелы нормализуются);
 //   * ошибка одной операции не отменяет остальные (FR-6), но попадает в лог и
 //     в exit-код.
+//
+// Подключение движка (makeFileEnvironment в конце файла) — единственное
+// место, где слой cli берёт engine::ScanCoordinator и engine::CleanupExecutor:
+// разбор аргументов, построение плана и показ остаются переносимыми и
+// проверяются без диска (§11.1).
 #include "cmd_apply.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <memory>
+#include <mutex>
 #include <ostream>
 #include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "args.hpp"
 #include "core/json.hpp"
 #include "core/log.hpp"
+#include "core/rules.hpp"
+#include "core/rulesync.hpp"
 #include "core/units.hpp"
+#include "engine/candidate_collector.hpp"
+#include "engine/executor.hpp"
+#include "engine/file_system_probe.hpp"
+#include "engine/scan_coordinator.hpp"
+#include "engine/scoring_bridge.hpp"
+
+#if defined(_WIN32)
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#endif
 
 namespace mrproper::cli {
 namespace {
@@ -527,6 +554,7 @@ std::string applyJson(bool executed, bool confirmed, const std::string& refusal,
                                                {"bytes", numberValue(op.bytes)},
                                                {"safety", Value(core::toString(op.safety))},
                                                {"ok", Value(result.ok)},
+                                               {"status", Value(result.status)},
                                                {"freedBytes", numberValue(result.freedBytes)},
                                                {"transactionId", Value(result.transactionId)},
                                                {"detail", Value(result.detail)}}));
@@ -547,6 +575,7 @@ std::string applyJson(bool executed, bool confirmed, const std::string& refusal,
             {"freedBytes", numberValue(summary.freedBytes)},
             {"aborted", Value(summary.aborted)},
             {"abortReason", Value(summary.abortReason)},
+            {"transactionId", Value(summary.transactionId)},
             {"operations", Value::array(std::move(operationItems))},
             {"errors", Value::array(std::move(errorItems))},
             {"notRun", Value::array(std::move(notRunItems))},
@@ -674,6 +703,7 @@ PlanExit prepareRun(const ApplyOptions& options, const ApplyIo& io, const ApplyE
 
     std::vector<core::CleanupCandidate> candidates;
     std::vector<core::CandidateManifest> manifests;
+    std::shared_ptr<const core::RuleSet> rules;
     if (options.candidatesPath.has_value()) {
         std::string error;
         if (!loadCandidatesFile(*options.candidatesPath, candidates, manifests, error)) {
@@ -683,6 +713,25 @@ PlanExit prepareRun(const ApplyOptions& options, const ApplyIo& io, const ApplyE
                                            core::logField("error", error)});
             return PlanExit::NoCandidates;
         }
+    } else if (!options.rulesPath.empty() && env.liveScan) {
+        // Живой скан — единственный источник, из которого можно удалять (FR-5:
+        // план это снимок состояния, а не разрешение навсегда). Правила нужны и
+        // исполнителю: из локатора он выводит корень, а корень — это граница
+        // проверки перед удалением.
+        LiveScan scan;
+        std::string error;
+        if (!env.liveScan(options.rulesPath, options.categories, io.err, scan, error)) {
+            io.err << "MrProper: скан не дал кандидатов" << (error.empty() ? "" : ": " + error) << "\n";
+            core::logError("plan.scan", "живой скан не дал кандидатов",
+                           core::LogFields{core::logField("rules", options.rulesPath),
+                                           core::logField("error", error)});
+            return PlanExit::NoCandidates;
+        }
+        candidates = std::move(scan.candidates);
+        manifests = std::move(scan.manifests);
+        rules = std::move(scan.rules);
+        io.err << "MrProper: живой скан: кандидатов " << core::formatCount(candidates.size()) << ", манифестов "
+               << core::formatCount(manifests.size()) << "\n";
     } else if (env.candidates) {
         std::string error;
         if (!env.candidates(candidates, error)) {
@@ -691,8 +740,9 @@ PlanExit prepareRun(const ApplyOptions& options, const ApplyIo& io, const ApplyE
             return PlanExit::NoCandidates;
         }
     } else {
-        io.err << "MrProper: не задано, откуда взять кандидатов: подключите скан "
-                  "(ApplyEnvironment::candidates) или укажите --candidates <файл>\n";
+        io.err << "MrProper: не задано, откуда взять кандидатов: укажите --rules <каталог> (живой скан), "
+                  "--candidates <файл> (план без удаления) или подключите скан "
+                  "(ApplyEnvironment::candidates)\n";
         return PlanExit::NoCandidates;
     }
 
@@ -752,6 +802,7 @@ PlanExit prepareRun(const ApplyOptions& options, const ApplyIo& io, const ApplyE
 
     out.candidates = std::move(candidates);
     out.manifests = std::move(manifests);
+    out.rules = std::move(rules);
     out.dryRun = core::makeDryRunReport(out.candidates, out.plan);
 
     core::PlanSnapshotContext context;
@@ -818,12 +869,24 @@ PlanExit askConfirmation(const ApplyIo& io, const ApplyEnvironment& env, const A
 // Выполнение
 // ---------------------------------------------------------------------------
 
+// Основной путь CLI: целиком через исполнитель движка. Объявлено здесь, потому
+// что executePlan вызывает его раньше, чем оно определено ниже.
+PlanExit executeWithEngine(const ApplyOptions& options, const ApplyIo& io, const ApplyEnvironment& env,
+                           ApplyReport& out);
+
 void printOperationResult(std::ostream& out, std::size_t number, const core::PlanOperation& op,
                           const OperationResult& result) {
-    out << "  [" << number << "] " << (result.ok ? "ок" : "ошибка") << " · " << actionName(op.action) << " · "
+    // Статус операции, а не «ок/ошибка»: пропуск по политике — это не ошибка,
+    // но для человека это и не «ок», и называть его «ошибкой» значило бы
+    // соврать о том, что стало с файлом (§12 — правда в отчёте).
+    const std::string verdict = !result.status.empty() ? result.status : (result.ok ? "ок" : "ошибка");
+    out << "  [" << number << "] " << verdict << " · " << actionName(op.action) << " · "
         << core::formatBytes(op.bytes) << " · " << op.path << "\n";
-    if (!result.ok) out << "        причина: " << (result.detail.empty() ? "исполнитель не вернул причину" : result.detail)
-                        << "\n";
+    if (!result.detail.empty()) {
+        if (!result.ok || result.status == "AlreadyGone") out << "        причина: " << result.detail << "\n";
+    } else if (!result.ok) {
+        out << "        причина: исполнитель не вернул причину\n";
+    }
 }
 
 PlanExit executePlan(const ApplyOptions& options, const ApplyIo& io, const ApplyEnvironment& env, ApplyReport& out) {
@@ -832,15 +895,13 @@ PlanExit executePlan(const ApplyOptions& options, const ApplyIo& io, const Apply
     printPlanText(options, io, out, /*beforeExecute=*/true);
     reportSnapshot(out.snapshot, out.dryRun, io.err);
 
-    if (out.dryRun.operations.empty()) {
-        out.refusal = "нечего выполнять: в плане 0 операций";
-        core::logInfo("apply.empty", "в плане нет операций — выполнение не потребовалось",
-                      core::LogFields{core::logField("signature", out.snapshot.planSignature)});
-        return PlanExit::Ok;
-    }
-
     // 2. Список из файла удалять нельзя: между сканом и очисткой он мог
     //    устареть (FR-5 — план это снимок, а не разрешение навсегда).
+    //    Проверка стоит ПЕРЕД ранним возвратом по пустому плану: иначе
+    //    `apply --candidates f.json --execute` на плане, из которого ничего не
+    //    выбирается, отвечал бы «0, удалять нечего» — то есть молча соглашался
+    //    удалять по файлу, который запрещён (D-49). Запрет не зависит от того,
+    //    нашлись операции или нет.
     if (options.candidatesPath.has_value()) {
         out.refusal = "--candidates читает готовый список: удалять по нему нельзя, план мог устареть";
         io.err << "MrProper: " << out.refusal
@@ -851,9 +912,21 @@ PlanExit executePlan(const ApplyOptions& options, const ApplyIo& io, const Apply
         return PlanExit::Refused;
     }
 
-    // 3. Без исполнителя операций --execute не выполняется. Молча вывести
-    //    «удалено 0 байт» здесь означало бы соврать о результате.
-    if (!env.executeOperation) {
+    // 3. Пустой план — не отказ, а «удалять нечего»: команды прошли, элементов
+    //    под профиль не нашлось. Ранний возврат стоит после запрета выше, иначе
+    //    пустой список из файла проходил бы как успешное выполнение.
+    if (out.dryRun.operations.empty()) {
+        out.refusal = "нечего выполнять: в плане 0 операций";
+        core::logInfo("apply.empty", "в плане нет операций — выполнение не потребовалось",
+                      core::LogFields{core::logField("signature", out.snapshot.planSignature)});
+        return PlanExit::Ok;
+    }
+
+    // 4. Без исполнителя операций --execute не выполняется. Молча вывести
+    //    «удалено 0 байт» здесь означало бы соврать о результате. Исполнителей
+    //    два вида: целиком (executePlan, engine::CleanupExecutor) и
+    //    пооперационный (executeOperation, для вызывающих со своим движком).
+    if (!env.executePlan && !env.executeOperation) {
         out.refusal = "исполнитель операций не подключён (engine::CleanupExecutor ещё не собран)";
         io.err << "MrProper: " << out.refusal << "\n";
         core::logError("apply.noexecutor", "запрошено выполнение без исполнителя операций",
@@ -861,7 +934,7 @@ PlanExit executePlan(const ApplyOptions& options, const ApplyIo& io, const Apply
         return PlanExit::NoExecutor;
     }
 
-    // 4. Подтверждение. Сессия CLI — один запуск процесса, поэтому подтверждение
+    // 5. Подтверждение. Сессия CLI — один запуск процесса, поэтому подтверждение
     //    всегда нужно заново, а --yes — единственный способ его не спрашивать.
     if (options.yes) {
         io.err << "MrProper: подтверждение получено ключом --yes (неинтерактивный режим)\n";
@@ -876,7 +949,7 @@ PlanExit executePlan(const ApplyOptions& options, const ApplyIo& io, const Apply
     }
     out.confirmed = true;
 
-    // 5. Ядро проверяет, что показан и подтверждён именно этот план: сменились
+    // 6. Ядро проверяет, что показан и подтверждён именно этот план: сменились
     //    выборы, профиль или порог — отпечаток другой, и подтверждение сгорело.
     core::DryRunGate gate;
     gate.beginSession();
@@ -889,7 +962,16 @@ PlanExit executePlan(const ApplyOptions& options, const ApplyIo& io, const Apply
         return PlanExit::Refused;
     }
 
-    // 6. Выполнение. Ошибка одной операции не отменяет остальные (FR-6).
+    // 7. Выполнение. Основной путь CLI — целиком через исполнитель движка:
+    //    фазы проверок (корень правила, белый список защищённых каталогов,
+    //    пропуск reparse, снимок состояния, Restart Manager), работа с
+    //    манифестом разрешённого и перенос в корзину принадлежат
+    //    engine::CleanupExecutor (FR-6, docs/review-02.md F-01), и второй их
+    //    вариант в CLI рано или поздно разошёлся бы с ним.
+    if (env.executePlan) return executeWithEngine(options, io, env, out);
+
+    // 8. Пооперационный исполнитель: ошибка одной операции не отменяет
+    //    остальные (FR-6).
     const std::vector<core::PlanOperation>& operations = out.dryRun.operations;
     ExecutionSummary& summary = out.execution;
     summary.operations.reserve(operations.size());
@@ -960,6 +1042,592 @@ PlanExit executePlan(const ApplyOptions& options, const ApplyIo& io, const Apply
                                   core::logField("freedBytes", summary.freedBytes),
                                   core::logField("notRun", summary.notRun.size())});
     return summary.failed == 0 ? PlanExit::Ok : PlanExit::Failed;
+}
+
+// ---------------------------------------------------------------------------
+// Отмена по Ctrl+C
+// ---------------------------------------------------------------------------
+//
+// Удаление кооперативно отменяемо (FR-6), но кооперативность должна быть с
+// кем-то: без обработчика консоли Ctrl+C убивает процесс посреди переноса в
+// корзину, и манифест транзакции не пишется — то есть отменять будет нечего.
+// Обработчик просит остановиться у того, кто сейчас работает, и всегда
+// возвращает TRUE: «приложение остановит само себя» — правда, а «процесс
+// исчезнет, ничего не записав» — нет. Указатели, а не ссылки: в обработчике
+// консоли ничего кроме атомарной загрузки и noexcept-вызова делать нельзя.
+
+std::atomic<engine::ScanCoordinator*> g_runningScan{nullptr};
+std::atomic<engine::CleanupExecutor*> g_runningExecutor{nullptr};
+
+void requestRunningWorkToStop() noexcept {
+    if (engine::ScanCoordinator* scan = g_runningScan.load(std::memory_order_acquire)) scan->requestStop();
+    if (engine::CleanupExecutor* executor = g_runningExecutor.load(std::memory_order_acquire)) executor->requestStop();
+}
+
+#if defined(_WIN32)
+BOOL WINAPI consoleCtrlHandler(DWORD type) {
+    switch (type) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            requestRunningWorkToStop();
+            return TRUE;
+        default:
+            break;
+    }
+    return FALSE;
+}
+
+// Один раз на процесс: повторная регистрация того же обработчика ничего не
+// меняет, но и не нужна.
+void installConsoleStopHandler() {
+    static const bool installed = [] {
+        ::SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
+        return true;
+    }();
+    (void)installed;
+}
+#else
+void installConsoleStopHandler() {}
+#endif
+
+// ---------------------------------------------------------------------------
+// Исполнение через engine::CleanupExecutor
+// ---------------------------------------------------------------------------
+
+// Статус строки для человека и для JSON. Язык движка (done, skipped-busy…)
+// годится в журнал, но в отчёте apply он обязан читаться как действие:
+// «Deleted» или «AlreadyGone» отвечают на вопрос «что стало с этим путём»
+// прямо, а «done» — только на вопрос «была ли ошибка».
+std::string statusOfItem(engine::ItemOutcome outcome, core::PlanAction action) {
+    switch (outcome) {
+        case engine::ItemOutcome::Done:
+            return action == core::PlanAction::Trash ? "Trashed" : "Deleted";
+        case engine::ItemOutcome::AlreadyGone:
+            return "AlreadyGone";
+        case engine::ItemOutcome::SkippedBusy:
+            return "Locked";
+        case engine::ItemOutcome::SkippedLockUnknown:
+            return "LockUnknown";
+        case engine::ItemOutcome::SkippedProtected:
+            return "Protected";
+        case engine::ItemOutcome::SkippedOutsideRoot:
+            return "OutsideRoot";
+        case engine::ItemOutcome::SkippedReparse:
+            return "Reparse";
+        case engine::ItemOutcome::SkippedChanged:
+            return "Changed";
+        case engine::ItemOutcome::SkippedInvalid:
+            return "InvalidPath";
+        case engine::ItemOutcome::SkippedNoManifest:
+            return "NoManifest";
+        case engine::ItemOutcome::NotStarted:
+            return "NotStarted";
+        case engine::ItemOutcome::NotSelected:
+            return "NotSelected";
+        case engine::ItemOutcome::Cancelled:
+            return "Cancelled";
+        case engine::ItemOutcome::Failed:
+            break;
+    }
+    return "Failed";
+}
+
+// Адаптер исполнителя: engine::CleanupExecutor поверх контракта PlanExecutor.
+//
+// Набор правил обязателен не «для полноты»: buildChecklist выводит из него
+// корень правила, а фаза проверки требует границу (FR-6) — без корня каждая
+// операция честно закончилась бы SkippedOutsideRoot, то есть удаление было бы
+// невозможно. Пустой набор — это не тихий обход проверки, а отказ с кодом 5.
+bool executePlanWithEngine(const PlanExecutionInput& input, PlanExecution& out) {
+    if (input.candidates == nullptr || input.plan == nullptr) {
+        out.abortReason = "исполнителю не переданы кандидаты или план";
+        return false;
+    }
+    installConsoleStopHandler();
+    const std::vector<core::CleanupCandidate>& candidates = *input.candidates;
+
+    engine::CleanupExecutorOptions options;
+    options.trashRoot = input.trashRoot;
+    options.appVersion = input.appVersion;
+    // Все проверки FR-6 включены: без них удаление идёт вслепую. checkStamps
+    // ловит «файл изменился после сканирования» (§10), checkLocks — занятый
+    // путь через Restart Manager, корень правила, белый список защищённых
+    // каталогов и признак reparse проверяются фазой A всегда.
+    options.checkStamps = true;
+    options.checkLocks = true;
+    // Закрывать чужие приложения из CLI нечем: спрашивать некого, а FR-6
+    // запрещает закрывать без подтверждения. Занятый путь становится
+    // Skip (locked) и попадает в отчёт с именем держателя — ровно то действие,
+    // которое описано в плане (PlanAction::SkipLocked).
+    options.allowCloseProcesses = false;
+
+    if (input.progress != nullptr) {
+        options.progressInterval = std::chrono::milliseconds(500);
+        options.onProgress = [stream = input.progress](const engine::ProgressSnapshot& snapshot) {
+            *stream << "MrProper: очистка: операций " << snapshot.itemsDone << ", освобождено "
+                    << core::formatBytes(snapshot.bytesFound) << ", потоков " << snapshot.workersActive << '/'
+                    << snapshot.workersTotal << "\n";
+        };
+    }
+
+    engine::ChecklistOptions checklistOptions;
+    checklistOptions.rules = input.rules;
+    const engine::Checklist checklist = engine::buildChecklist(candidates, *input.plan, checklistOptions);
+    if (checklist.executable() == 0) {
+        out.abortReason = "чек-лист пуст: план не выбрал ни одной операции Delete или Trash";
+        return false;
+    }
+
+    engine::CleanupExecutor executor(options);
+    g_runningExecutor.store(&executor, std::memory_order_release);
+    const engine::ExecutionRefusal refusal = executor.run(candidates, *input.plan, checklist);
+    g_runningExecutor.store(nullptr, std::memory_order_release);
+    out.summary = executor.toText();
+    if (refusal != engine::ExecutionRefusal::Completed) {
+        out.abortReason = std::string("исполнитель отказал: ") + engine::toString(refusal);
+        return false;
+    }
+    const engine::ExecutionReportPtr report = executor.result();
+    if (report == nullptr) {
+        out.abortReason = "исполнитель отработал, но отчёта не опубликовал";
+        return false;
+    }
+
+    out.items.assign(candidates.size(), PlanExecutionItem{});
+    for (const engine::ItemReport& item : report->items) {
+        if (item.candidateIndex >= out.items.size()) continue;
+        PlanExecutionItem& target = out.items[item.candidateIndex];
+        target.ok = item.ok();
+        target.status = statusOfItem(item.outcome, item.action);
+        target.freedBytes = item.reclaimedBytes;
+        target.transactionId = item.txId;
+        target.detail = item.detail;
+    }
+    out.freedBytes = report->reclaimedBytes;
+    out.transactionId = report->trashTxId;
+    out.aborted = report->cancelled;
+    if (out.aborted) out.abortReason = "прогон прерван отменой (Ctrl+C)";
+    return true;
+}
+
+// Прогон целиком и разбор его отчёта в сводку команды. Коды SPEC §7.2:
+// успех 0, отказ 3, отказ исполнителя 5, частичный результат — сводка в отчёте
+// и код 6, а не тишина (FR-6).
+PlanExit executeWithEngine(const ApplyOptions& options, const ApplyIo& io, const ApplyEnvironment& env,
+                           ApplyReport& out) {
+    PlanExecutionInput input;
+    input.candidates = &out.candidates;
+    input.manifests = &out.manifests;
+    input.plan = &out.plan;
+    input.rules = out.rules.get();
+    input.trashRoot = options.trashRoot;
+    input.appVersion = env.appVersion;
+    input.progress = &io.err;
+
+    PlanExecution execution;
+    out.executed = true;
+    const bool ran = env.executePlan(input, execution);
+
+    const std::vector<core::PlanOperation>& operations = out.dryRun.operations;
+    ExecutionSummary& summary = out.execution;
+    summary.operations.reserve(operations.size());
+    summary.results.reserve(operations.size());
+    summary.transactionId = execution.transactionId;
+
+    if (!ran) {
+        out.refusal = execution.abortReason.empty() ? "исполнитель отказался выполнять план" : execution.abortReason;
+        io.err << "MrProper: " << out.refusal << "\n";
+        io.err << "MrProper: удалено 0 байт\n";
+        core::logError("apply.executor.refused", "исполнитель отказался выполнять план",
+                       core::LogFields{core::logField("refusal", out.refusal),
+                                       core::logField("signature", out.snapshot.planSignature)});
+        return PlanExit::NoExecutor;
+    }
+
+    const bool perOperationLines = !options.json;  // в --json итог едет в stdout
+    for (const core::PlanOperation& op : operations) {
+        OperationResult result;
+        if (op.candidateIndex < execution.items.size()) {
+            const PlanExecutionItem& item = execution.items[op.candidateIndex];
+            result.ok = item.ok;
+            result.status = item.status;
+            result.freedBytes = item.freedBytes;
+            result.transactionId = item.transactionId;
+            result.detail = item.detail;
+        } else {
+            result.ok = false;
+            result.status = "NoResult";
+            result.detail = "исполнитель не вернул результат по кандидату " + std::to_string(op.candidateIndex);
+        }
+        if (result.status.empty()) result.status = result.ok ? "Done" : "Failed";
+
+        summary.operations.push_back(op);
+        summary.results.push_back(result);
+        ++summary.attempted;
+        if (result.ok) {
+            ++summary.succeeded;
+            summary.freedBytes += result.freedBytes;
+            if (perOperationLines) printOperationResult(io.err, summary.attempted, op, result);
+            continue;
+        }
+        // Строку, которую отмена застала в очереди, нельзя называть ошибкой
+        // исполнения: объект цел, и «не успели» — другое утверждение, чем
+        // «не смогли» (FR-6). Она уходит в notRun и в счётчик попадает иначе.
+        if (result.status == "NotStarted" || result.status == "Cancelled") {
+            summary.notRun.push_back(op);
+            printOperationResult(io.err, summary.attempted, op, result);
+            core::logWarn("apply.notrun", "операция не начата: прогон прерван отменой",
+                          core::LogFields{core::logField("path", op.path),
+                                          core::logField("status", result.status),
+                                          core::logField("detail", result.detail)});
+            continue;
+        }
+        ++summary.failed;
+        printOperationResult(io.err, summary.attempted, op, result);
+        core::logError("apply.operation", "операция не выполнена",
+                       core::LogFields{core::logField("path", op.path),
+                                       core::logField("action", std::string(actionName(op.action))),
+                                       core::logField("bytes", op.bytes),
+                                       core::logField("status", result.status),
+                                       core::logField("detail", result.detail),
+                                       core::logField("transactionId", result.transactionId)});
+    }
+    summary.aborted = execution.aborted;
+    summary.abortReason = execution.abortReason;
+
+    if (!execution.summary.empty()) io.err << "MrProper: " << execution.summary << "\n";
+    io.err << "MrProper: выполнено " << summary.succeeded << " из " << summary.attempted << ", освобождено "
+           << core::formatBytes(summary.freedBytes) << " (по аллоцированному размеру), ошибок: " << summary.failed;
+    if (!summary.notRun.empty()) io.err << ", не начато: " << summary.notRun.size();
+    if (!summary.transactionId.empty()) {
+        io.err << ", транзакция корзины " << summary.transactionId << " (FR-7, отменяемо)";
+    }
+    io.err << "\n";
+    core::logInfo("apply.done", "план выполнен движком",
+                  core::LogFields{core::logField("attempted", summary.attempted),
+                                  core::logField("succeeded", summary.succeeded),
+                                  core::logField("failed", summary.failed),
+                                  core::logField("freedBytes", summary.freedBytes),
+                                  core::logField("transactionId", summary.transactionId)});
+    return summary.failed == 0 ? PlanExit::Ok : PlanExit::Failed;
+}
+
+// ---------------------------------------------------------------------------
+// Живой скан по --rules: правила из каталога и обход ФС
+// ---------------------------------------------------------------------------
+
+// Переменные окружения, которые подставляются в локаторы правил: тот же
+// закрытый список, что у команды scan (cmd_scan.cpp, kRuleEnvironmentNames), и по
+// той же причине — в локатор попадает только то, что правилам действительно
+// нужно, а весь дамп окружения не должен печататься ни в отчёт, ни в журнал
+// (SPEC §5 «Локализация», docs/rules-authoring.md §4). Список продублирован
+// намеренно: этот мост не должен зависеть от внутренних деталей команды scan;
+// когда у scan появится публичный доступ к дампу окружения, функция удаляется.
+constexpr std::string_view kRuleEnvironmentNames[] = {
+    "ALLUSERSPROFILE", "APPDATA",       "LOCALAPPDATA", "ProgramData",  "ProgramFiles",
+    "ProgramFiles(x86)", "ProgramW6432", "PUBLIC",       "SystemDrive",  "SystemRoot",
+    "TEMP",           "TMP",            "USERPROFILE",  "windir",
+};
+
+// Чтение переменной окружения в UTF-8. На Windows — GetEnvironmentVariableW, а
+// не std::getenv: узкие функции отдают путь в кодовой странице консоли, и
+// «%TEMP%» с кириллицей приехал бы в локатор правила мусором (§5 «Пути»).
+std::optional<std::string> readEnvironmentValue(std::string_view name) {
+#if defined(_WIN32)
+    const std::wstring wideName(name.begin(), name.end());
+    std::wstring buffer(1024, L'\0');
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const DWORD written = ::GetEnvironmentVariableW(wideName.c_str(), buffer.data(),
+                                                        static_cast<DWORD>(buffer.size()));
+        if (written == 0) return std::nullopt;
+        if (written < buffer.size()) {
+            buffer.resize(written);
+            const int size = ::WideCharToMultiByte(CP_UTF8, 0, buffer.data(), written, nullptr, 0, nullptr, nullptr);
+            if (size <= 0) return std::nullopt;
+            std::string value(static_cast<std::size_t>(size), '\0');
+            if (::WideCharToMultiByte(CP_UTF8, 0, buffer.data(), written, value.data(), size, nullptr, nullptr) <= 0) {
+                return std::nullopt;
+            }
+            return value;
+        }
+        buffer.resize(written);
+    }
+    return std::nullopt;
+#else
+    const std::string key(name);
+    const char* value = std::getenv(key.c_str());
+    if (value == nullptr || *value == '\0') return std::nullopt;
+    return std::string(value);
+#endif
+}
+
+// Дамп «NAME=value» по строке на переменную — тот формат, который ждёт
+// core::loadRuleFiles. Переменных, которых нет, в дампе нет вовсе:
+// core::expandEnvironment помечает %НЕИЗВЕСТНО% как неразрешённое, и такой
+// локатор отбрасывается целиком, а это честнее, чем подставить пустой путь.
+std::string processEnvironmentDump() {
+    std::string dump;
+    for (const std::string_view name : kRuleEnvironmentNames) {
+        const std::optional<std::string> value = readEnvironmentValue(name);
+        if (!value.has_value()) continue;
+        dump.append(name);
+        dump.push_back('=');
+        dump.append(*value);
+        dump.push_back('\n');
+    }
+    return dump;
+}
+
+// Набор правил из каталога. Формат каталога — тот же, что у команды scan:
+// *.json, плюс manifest.json рядом (он опознаётся попыткой разбора, а не
+// именем файла, потому что форма у него другая). Порядок чтения фиксирован
+// сортировкой: иначе первая ошибка валидации называла бы другой файл в
+// зависимости от порядка каталога на диске.
+bool loadRuleSetFromDirectory(const std::string& directory, const std::string& environment, core::RuleSet& out,
+                              std::string& rulesVersion, std::string& error) {
+    namespace fs = std::filesystem;
+
+    std::error_code code;
+    const fs::path root(directory);
+    if (!fs::is_directory(root, code)) {
+        error = "каталог набора правил не найден: " + directory;
+        return false;
+    }
+
+    std::vector<fs::path> files;
+    for (const fs::directory_entry& entry : fs::directory_iterator(root, code)) {
+        if (entry.is_regular_file(code) && entry.path().extension() == ".json") files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end());
+    if (files.empty()) {
+        error = "в каталоге " + directory + " нет ни одного файла *.json";
+        return false;
+    }
+
+    std::vector<std::pair<std::string, std::string>> texts;
+    texts.reserve(files.size());
+    for (const fs::path& path : files) {
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream) {
+            error = "файл правил не читается: " + path.string();
+            return false;
+        }
+        std::ostringstream buffer;
+        buffer << stream.rdbuf();
+        const std::string text = buffer.str();
+        const std::string name = path.filename().string();
+        try {
+            rulesVersion = core::parseRuleSetManifest(text, name).version;
+            continue;  // манифест набора, а не правило
+        } catch (const core::RuleSyncError&) {
+            // Не манифест — идёт в набор правил, разберётся загрузчик.
+        }
+        texts.emplace_back(name, text);
+    }
+    if (texts.empty()) {
+        error = "в каталоге " + directory + " нет ни одного файла правил (только manifest.json)";
+        return false;
+    }
+
+    try {
+        out = core::loadRuleFiles(texts, environment);
+        core::validateRuleSet(out);
+    } catch (const std::exception& failure) {
+        error = failure.what();
+        return false;
+    }
+    if (rulesVersion.empty()) rulesVersion = out.version;
+    return true;
+}
+
+// Куда складывают задачи пула. Кандидаты и манифесты пишут несколько потоков, а
+// читает один главный поток после конца прогона, поэтому под замком.
+class LiveScanSink {
+public:
+    void add(std::vector<core::CleanupCandidate> candidates, std::vector<core::CandidateManifest> manifests) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const std::size_t count = candidates.size();
+        const std::size_t base = candidates_.size();
+        for (core::CleanupCandidate& candidate : candidates) candidates_.push_back(std::move(candidate));
+        for (core::CandidateManifest& manifest : manifests) {
+            // Манифесты приходят с индексами своей задачи (сборщик нумерует
+            // кандидатов внутри результата одной категории), а в плане индекс —
+            // это позиция в общем списке. Сдвиг на базу обязателен: без него
+            // манифест достался бы чужому кандидату, и план удалил бы не то
+            // (docs/review-02.md F-01).
+            if (manifest.candidateIndex >= count) continue;
+            manifest.candidateIndex += base;
+            manifests_.push_back(std::move(manifest));
+        }
+        ++completed_;
+    }
+
+    [[nodiscard]] std::size_t completed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return completed_;
+    }
+
+    [[nodiscard]] std::vector<core::CleanupCandidate> candidates() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return candidates_;
+    }
+
+    [[nodiscard]] std::vector<core::CandidateManifest> manifests() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return manifests_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<core::CleanupCandidate> candidates_;
+    std::vector<core::CandidateManifest> manifests_;
+    std::size_t completed_{};
+};
+
+// Живой скан: правила из --rules, обход ФС и оценка кандидатов — тем же кодом
+// движка, что и команда scan. Кандидаты здесь НЕ сортируются: у манифеста
+// индекс кандидата, и перестановка списка без переноса манифестов отдала бы
+// план не тем путям (docs/review-02.md F-01). Порядок и так детерминирован:
+// одна задача на категорию, а внутри категории кандидаты идут в порядке
+// правил.
+bool liveScanWithEngine(const std::string& rulesPath, const std::vector<std::string>& categories, std::ostream& human,
+                        LiveScan& out, std::string& error) {
+    installConsoleStopHandler();
+
+    core::RuleSet rules;
+    std::string rulesVersion;
+    if (!loadRuleSetFromDirectory(rulesPath, processEnvironmentDump(), rules, rulesVersion, error)) return false;
+
+    if (!categories.empty()) {
+        std::vector<core::Rule> kept;
+        kept.reserve(rules.rules.size());
+        for (const core::Rule& rule : rules.rules) {
+            const std::string wanted = toLowerAscii(trim(rule.category));
+            if (std::find(categories.begin(), categories.end(), wanted) != categories.end()) {
+                kept.push_back(rule);
+            }
+        }
+        if (kept.empty()) {
+            error = "ни одно правило не относится ни к одной из указанных категорий";
+            return false;
+        }
+        rules.rules = std::move(kept);
+    }
+
+    const std::int64_t now =
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+
+    std::vector<std::string> categoryOrder;
+    for (const core::Rule& rule : rules.rules) {
+        if (std::find(categoryOrder.begin(), categoryOrder.end(), rule.category) == categoryOrder.end()) {
+            categoryOrder.push_back(rule.category);
+        }
+    }
+    human << "MrProper: скан: набор правил " << (rulesVersion.empty() ? std::string("без версии") : rulesVersion)
+          << ", правил " << rules.rules.size() << ", задач " << categoryOrder.size() << "\n";
+
+    engine::scoring_bridge::ScoringContext scoringContext;
+    scoringContext.now = now;
+    // Состояние процессов не проверялось: определение блокировок в скане не
+    // участвует, и мост скажет об этом строкой в причинах, а не промолчит
+    // (FR-4 LockedBy остаётся пустым, и это видно).
+    scoringContext.processClosedStateKnown = false;
+
+    LiveScanSink sink;
+    std::vector<engine::ScanTask> tasks;
+    tasks.reserve(categoryOrder.size());
+    for (const std::string& category : categoryOrder) {
+        core::RuleSet subset;
+        subset.schemaVersion = rules.schemaVersion;
+        subset.version = rules.version;
+        subset.minAppVersion = rules.minAppVersion;
+        for (const core::Rule& rule : rules.rules) {
+            if (rule.category == category) subset.rules.push_back(rule);
+        }
+        engine::CollectOptions collectOptions;
+        collectOptions.now = now;
+        const engine::scoring_bridge::RuleLookup lookup = engine::scoring_bridge::makeRuleLookup(subset);
+
+        tasks.push_back(engine::ScanTask{
+            category,
+            category,
+            0,  // число элементов заранее неизвестно: обход ФС не знает счётчика
+            [subset = std::move(subset), collectOptions, scoringContext, lookup,
+             &sink](engine::ScanTaskContext& context) {
+                // Свой адаптер обхода на задачу: обход идёт в пуле, и требовать
+                // потокобезопасности реализации нельзя.
+                std::unique_ptr<engine::FileSystemProbe> probe = engine::makeVfsFileSystemProbe();
+                if (!probe) return;  // адаптер не выдался: задача пуста, а не падение прогона
+                engine::CollectResult collected =
+                    engine::collectCandidates(subset, *probe, collectOptions, context.stopToken());
+                engine::scoring_bridge::scoreCandidates(collected.candidates, lookup, scoringContext);
+                std::uint64_t found = 0;
+                for (const core::CleanupCandidate& candidate : collected.candidates) {
+                    found += candidate.allocatedBytes;
+                }
+                context.addItems(collected.stats.filesSeen);
+                context.addBytes(found);
+                sink.add(std::move(collected.candidates), std::move(collected.manifests));
+            },
+        });
+    }
+
+    std::mutex progressMutex;
+    std::chrono::steady_clock::time_point nextPrint{};
+    engine::ScanCoordinatorOptions coordinatorOptions;
+    coordinatorOptions.logProgress = false;  // прогресс идёт в stderr, а не в журнал
+    coordinatorOptions.onProgress = [&human, &progressMutex, &nextPrint](const engine::ProgressSnapshot& snapshot) {
+        std::lock_guard<std::mutex> lock(progressMutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (!snapshot.finished && now < nextPrint) return;
+        nextPrint = now + std::chrono::milliseconds(1000);
+        human << "MrProper: скан: элементов " << snapshot.itemsDone << ", найдено "
+              << core::formatBytes(snapshot.bytesFound) << ", задач " << snapshot.tasksDone << '/' << snapshot.tasksTotal
+              << "\n";
+    };
+
+    engine::ScanCoordinator coordinator(coordinatorOptions);
+    g_runningScan.store(&coordinator, std::memory_order_release);
+    const engine::ScanRunReportPtr runReport = coordinator.run(std::move(tasks));
+    g_runningScan.store(nullptr, std::memory_order_release);
+
+    if (runReport == nullptr) {
+        error = "прогон скана не дал отчёта";
+        return false;
+    }
+    if (!runReport->tasks.empty() && runReport->completed == 0) {
+        error = "ни одна задача скана не выполнена";
+        return false;
+    }
+    if (runReport->cancelled) {
+        // Отменённый скан — не повод удалять по неполному списку: план из
+        // половины обхода хуже, чем никакого (FR-5).
+        error = "скан прерван, список кандидатов неполон — удаление по нему запрещено";
+        return false;
+    }
+
+    out.candidates = sink.candidates();
+    out.manifests = sink.manifests();
+    // Набор правил едет вместе с кандидатами: из него исполнитель выводит
+    // корень правила, а без корня удаление невозможно (FR-6).
+    out.rules = std::make_shared<const core::RuleSet>(std::move(rules));
+
+    std::uint64_t reclaimable = 0;
+    for (const core::CleanupCandidate& candidate : out.candidates) reclaimable += candidate.allocatedBytes;
+    human << "MrProper: скан: кандидатов " << core::formatCount(out.candidates.size()) << ", манифестов "
+          << core::formatCount(out.manifests.size()) << ", освободится " << core::formatBytes(reclaimable)
+          << ", задач выполнено " << runReport->completed << " из " << runReport->tasks.size() << "\n";
+
+    core::logInfo("apply.scan", "живой скан завершён",
+                  core::LogFields{core::logField("rules", rulesPath),
+                                  core::logField("rulesVersion", rulesVersion),
+                                  core::logField("candidates", out.candidates.size()),
+                                  core::logField("manifests", out.manifests.size()),
+                                  core::logField("reclaimable", reclaimable)});
+    return true;
 }
 
 }  // namespace
@@ -1088,6 +1756,26 @@ std::optional<ApplyOptions> parseApplyOptions(const std::vector<std::string>& ar
             options.candidatesPath = value;
             continue;
         }
+        if (arg == "--rules") {
+            std::string value;
+            if (!takeValue(value)) return std::nullopt;
+            if (trim(value).empty()) {
+                error = "--rules: пустой путь к каталогу правил";
+                return std::nullopt;
+            }
+            options.rulesPath = value;
+            continue;
+        }
+        if (arg == "--trash-root") {
+            std::string value;
+            if (!takeValue(value)) return std::nullopt;
+            if (trim(value).empty()) {
+                error = "--trash-root: пустой путь к корзине приложения";
+                return std::nullopt;
+            }
+            options.trashRoot = value;
+            continue;
+        }
 
         if (!arg.empty() && arg[0] == '-') {
             error = "неизвестный ключ: " + arg;
@@ -1122,6 +1810,8 @@ const char* planUsage() {
            "  --trash-direct-delete-above <размер>\n"
            "                                  выше этого объёма удаляем сразу, а не в корзину\n"
            "  --category <id>[,<id>…]        только эти категории; ключ можно повторять\n"
+           "  --rules <каталог>               правила для живого скана; единственный путь к удалению\n"
+           "  --trash-root <каталог>          корзина приложения (FR-7); пусто — %ProgramData%\\MrProper\\Trash\n"
            "  --candidates <файл>             кандидаты из JSON: дамп скана или отчёт core::report_json\n"
            "  -h, --help                      этот текст\n";
 }
@@ -1146,6 +1836,8 @@ const char* applyUsage() {
            "  --trash-direct-delete-above <размер>\n"
            "                                  выше этого объёма удаляем сразу, а не в корзину\n"
            "  --category <id>[,<id>…]        только эти категории; ключ можно повторять\n"
+           "  --rules <каталог>               правила для живого скана: без них удаление невозможно\n"
+           "  --trash-root <каталог>          корзина приложения (FR-7); пусто — %ProgramData%\\MrProper\\Trash\n"
            "  --candidates <файл>             кандидаты из JSON; вместе с --execute запрещено:\n"
            "                                  список из файла мог устареть, удалять по нему нельзя\n"
            "  -h, --help                      этот текст\n"
@@ -1323,7 +2015,37 @@ bool loadCandidatesFile(const std::string& path, std::vector<core::CleanupCandid
 // Окружение и подтверждение
 // ---------------------------------------------------------------------------
 
-ApplyEnvironment makeFileEnvironment() { return ApplyEnvironment{}; }
+ApplyEnvironment makeFileEnvironment() {
+    ApplyEnvironment environment;
+    // Живой скан по --rules и настоящий исполнитель engine::CleanupExecutor.
+    // Подключение живёт здесь, а не в разборе аргументов и не в построении
+    // плана: без него команда остаётся переносимой и проверяемой без диска
+    // (§11.1), а с настоящей программой удаление работает.
+    environment.liveScan = [](const std::string& rulesPath, const std::vector<std::string>& categories,
+                              std::ostream& human, LiveScan& out, std::string& error) {
+        return liveScanWithEngine(rulesPath, categories, human, out, error);
+    };
+    environment.executePlan = [](const PlanExecutionInput& input, PlanExecution& out) {
+        return executePlanWithEngine(input, out);
+    };
+    const char* version = appVersion();
+    environment.appVersion = version == nullptr ? std::string{} : std::string{version};
+    // Снимок состояния (FR-5) требует версию и PID процесса: без них человек
+    // перед удалением не знает, из какой сборки и из какого процесса оно
+    // запущено. Время core::makeSnapshot проставит сам.
+    environment.snapshotContext = []() {
+        core::PlanSnapshotContext context;
+        context.appVersion = appVersion() == nullptr ? std::string{} : std::string{appVersion()};
+        context.createdAtUnix = std::chrono::duration_cast<std::chrono::seconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count();
+#if defined(_WIN32)
+        context.pid = static_cast<std::uint32_t>(::GetCurrentProcessId());
+#endif
+        return context;
+    };
+    return environment;
+}
 
 bool askOnStream(const std::string& question, const ApplyIo& io, std::string& answer) {
     answer.clear();

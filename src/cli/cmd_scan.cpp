@@ -433,9 +433,20 @@ private:
 // не горячий путь: обход уже закончен, сборка не трогает диск.
 class ScanSink {
 public:
-    void add(std::vector<core::CleanupCandidate> candidates, const engine::CollectStats& stats) {
+    // manifests[i] описывает candidates[i] этой же задачи: сборщик нумерует
+    // манифест позицией кандидата в CollectResult (engine::candidate_collector).
+    // Здесь индекс переносится на общий список — иначе манифест второй задачи
+    // указал бы на кандидата первой.
+    void add(std::vector<core::CleanupCandidate> candidates, std::vector<core::CandidateManifest> manifests,
+             const engine::CollectStats& stats) {
         std::lock_guard<std::mutex> lock(mutex_);
+        const std::size_t base = candidates_.size();
         for (core::CleanupCandidate& candidate : candidates) candidates_.push_back(std::move(candidate));
+        for (core::CandidateManifest& manifest : manifests) {
+            if (manifest.candidateIndex >= candidates.size()) continue;  // защита от рассинхрона сборщика
+            manifest.candidateIndex += base;
+            manifests_.push_back(std::move(manifest));
+        }
         for (const std::string& note : stats.notes) {
             if (notes_.size() < kMaxNotesInReport) notes_.push_back(note);
         }
@@ -448,6 +459,14 @@ public:
     [[nodiscard]] std::vector<core::CleanupCandidate> candidates() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return candidates_;
+    }
+
+    // Манифесты удаления в порядке общих индексов кандидатов (docs/review-02.md
+    // F-01). Без них сохранённый скан не даёт плана: `plan --candidates` обязан
+    // заново перечислить корень, а это уже не то, что правило разрешило удалить.
+    [[nodiscard]] std::vector<core::CandidateManifest> manifests() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return manifests_;
     }
 
     [[nodiscard]] std::vector<std::string> notes() const {
@@ -478,6 +497,7 @@ public:
 private:
     mutable std::mutex mutex_;
     std::vector<core::CleanupCandidate> candidates_;
+    std::vector<core::CandidateManifest> manifests_;
     std::vector<std::string> notes_;
     std::uint64_t notesDropped_{};
     std::uint64_t filesSeen_{};
@@ -595,14 +615,61 @@ private:
 // Порядок кандидатов: категория, правило, путь. Задачи пула заканчиваются в
 // произвольном порядке, и без сортировки один и тот же вход давал бы разные
 // байты в stdout — golden-тест (§11.4) мигал бы, а «повторный скан идемпотентен»
-// (§8 Этап 2) нельзя было бы проверить сравнением файлов.
-void sortCandidates(std::vector<core::CleanupCandidate>& candidates) {
-    std::sort(candidates.begin(), candidates.end(),
-              [](const core::CleanupCandidate& left, const core::CleanupCandidate& right) {
-                  if (left.category != right.category) return left.category < right.category;
-                  if (left.ruleId != right.ruleId) return left.ruleId < right.ruleId;
-                  return left.path < right.path;
+// (§8 Этап 2) нельзя было бы проверить сравнением файлов. Возвращается перестановка
+// индексов, а не переставленный список: манифест каждого кандидата едет вместе
+// с ним (applyCandidateOrder ниже).
+std::vector<std::size_t> candidateOrder(const std::vector<core::CleanupCandidate>& candidates) {
+    std::vector<std::size_t> order(candidates.size());
+    for (std::size_t index = 0; index < order.size(); ++index) order[index] = index;
+    std::sort(order.begin(), order.end(),
+              [&candidates](std::size_t left, std::size_t right) {
+                  const core::CleanupCandidate& a = candidates[left];
+                  const core::CleanupCandidate& b = candidates[right];
+                  if (a.category != b.category) return a.category < b.category;
+                  if (a.ruleId != b.ruleId) return a.ruleId < b.ruleId;
+                  return a.path < b.path;
               });
+    return order;
+}
+
+// Кандидаты и манифесты переставляются ОДНИМ порядком: candidateIndex — это
+// позиция кандидата в отчёте (core::report_json ищет манифест ровно по нему).
+// Отсортировать списки по отдельности нельзя — список разрешённого достался бы
+// чужому элементу, и plan по сохранённому скану удалял бы не то (F-01).
+void applyCandidateOrder(const std::vector<std::size_t>& order, std::vector<core::CleanupCandidate>& candidates,
+                         std::vector<core::CandidateManifest>& manifests) {
+    constexpr std::size_t kNoPosition = std::numeric_limits<std::size_t>::max();
+    // Куда уезжает каждый манифест: индекс кандидата -> позиция в отчёте.
+    // Один указатель по манифестам здесь не годится: перестановка кандидатов
+    // идёт НЕ по возрастанию (сортировка по категории и пути), и манифест с
+    // меньшим индексом вполне может обрабатываться позже.
+    std::vector<std::size_t> position(candidates.size(), kNoPosition);
+    for (std::size_t newIndex = 0; newIndex < order.size(); ++newIndex) {
+        if (order[newIndex] < position.size()) position[order[newIndex]] = newIndex;
+    }
+
+    std::vector<core::CleanupCandidate> sortedCandidates;
+    sortedCandidates.reserve(candidates.size());
+    for (const std::size_t source : order) sortedCandidates.push_back(std::move(candidates[source]));
+
+    std::vector<core::CandidateManifest> sortedManifests;
+    sortedManifests.reserve(manifests.size());
+    for (core::CandidateManifest& manifest : manifests) {
+        if (manifest.candidateIndex >= position.size()) continue;
+        const std::size_t target = position[manifest.candidateIndex];
+        if (target == kNoPosition) continue;
+        manifest.candidateIndex = target;
+        sortedManifests.push_back(std::move(manifest));
+    }
+    // По возрастанию индекса: так core::report_json и core::CleanupPlan ищут
+    // манифест одним указателем, идущим вперёд.
+    std::sort(sortedManifests.begin(), sortedManifests.end(),
+              [](const core::CandidateManifest& left, const core::CandidateManifest& right) {
+                  return left.candidateIndex < right.candidateIndex;
+              });
+
+    candidates = std::move(sortedCandidates);
+    manifests = std::move(sortedManifests);
 }
 
 [[nodiscard]] std::uint64_t reclaimableBytes(const std::vector<core::CleanupCandidate>& candidates) {
@@ -939,7 +1006,7 @@ int runScan(const std::vector<std::string>& args, const ScanServices& services, 
                 }
                 context.addItems(collected.stats.filesSeen);
                 context.addBytes(found);
-                sink.add(std::move(collected.candidates), collected.stats);
+                sink.add(std::move(collected.candidates), std::move(collected.manifests), collected.stats);
             },
         });
     }
@@ -975,20 +1042,34 @@ int runScan(const std::vector<std::string>& args, const ScanServices& services, 
     const bool cancelled = runReport->cancelled || InterruptGuard::interrupted() || timeoutFired;
 
     std::vector<core::CleanupCandidate> candidates = sink.candidates();
-    sortCandidates(candidates);
+    std::vector<core::CandidateManifest> manifests = sink.manifests();
+    applyCandidateOrder(candidateOrder(candidates), candidates, manifests);
 
     std::size_t belowThreshold = 0;
     if (options.minConfidence >= 0) {
         std::vector<core::CleanupCandidate> kept;
+        std::vector<core::CandidateManifest> keptManifests;
         kept.reserve(candidates.size());
-        for (core::CleanupCandidate& candidate : candidates) {
-            if (candidate.confidence >= options.minConfidence) {
-                kept.push_back(std::move(candidate));
-            } else {
+        keptManifests.reserve(manifests.size());
+        std::size_t nextManifest = 0;
+        std::size_t position = 0;
+        for (std::size_t index = 0; index < candidates.size(); ++index) {
+            while (nextManifest < manifests.size() && manifests[nextManifest].candidateIndex < index) ++nextManifest;
+            if (candidates[index].confidence < options.minConfidence) {
                 ++belowThreshold;
+                continue;
             }
+            kept.push_back(std::move(candidates[index]));
+            if (nextManifest < manifests.size() && manifests[nextManifest].candidateIndex == index) {
+                core::CandidateManifest moved = std::move(manifests[nextManifest]);
+                moved.candidateIndex = position;
+                keptManifests.push_back(std::move(moved));
+                ++nextManifest;
+            }
+            ++position;
         }
         candidates = std::move(kept);
+        manifests = std::move(keptManifests);
     }
 
     const std::uint64_t reclaimable = reclaimableBytes(candidates);
@@ -1042,9 +1123,11 @@ int runScan(const std::vector<std::string>& args, const ScanServices& services, 
     report.options.includeOperations = false;  // операций у скана нет: это --apply (§8 Этап 3)
     report.options.includeUntouched = false;
     report.options.includeErrors = true;
+    report.options.includeManifests = true;  // без списка разрешённого сохранённый скан не даёт плана (F-01)
     report.options.maskSerials = true;      // §5: серийник по умолчанию уходит в баг-репорт замазанным
     report.options.maskVolumeGuids = true;
     report.candidates = std::move(candidates);
+    report.manifests = std::move(manifests);
     if (options.withDisks && services.listDisks) {
         try {
             report.disks = services.listDisks();
