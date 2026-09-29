@@ -161,7 +161,7 @@ struct StoragePropertiesResult {
     DeviceDescriptor device{};
     DeviceId id{};
     QueryStatus status{QueryStatus::Unavailable};
-    std::uint32_t win32Error{};             // код Win32; при TimedOut — WAIT_TIMEOUT
+    std::uint32_t win32Error{};             // код Win32; при TimedOut — ERROR_TIMEOUT
     std::chrono::milliseconds elapsed{};    // сколько ждали результат
 
     [[nodiscard]] bool ok() const noexcept { return status == QueryStatus::Ok; }

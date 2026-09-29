@@ -625,8 +625,23 @@ void AppShell::handleSize(HWND window, WPARAM sizeType) {
 
 void AppShell::handleGetMinMaxInfo(MINMAXINFO* info) noexcept {
     if (info == nullptr) return;
-    info->ptMinTrackSize.x = options_.minWidth;
-    info->ptMinTrackSize.y = options_.minHeight;
+    // ptMinTrackSize задаётся в ФИЗИЧЕСКИХ пикселях монитора, и при
+    // Per-Monitor V2 система его не пересчитывает: заявленные 900×600 на
+    // мониторе 150 % означали бы 600×400 логических пикселей — ровно тот размер,
+    // при котором вёрстка §7.1 (карта разделов плюс дерево плюс карточка
+    // деталей) ломается. Поэтому минимум переводится в физические пиксели
+    // текущего масштаба, а dpi_ к этому моменту уже новый: WM_DPICHANGED
+    // обновляет его до SetWindowPos, а тот уже вызывает это сообщение.
+    const auto scale = [](int logical, UINT dpi) -> LONG {
+        const long long scaled =
+            (static_cast<long long>(logical) * static_cast<long long>(dpi) + (kBaseDpi / 2)) / kBaseDpi;
+        // Окно не может быть меньше рамки: отрицательный или нулевой размер
+        // минимальной области система трактует как «не сжимать», а минус —
+        // как некорректное значение.
+        return scaled > 0 ? static_cast<LONG>(scaled) : 1L;
+    };
+    info->ptMinTrackSize.x = scale(options_.minWidth, dpi_.x);
+    info->ptMinTrackSize.y = scale(options_.minHeight, dpi_.y);
 }
 
 void AppShell::handleDpiChanged(HWND window, UINT dpiX, UINT dpiY, const RECT* suggested) {

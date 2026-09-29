@@ -391,8 +391,12 @@ DiskSizeResult queryDiskSize(std::wstring_view devicePath, std::chrono::millisec
             } else {
                 // Вызов не уложился: устройство не отвечает, отдаём «недоступно»
                 // с кодом ожидания, чтобы по логу было видно, откуда причина.
+                // Именно ERROR_TIMEOUT (1460), а не WAIT_TIMEOUT (258): второе —
+                // WAIT-результат WaitForSingleObject, в каталоге ERROR_ его нет,
+                // и FormatMessageW для 258 не находит текста. Так же поступают
+                // devices, volumes, trim_cache и storage_query.
                 result.status = ProbeStatus::TimedOut;
-                result.win32Error = static_cast<std::uint32_t>(WAIT_TIMEOUT);
+                result.win32Error = static_cast<std::uint32_t>(ERROR_TIMEOUT);
             }
         }
     } catch (const std::bad_alloc&) {
@@ -434,7 +438,7 @@ VolumeSpaceResult queryVolumeSpace(std::wstring_view rootPath, std::chrono::mill
                 result.win32Error = call->win32Error;
             } else {
                 result.status = ProbeStatus::TimedOut;
-                result.win32Error = static_cast<std::uint32_t>(WAIT_TIMEOUT);
+                result.win32Error = static_cast<std::uint32_t>(ERROR_TIMEOUT);
             }
         }
     } catch (const std::bad_alloc&) {

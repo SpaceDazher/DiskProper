@@ -244,7 +244,12 @@ double CleanupProgress::fraction() const noexcept {
 }
 
 bool CleanupProgress::indeterminate() const noexcept {
-    return state == ScreenState::Scanning || state == ScreenState::Planning;
+    if (state == ScreenState::Scanning || state == ScreenState::Planning) return true;
+    // Отменённый скан: операций исполнения ещё ноль, и отсчитывать по ним
+    // нечего. Диапазон 0…0 на полосе рисуется как заполненная или как пустая
+    // в зависимости от версии comctl32, то есть сообщает о прогрессе, которого
+    // нет. До полной остановки полоса остаётся бегунком.
+    return state == ScreenState::Cancelling && totalOperations == 0;
 }
 
 bool CleanupProgress::busy() const noexcept {
@@ -425,6 +430,7 @@ struct CleanupViewModel::Impl {
     std::string focusKey;
     CleanupAggregates aggregates;
     CleanupProgress progress;
+    ScanProgress scan;  // счётчики прохода; см. CleanupViewModel::scanProgress()
     core::CleanupPlan profilePlan;
     core::DryRunGate gate;
     std::string error;
@@ -649,6 +655,7 @@ const std::vector<ItemNode>& CleanupViewModel::items() const noexcept { return i
 std::size_t CleanupViewModel::visibleCategoryCount() const noexcept { return impl_->categories.size(); }
 const CleanupAggregates& CleanupViewModel::aggregates() const noexcept { return impl_->aggregates; }
 const CleanupProgress& CleanupViewModel::progress() const noexcept { return impl_->progress; }
+const ScanProgress& CleanupViewModel::scanProgress() const noexcept { return impl_->scan; }
 ScreenState CleanupViewModel::state() const noexcept { return impl_->progress.state; }
 std::string CleanupViewModel::errorText() const { return impl_->error; }
 std::string CleanupViewModel::focusKey() const { return impl_->focusKey; }
@@ -694,6 +701,7 @@ void CleanupViewModel::clear() {
     s.gate = core::DryRunGate{};
     s.progress = CleanupProgress{};
     s.progress.state = ScreenState::Idle;
+    s.scan = ScanProgress{};  // счётчики относятся к этому проходу, а не к следующему
     s.undoAvailable = false;
     rebuild(false);
 }
@@ -1050,7 +1058,21 @@ std::string CleanupViewModel::statusText() const {
         return s.candidates ? tr(StringId::kCleanupNoCandidates)
                             : tr(StringId::kStatusIdle);
     case ScreenState::Scanning:
-    case ScreenState::Planning: return tr(StringId::kStatusScanning);
+    case ScreenState::Planning: {
+        std::string text = tr(StringId::kStatusScanning);
+        // Счётчики прохода показываем только когда фон их уже прислал: ноль
+        // файлов на первом кадре — это «ещё ничего не посмотрено», а не
+        // «посмотрено ноль», и рисовать его как результат значило бы врать.
+        if (s.scan.filesSeen > 0) {
+            text += " · ";
+            text += countText(s.scan.filesSeen);
+        }
+        if (s.scan.bytesSeen > 0) {
+            text += " · ";
+            text += sizeText(s.scan.bytesSeen);
+        }
+        return text;
+    }
     case ScreenState::DryRun:
         return tr(StringId::kCleanupDryRunNotice) + " · " +
                trPlural(StringId::kCleanupCandidates, s.progress.totalOperations);
@@ -1150,12 +1172,16 @@ void CleanupViewModel::beginScan() {
     s.error.clear();
     s.progress = CleanupProgress{};
     s.progress.state = ScreenState::Scanning;
+    s.scan = ScanProgress{};
 }
 
 void CleanupViewModel::publishScanProgress(ScanProgress progress) {
     auto& s = *impl_;
-    s.progress.state = ScreenState::Scanning;
-    s.progress.currentLabel = std::move(progress.currentLabel);
+    // Кадр, уже поставленный в очередь до отмены, не должен воскресить
+    // Scanning: иначе endScan() увидит не Cancelling и объявит отменённый
+    // скан успешным (та же осторожность, что в publishOperationResult).
+    if (s.progress.state != ScreenState::Cancelling) s.progress.state = ScreenState::Scanning;
+    s.scan = std::move(progress);
 }
 
 void CleanupViewModel::endScan() {
@@ -1577,6 +1603,12 @@ struct ViewState {
         const std::string focused = model.focusKey();
         if (!focused.empty() && !model.progress().busy()) {
             setChildText(details, model.nodeDetails(focused));
+        } else if (model.progress().busy() && !model.scanProgress().currentLabel.empty()) {
+            // Чем занят скан (путь или имя правила). Полоса-бегунок не говорит,
+            // куда смотреть, а проход по диску идёт до минуты (§5
+            // «Производительность»), и молчаливая минута — это минута, в
+            // которую человек решает, что программа зависла.
+            setChildText(details, model.scanProgress().currentLabel);
         } else {
             setChildText(details, model.reclaimHintText());
         }

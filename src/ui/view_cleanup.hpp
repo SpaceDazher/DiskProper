@@ -216,6 +216,8 @@ struct CleanupAggregates {
 
 // Прогресс скана: скан идёт в фоне, дерево ещё пустое (SPEC §6.4 — UI читает
 // счётчики раз в 100 мс, но и без таймера публикация кадра из фона честнее).
+// Счётчики обязаны доехать до экрана: скан на C: SSD идёт до минуты (§5
+// «Производительность»), и полоса-marquee без чисел читается как зависшая.
 struct ScanProgress {
     std::uint64_t filesSeen{};
     std::uint64_t bytesSeen{};
@@ -532,6 +534,11 @@ public:
     bool undo();  // Ctrl+Z, §7.2: работает, пока транзакция не схлопнулась
 
     [[nodiscard]] const CleanupProgress& progress() const noexcept;
+    // Счётчики прохода скана. Отдельны от CleanupProgress не по прихоти, а
+    // потому что это две разные работы: CleanupProgress считает операции
+    // исполнения, ScanProgress — просмотренные файлы и байты, и в любой момент
+    // у одного из этих двух режимов половина полей была бы нулевой.
+    [[nodiscard]] const ScanProgress& scanProgress() const noexcept;
     [[nodiscard]] ScreenState state() const noexcept;
     [[nodiscard]] std::string errorText() const;
 

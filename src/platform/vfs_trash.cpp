@@ -52,6 +52,7 @@
 #include <sddl.h>     // Convert*SecurityDescriptor*SecurityDescriptorW, SDDL_REVISION_1
 
 #include "core/log.hpp"
+#include "vfs_paths.hpp"
 #include "win_error.hpp"
 #include "win_handle.hpp"
 
@@ -516,10 +517,53 @@ TrashStatus applyTimestamp(const std::wstring& path, FILETIME modified) {
     return ::SetFileTime(handle.get(), nullptr, &modified, nullptr) != FALSE ? TrashStatus::Ok : classifyLastError();
 }
 
+// Граница обхода: корень правила (FR-6, §12 «отсутствие изменений вне корней
+// правил»). Проверяется на каждом кадре, а не один раз для верхнего элемента:
+// обход идёт по лексическим путям, а каталог, перечисленный как обычный, может
+// оказаться junction'ом к моменту, когда обход в него войдёт. Сравнение с
+// корнем даёт настоящее имя кадра (GetFinalPathNameByHandleW), то есть
+// «C:\Temp\dl\sub» не проверить как «C:\Temp\dl\sub», если sub — ссылка на
+// «C:\Users\me\Documents».
+class WalkBoundary {
+public:
+    explicit WalkBoundary(const TrashOptions& options) {
+        if (options.allowedRootUtf8.empty()) return;  // граница не задана (сервис корзины)
+        armed_ = true;
+        root_ = vfs_paths::prepareRoot(options.allowedRootUtf8);
+        // Корень, который не открылся, — это не «границы нет», а «граница
+        // недоступна». Пропускать под невыясненную границей нельзя, поэтому
+        // разрешаем только когда корень действительно пригоден.
+        usable_ = root_.resolved;
+    }
+
+    [[nodiscard]] bool armed() const noexcept { return armed_; }
+
+    // true — кадр можно раскрывать. При отказе причина уже в журнале: сам
+    // vfs_paths пишет путь и код (§12).
+    [[nodiscard]] bool allows(const std::wstring& widePath) const {
+        if (!armed_) return true;
+        if (!usable_) return false;
+        return vfs_paths::checkRuleRoot(plainOf(widePath), root_).allowed();
+    }
+
+private:
+    vfs_paths::RootGuard root_;
+    bool armed_{false};
+    bool usable_{false};
+};
+
 // Копирование дерева каталога. Порядок принципиален: сначала содержимое, и только
 // потом (по завершении кадра) время каталога — иначе выставленное заранее время
 // затиралось бы созданием содержимого.
 TrashStatus copyDirectoryTree(const std::wstring& source, const std::wstring& destination, Transfer& transfer) {
+    // Ссылка на параметры операции, а не копия: у них есть std::stop_token и
+    // обработчик прогресса. Пустой набор — отдельно и по имени: привязка ссылки
+    // к временному объекту в тернарном выражении не продлевает ему жизнь.
+    const TrashOptions none;
+    const TrashOptions& options = transfer.options != nullptr ? *transfer.options : none;
+    // Граница одна на весь обход: корень готовится один раз (нормализация открывает
+    // каталог), проверяется каждый кадр.
+    const WalkBoundary boundary(options);
     std::vector<DirFrame> stack;
     stack.push_back(DirFrame{std::wstring(), source, {}, false, false});
 
@@ -532,8 +576,31 @@ TrashStatus copyDirectoryTree(const std::wstring& source, const std::wstring& de
             // Копии полей, а не ссылка на кадр: push_back ниже перевыделит память,
             // и ссылка stack.back() после этого указывала бы в освобождённое.
             const std::wstring current = frame.path;
+            const std::string currentUtf8 = plainOf(current);
             const std::wstring relBase = frame.rel;
             const std::wstring target = frame.isRoot() ? destination : joinWide(destination, relBase);
+
+            // Проверка кадра до раскрытия: в корзину не должно уехать то, что
+            // физически лежит вне корня правила (утечка чужих данных в корзину
+            // приложения и неверный отчёт о перенесённом).
+            if (!boundary.allows(current)) {
+                logTrashFailure(kLogCopy, "каталог вне корня правила: обход копирования прерван", currentUtf8,
+                                ERROR_ACCESS_DENIED, options);
+                return TrashStatus::AccessDenied;
+            }
+            // И сам кадр перепроверяется признаком точки перехода: между
+            // перечислением и раскрытием каталог могли заменить junction'ом.
+            WIN32_FILE_ATTRIBUTE_DATA frameData{};
+            if (attributesOf(current, frameData) && isReparse(frameData.dwFileAttributes)) {
+                ++transfer.reparseSkipped;  // FR-6: ссылку не раскрываем
+                if (frame.isRoot()) {
+                    logTrashFailure(kLogCopy, "источник оказался точкой перехода", currentUtf8, ERROR_ACCESS_DENIED,
+                                    options);
+                    return TrashStatus::AccessDenied;
+                }
+                stack.pop_back();
+                continue;
+            }
 
             if (!directoryExists(target)) {
                 if (::CreateDirectoryW(target.c_str(), nullptr) == FALSE) {
@@ -602,12 +669,23 @@ TrashStatus copyDirectoryTree(const std::wstring& source, const std::wstring& de
 // это почти весь код, и различие между «считать» и «снимать» не требует
 // своей копии: измерение просто ничего не удаляет.
 TrashStatus walkTree(const std::wstring& root, const TrashOptions& options, bool remove, TrashPurgeResult& result) {
+    // Граница обхода готовится один раз, проверяется на каждом кадре.
+    const WalkBoundary boundary(options);
     // Корень обхода — не обязательно каталог: элемент транзакции может быть
     // файлом, а очистка корзины обязана уметь снять и его.
     WIN32_FILE_ATTRIBUTE_DATA rootData{};
     if (!attributesOf(root, rootData)) {
         result.status = classifyLastError();
         if (result.status == TrashStatus::NotFound) result.notFound = true;
+        return result.status;
+    }
+    if (!boundary.allows(root)) {
+        // Снос вне корня правила невозможен в принципе: это и есть граница FR-6.
+        result.status = TrashStatus::AccessDenied;
+        result.win32Error = ERROR_ACCESS_DENIED;
+        result.failedPath = plainOf(root);
+        logTrashFailure(kLogPurge, "объект вне корня правила: снос не начат", result.failedPath,
+                        ERROR_ACCESS_DENIED, options);
         return result.status;
     }
     if ((rootData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
@@ -665,6 +743,41 @@ TrashStatus walkTree(const std::wstring& root, const TrashOptions& options, bool
                 if (frame.isRoot()) {
                     result.status = TrashStatus::NotFound;
                     result.notFound = true;
+                    return result.status;
+                }
+                stack.pop_back();
+                continue;
+            }
+
+            // Кадр проверяется заново, перед самым раскрытием. Признак reparse
+            // снимается при перечислении, а раскрытие идёт позже — на кэше в
+            // десятки тысяч файлов между ними проходят минуты, и за это время
+            // каталог успевают заменить junction'ом. Проверка по дескриптору
+            // (vfs_paths::checkRuleRoot) дополнительно доказывает, что кадр
+            // физически лежит внутри корня правила: имя кадра при этом может
+            // быть любым, ссылка name отдаёт настоящий путь.
+            WIN32_FILE_ATTRIBUTE_DATA frameData{};
+            if (attributesOf(current, frameData) && isReparse(frameData.dwFileAttributes)) {
+                ++result.skippedReparsePoints;  // FR-6: ссылку не раскрываем
+                logTrashFailure(kLogPurge, "каталог оказался точкой перехода: содержимое не тронуто",
+                                plainOf(current), ERROR_ACCESS_DENIED, options);
+                if (frame.isRoot()) {
+                    result.status = TrashStatus::AccessDenied;
+                    result.win32Error = ERROR_ACCESS_DENIED;
+                    result.failedPath = plainOf(current);
+                    return result.status;
+                }
+                stack.pop_back();
+                continue;
+            }
+            if (!boundary.allows(current)) {
+                ++result.skippedReparsePoints;  // счётчик пропущенных кадров: отчёт не врёт
+                logTrashFailure(kLogPurge, "каталог вне корня правила: содержимое не тронуто", plainOf(current),
+                                ERROR_ACCESS_DENIED, options);
+                if (frame.isRoot()) {
+                    result.status = TrashStatus::AccessDenied;
+                    result.win32Error = ERROR_ACCESS_DENIED;
+                    result.failedPath = plainOf(current);
                     return result.status;
                 }
                 stack.pop_back();
@@ -1363,11 +1476,17 @@ TrashMoveResult moveToTrash(const TrashMoveRequest& request, const TrashOptions&
 TrashStageResult stageTrashItem(const TrashStageRequest& request, const TrashOptions& options) {
     TrashStageResult staged;
 
+    // Граница правила — свойство элемента, а параметры операции у транзакции
+    // общие: подставляем её на время переноса. Пустое поле означает «границу не
+    // задавал» и поведение прежнее (внутренние операции сервиса корзины).
+    TrashOptions scoped = options;
+    if (!request.allowedRoot.empty()) scoped.allowedRootUtf8 = request.allowedRoot;
+
     TrashMoveRequest move;
     move.sourcePath = request.originalPath;
     move.transactionDir = request.transactionDir;
     move.payload = request.payload;
-    staged.transfer = moveToTrash(move, options);
+    staged.transfer = moveToTrash(move, scoped);
     if (!staged.transfer.ok()) return staged;
 
     staged.item.kind = staged.transfer.facts.directory ? core::TrashItemKind::Directory : core::TrashItemKind::File;

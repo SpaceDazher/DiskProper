@@ -16,9 +16,11 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "core/glob.hpp"
 #include "core/log.hpp"
 #include "core/trash.hpp"
 #include "core/units.hpp"
@@ -353,22 +355,56 @@ const ChecklistEntry* Checklist::find(std::size_t candidateIndex) const noexcept
     return nullptr;
 }
 
+// Позиция первого метасимвола шаблона core::glob. Класс символов «[…]» не
+// метасимвол: его содержимое — литералы. Незакрытая «[» — тоже литерал («в имени
+// каталога», «C:\a\b[1]\*.tmp»), иначе корень правила срезался бы на два уровня
+// выше своего каталога.
+std::size_t firstMetachar(std::string_view pattern) noexcept {
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+        const char ch = pattern[i];
+        if (ch == '*' || ch == '?') return i;
+        if (ch == '[') {
+            const std::size_t close = pattern.find(']', i + 1);
+            if (close == std::string_view::npos) return std::string_view::npos;
+            i = close;
+        }
+    }
+    return std::string_view::npos;
+}
+
 std::string ruleRootOf(std::string_view resolvedLocator) {
     if (resolvedLocator.empty()) return {};
     // Глоб-символы core::glob: *, ?, [. Первый из них обрывает корень: всё
     // после него — уже содержимое правила, а не его каталог.
-    std::size_t cut = resolvedLocator.size();
-    for (std::size_t i = 0; i < resolvedLocator.size(); ++i) {
-        const char ch = resolvedLocator[i];
-        if (ch == '*' || ch == '?' || ch == '[') {
-            cut = i;
-            break;
+    const std::size_t cut = firstMetachar(resolvedLocator);
+    std::string root;
+    if (cut == std::string_view::npos) {
+        // Локатор без метасимволов называет ровно один объект, и это не «каталог
+        // плюс содержимое», а сам каталог либо сам файл. Раньше последний
+        // компонент срезался всегда, и восемь правил с точным локатором получали
+        // корень на уровень выше своего каталога: «%LOCALAPPDATA%\npm-cache»
+        // давал «%LOCALAPPDATA%», «C:\Windows\WinSxS» — «C:\Windows». Теперь
+        // каталог остаётся своим корнем, а файл даёт корень своего родителя.
+        // Вопрос «каталог это или файл» решает ФС: один вызов на правило, кэш
+        // в buildChecklist. Несуществующий путь считаем файлом — это совпадает
+        // с прежним поведением, то есть ничего не ухудшается.
+        const std::string exact(resolvedLocator);
+        std::string trimmed = exact;
+        while (trimmed.size() > 1 && (trimmed.back() == '/' || trimmed.back() == '\\')) trimmed.pop_back();
+        if (trimmed.find('%') != std::string::npos) return {};
+        if (platform::isDirectory(trimmed)) {
+            root = trimmed;
+        } else {
+            const std::size_t slash = trimmed.find_last_of("/\\");
+            if (slash == std::string_view::npos) return {};
+            root = trimmed.substr(0, slash);
         }
+    } else {
+        const std::string_view head = resolvedLocator.substr(0, cut);
+        const std::size_t slash = head.find_last_of("/\\");
+        if (slash == std::string_view::npos) return {};
+        root = std::string(head.substr(0, slash));
     }
-    const std::string_view head = resolvedLocator.substr(0, cut);
-    const std::size_t slash = head.find_last_of("/\\");
-    if (slash == std::string_view::npos) return {};
-    std::string root(head.substr(0, slash));
     // Хвостовой разделитель не нужен: isInsideRoot срезает завершающие
     // разделители с обеих сторон, а лишний символ в логе сбивает с толку.
     while (root.size() > 1 && (root.back() == '/' || root.back() == '\\')) root.pop_back();
@@ -398,6 +434,10 @@ Checklist buildChecklist(const std::vector<core::CleanupCandidate>& candidates, 
     Checklist checklist;
     checklist.entries.reserve(plan.items.size());
     std::size_t sequence = 0;
+    // Корень и локатор — свойства правила, а не строки, поэтому считаются один
+    // раз на ruleId. Раньше ruleRootOf звался на каждую строку, а проверка
+    // «каталог это или файл» добавила бы обращение к ФС на каждую строку плана.
+    std::unordered_map<std::string, std::pair<std::string, std::string>> ruleFacts;
     for (const core::CleanupPlanItem& item : plan.items) {
         if (item.candidateIndex >= candidates.size()) continue;  // индекс не согласован — решает вызывающий
         const core::CleanupCandidate& candidate = candidates[item.candidateIndex];
@@ -412,7 +452,16 @@ Checklist buildChecklist(const std::vector<core::CleanupCandidate>& candidates, 
             if (!options.ruleRootOverride.empty()) {
                 entry.ruleRoot = options.ruleRootOverride;
             } else if (options.rules != nullptr) {
-                if (const core::Rule* rule = options.rules->byId(candidate.ruleId)) entry.ruleRoot = ruleRootOf(*rule);
+                if (const core::Rule* rule = options.rules->byId(candidate.ruleId)) {
+                    const auto [it, inserted] = ruleFacts.try_emplace(candidate.ruleId);
+                    if (inserted) {
+                        it->second.first = ruleRootOf(*rule);
+                        it->second.second =
+                            rule->resolvedLocator.empty() ? rule->locator : rule->resolvedLocator;
+                    }
+                    entry.ruleRoot = it->second.first;
+                    entry.ruleLocator = it->second.second;
+                }
             }
             // Пустой корень остаётся пустым намеренно: он означает «удалять
             // нельзя» (SkippedOutsideRoot), и это безопаснее, чем подставить
@@ -872,6 +921,16 @@ bool CleanupExecutor::closePhase(std::vector<ItemReport>& items) {
 // Фаза C: исполнение (параллельно)
 // ---------------------------------------------------------------------------
 
+// Соответствует ли путь строки локатору правила, из которого кандидат вырос.
+// Пустой локатор — сверять нечем: корень тогда задал вызывающий, и границу
+// полностью держит checkRuleRoot. Сравнение регистронезависимое и по разделителям
+// — тем же matchPath, что и на скане (src/core/rules.cpp, Rule::matches).
+bool locatorStillMatches(const ItemReport& item) {
+    if (item.ruleLocator.empty()) return true;
+    if (item.path.empty()) return false;
+    return core::matchPath(item.ruleLocator, core::normalizeSeparators(item.path));
+}
+
 // Прямое удаление: дерево для каталога, один объект для файла. «Повтор с
 // backoff 3×» (FR-6) задаётся платформенному модулю, который сам решает, какие
 // коды отказа повторяемы (SHARING/LOCK_VIOLATION), а какие нет (ACCESS_DENIED
@@ -990,6 +1049,11 @@ void CleanupExecutor::trashItem(ItemReport& item, RunContext& run) {
     request.transactionDir = run.trashDir;
     request.originalPath = item.path;
     request.payload = item.payload;
+    // Граница правила уходит в сам слой корзины: обход дерева работает с
+    // лексическими путями, и проверка только верхнего элемента оставляла окно,
+    // в котором каталог, подменённый на junction, уводил снос за пределы корня
+    // (FR-6, §12 «отсутствие изменений вне корней правил»).
+    request.allowedRoot = item.ruleRoot;
     const platform::TrashStageResult staged = platform::stageTrashItem(request, run.trashOptions);
 
     item.txId = run.txId;
@@ -1044,7 +1108,18 @@ bool CleanupExecutor::executePhase(std::vector<ItemReport>& items, RunContext& r
             queued = pool.submit([this, &item, &run, trash] {
                 const std::int64_t startTick = steadyTicks();
                 try {
-                    if (trash) {
+                    // Повторная сверка с локатором правила непосредственно перед
+                    // операцией (§10: «путь, не совпавший ни с одним известным
+                    // правилом, никогда не удаляется»). На скане совпадение уже
+                    // было, но между фазой A и фазой C путь мог уйти из-под
+                    // правила, а корень — каталог пошире того, что правило
+                    // собиралось трогать. Одна проверка шаблона на элемент
+                    // дешевле, чем операция, которую придётся откатывать.
+                    if (!locatorStillMatches(item)) {
+                        skipItem(item, ItemOutcome::SkippedOutsideRoot);
+                        item.detail =
+                            "путь не соответствует локатору правила: элемент вне того, что правило отбирало";
+                    } else if (trash) {
                         trashItem(item, run);
                     } else {
                         deleteItem(item);
@@ -1582,6 +1657,7 @@ ItemReport CleanupExecutor::makeItem(const core::CleanupCandidate& candidate, co
     item.category = candidate.category;
     item.plannedBytes = entry.plannedBytes;
     item.ruleRoot = entry.ruleRoot;
+    item.ruleLocator = entry.ruleLocator;
     item.payload = entry.trashPayload;
     item.outcome = ItemOutcome::NotStarted;
     item.code = toString(item.outcome);
@@ -1597,6 +1673,28 @@ ExecutionRefusal CleanupExecutor::start(const std::vector<core::CleanupCandidate
     runCandidates_ = candidates;
     runPlan_ = plan;
     runChecklist_ = checklist;
+    {
+        // Прежний поток, если его не дождались, присоединяем ДО присваивания
+        // нового: присваивание в joinable-поток вызывает std::terminate(), то
+        // есть второй клик «Очистить» после завершившегося фонового прогона
+        // убивал процесс (контракт класса на это прямо разрешает: generation_
+        // растёт, повторный запуск отработанного прогона — не «уже идёт»).
+        // Мьютекс на время ожидания отпускаем: прежний поток в finalize() берёт
+        // его сам, и join() под мьютексом — это взаимоблокировка.
+        std::unique_lock lock(mutex_);
+        if (runner_.joinable()) {
+            std::jthread previous = std::move(runner_);
+            lock.unlock();
+            previous.join();
+            lock.lock();
+            // Пока мьютекс был отпущен, прежний поток мог дописать отчёт и
+            // снять running_. Свой прогон он завершить не мог: finalize()
+            // отработал до beginRun (иначе running_ было бы true и start()
+            // получил бы AlreadyRunning), а чужой прогон тоже не начался бы.
+            // Значение возвращаем своё — по контракту это делает beginRun.
+            running_ = true;
+        }
+    }
     try {
         runner_ = std::jthread([this] { runBackground(); });
     } catch (const std::exception& error) {

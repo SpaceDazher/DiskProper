@@ -60,7 +60,7 @@ std::wstring formatProbeError(ProbeStatus status, std::uint32_t win32Error);
 struct DiskSizeResult {
     std::uint64_t lengthBytes{};                    // GET_LENGTH_INFORMATION::Length
     ProbeStatus status{ProbeStatus::Unavailable};
-    std::uint32_t win32Error{};                     // код Win32; при TimedOut — WAIT_TIMEOUT
+    std::uint32_t win32Error{};                     // код Win32; при TimedOut — ERROR_TIMEOUT
     std::chrono::milliseconds elapsed{};             // сколько ждали результат
 
     [[nodiscard]] bool ok() const noexcept { return status == ProbeStatus::Ok; }

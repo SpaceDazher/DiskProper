@@ -146,8 +146,17 @@ constexpr bool isDriveLetterA(char ch) noexcept {
     }
     // «C:\…» и «C:\» одинаково приводятся: третьим символом у корня тома
     // стоит разделитель, а не буква, и проверять его на букву нельзя.
-    if (path.size() < 2u || !isDriveLetterW(path[0]) || !isSeparatorW(path[1])) return false;
-    path[1] = L'\\';
+    // Двоеточие при этом остаётся на месте: расширенная форма, которую ждёт
+    // Win32 (и isExtendedFileSystemPath), — это «\\?\C:\…». Прежний код
+    // требовал path[1] == L'\\' и подставлял разделитель вместо двоеточия,
+    // из-за чего любой обычный путь «C:\…» отвергался: prepareRoot отдавал
+    // ERROR_INVALID_NAME, а checkRuleRoot — Unresolvable на каждый элемент.
+    if (path.size() < 2u || !isDriveLetterW(path[0])) return false;
+    if (path.size() == 2u && path[1] == L':') {
+        path.push_back(L'\\');  // «C:» — корень тома, который Win32 не открывает
+    } else if (path[1] != L':' && !isSeparatorW(path[1])) {
+        return false;
+    }
     path.insert(0, kExtendedPrefix);
     return true;
 }

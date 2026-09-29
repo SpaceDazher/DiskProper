@@ -135,6 +135,10 @@ DeviceState deviceStateFromWin32(std::uint32_t win32Error) noexcept {
         case ERROR_SUCCESS:
             return DeviceState::Ok;
         case ERROR_TIMEOUT:
+        // WAIT_TIMEOUT (258) больше не приходит: size_probe и storage_query
+        // кладут в win32Error настоящий код ERROR_TIMEOUT. Ветка оставлена как
+        // страховка от старых снимков и чужих модулей — код 258 в каталоге
+        // ERROR_ не значит таймаут и текста системы не имеет.
         case WAIT_TIMEOUT:
             return DeviceState::TimedOut;
         case ERROR_ACCESS_DENIED:

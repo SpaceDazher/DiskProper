@@ -147,6 +147,13 @@ private:
 // Код ошибки Win32 → состояние запроса
 // ---------------------------------------------------------------------------
 
+// Единственное значение, которым модуль помечает таймаут устройства:
+// ERROR_TIMEOUT (1460). Раньше здесь был WAIT_TIMEOUT (258) — WAIT-результат
+// WaitForSingleObject, а не код Win32, из-за чего в лог и отчёт уходило число,
+// для которого у системы нет текста. Оставлено константой, потому что
+// сравнивать надо во всех местах, где статус переводится в QueryStatus.
+constexpr std::uint32_t kTimeoutCode = static_cast<std::uint32_t>(ERROR_TIMEOUT);
+
 QueryStatus classify(std::uint32_t error) noexcept {
     switch (error) {
         case ERROR_SUCCESS:
@@ -259,7 +266,14 @@ IoctlOutcome sendPropertyQuery(HANDLE device, const STORAGE_PROPERTY_QUERY& quer
                 buffer.giveUpToDriver();
             }
             gAbandonedCalls.fetch_add(1, std::memory_order_relaxed);
-            outcome.win32Error = static_cast<std::uint32_t>(WAIT_TIMEOUT);
+            // В поле win32Error кладём ERROR_TIMEOUT (1460), а не WAIT_TIMEOUT
+            // (258): WaitForSingleObject возвращает WAIT-результат, а не код
+            // ошибки, и 258 не значит таймаут ни в одном каталоге ERROR_ —
+            // FormatMessageW для него не находит текста, и пользователь видит
+            // в отчёте пустую строку «(258) [win32=0x00000102]». Остальной слой
+            // (devices, volumes, trim_cache, inventory) уже кладёт
+            // ERROR_TIMEOUT, поэтому теперь значения совпадают.
+            outcome.win32Error = static_cast<std::uint32_t>(ERROR_TIMEOUT);
             return outcome;
         }
         if (wait != WAIT_OBJECT_0) {
@@ -540,8 +554,7 @@ QuerySlot<Parsed> readDescriptor(HANDLE device, STORAGE_PROPERTY_ID propertyId, 
     } else if (probe.win32Error == ERROR_SUCCESS || probe.win32Error == ERROR_INSUFFICIENT_BUFFER) {
         bytes = kMaxPropertyBytes;
     } else {
-        slot.status = probe.win32Error == static_cast<std::uint32_t>(WAIT_TIMEOUT) ? QueryStatus::TimedOut
-                                                                                    : classify(probe.win32Error);
+        slot.status = probe.win32Error == kTimeoutCode ? QueryStatus::TimedOut : classify(probe.win32Error);
         slot.win32Error = probe.win32Error;
         return slot;
     }
@@ -558,8 +571,7 @@ QuerySlot<Parsed> readDescriptor(HANDLE device, STORAGE_PROPERTY_ID propertyId, 
     ResponseBuffer buffer(bytes);
     const IoctlOutcome read = sendPropertyQuery(device, query, buffer, timeoutMs, overlapped);
     if (!read.ok) {
-        slot.status = read.win32Error == static_cast<std::uint32_t>(WAIT_TIMEOUT) ? QueryStatus::TimedOut
-                                                                                  : classify(read.win32Error);
+        slot.status = read.win32Error == kTimeoutCode ? QueryStatus::TimedOut : classify(read.win32Error);
         slot.win32Error = read.win32Error;
         return slot;
     }
