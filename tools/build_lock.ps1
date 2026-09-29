@@ -1,4 +1,4 @@
-# MrProper: serialize builds.
+﻿# MrProper: serialize builds.
 # Why: several agents run MSVC on one host with 7.8 GB RAM. Parallel cl.exe +
 # link.exe exhaust memory, the kernel OOM-kills processes, and BB workflows then
 # report "Thread interrupted because the connection to the host was lost".

@@ -1,0 +1,18 @@
+# Переносы строк по типам файла. Без этого Windows-скрипты ломаются молча:
+# cmd.exe разбирает .bat только с CRLF, а с LF метка или goto «съезжает»,
+# и файл начинает исполнять куски кириллических комментариев как команды
+# («cho is not recognized» вместо «echo»). Правило закреплено и в
+# .editorconfig, но .editorconfig не применяется к файлам, уже пришедшим
+# из git с чужими переносами, — а это как раз наш случай.
+
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf working-tree-encoding=UTF-8
+*.rc    text eol=crlf
+*.md    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.cpp   text eol=lf
+*.hpp   text eol=lf
+*.txt   text eol=lf
