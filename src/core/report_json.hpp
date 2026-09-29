@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "model.hpp"
+#include "plan.hpp"
 
 namespace mrproper::core {
 
@@ -105,6 +106,10 @@ struct ReportOptions {
     bool includeOperations{true};
     bool includeUntouched{true};
     bool includeErrors{true};
+    // Манифест удаления рядом с кандидатом (docs/review-02.md F-01): что
+    // правило разрешило удалить. По умолчанию включено — без него сохранённый
+    // скан нельзя превратить в план, а «пустой план» хуже отсутствия плана.
+    bool includeManifests{true};
     bool maskSerials{true};       // серийники дисков → хвост из 4 символов
     bool maskVolumeGuids{true};   // \\?\Volume{…} → \\?\Volume{****}
 };
@@ -142,6 +147,13 @@ struct Report {
     ReportOptions options;
     std::vector<PhysicalDisk> disks;            // карта разделов (FR-2, FR-8)
     std::vector<CleanupCandidate> candidates;   // что нашли и с какой оценкой
+    // Манифесты удаления — по одному на кандидата из candidates, в том же
+    // порядке. Секция кандидата несёт свой манифест (ключ «manifest»), потому
+    // что манифест — продолжение кандидата, а не отдельный документ
+    // (core::plan.hpp, docs/review-02.md F-01): сохранённый скан без него не
+    // даёт плана — `plan --candidates` приходится перечислять корень заново, а
+    // это уже не то, что правило разрешило.
+    std::vector<CandidateManifest> manifests;
     std::vector<ReportOperation> operations;     // что выполнили
     std::vector<ReportOperation> untouched;      // что оставили и почему
     std::vector<ReportError> errors;
@@ -169,6 +181,12 @@ std::vector<std::string> validateReport(const Report& report);
 
 // Сколько значащих цифр серийника остаётся при маскировании (FR-8, §5 приватность).
 inline constexpr std::size_t kSerialTailKept = 4;
+
+// Предел путей в манифесте внутри отчёта. Список бывает на десятки тысяч
+// путей, а отчёт — это ещё и баг-репорт: полный перечень в него не влезает.
+// Обрезанный список помечается неполным, и читатель обязан трактовать его как
+// «удалять нельзя» (CandidateManifest::deletable), а не как «удалять начало».
+inline constexpr std::size_t kMaxReportManifestPaths = 4096;
 
 // Маскирование серийника: хвост из 4 символов, остальное — звёздочки.
 // Пустая строка остаётся пустой (нет диска — нет серийника, а не «****»).

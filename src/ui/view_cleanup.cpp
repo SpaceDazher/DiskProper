@@ -445,6 +445,10 @@ HitTarget CleanupLayout::hitTest(int px, int py) const noexcept {
 struct CleanupViewModel::Impl {
     // Снимок скана (§6.4: результаты не мутируются после публикации).
     std::shared_ptr<const std::vector<CleanupCandidate>> candidates;
+    // Что каждому кандидату разрешено удалять (docs/review-02.md F-01).
+    // nullptr — сборщик манифестов не подключён, и план тогда ничего не
+    // выбирает: обещать удаление корня, не сказав что внутри, нельзя.
+    std::shared_ptr<const std::vector<core::CandidateManifest>> manifests;
     core::PlanOptions options;
     bool showAllRisky{false};
     std::string filter;
@@ -496,7 +500,11 @@ void CleanupViewModel::rebuild(bool keepSelection) {
 
     const std::vector<CleanupCandidate>& all = *s.candidates;
     s.options.dryRun = true;
-    s.profilePlan = core::buildPlan(all, s.options);
+    // Манифесты идут в план вместе с кандидатами: без них buildPlan не выберет
+    // ничего (docs/review-02.md F-01), и экран показал бы «нечего удалять» при
+    // полном дереве.
+    const std::vector<core::CandidateManifest>* manifests = s.manifests != nullptr ? s.manifests.get() : nullptr;
+    s.profilePlan = core::buildPlan(all, s.options, manifests);
     if (s.selected.size() != all.size()) s.selected.assign(all.size(), kUnchecked);
 
     const core::PlanOptions effective = effectiveOptions();
@@ -508,7 +516,8 @@ void CleanupViewModel::rebuild(bool keepSelection) {
     for (std::size_t i = 0; i < all.size(); ++i) {
         const CleanupCandidate& candidate = all[i];
         // Решение по профилю — из ядра (core::plan владеет отбором, §6.2).
-        const core::SelectionDecision decision = core::decideCandidate(candidate, s.options);
+        const core::CandidateManifest* manifest = manifestOf(i);
+        const core::SelectionDecision decision = core::decideCandidate(candidate, s.options, manifest);
         const bool locked = decision.action == PlanAction::SkipLocked || !candidate.lockedBy.empty();
         const bool risky = candidate.safety == SafetyLevel::Risky;
         const bool riskyHidden = risky && !s.showAllRisky;
@@ -531,7 +540,7 @@ void CleanupViewModel::rebuild(bool keepSelection) {
 
         if (checked) {
             ++selectedCount;
-            const core::SelectionDecision chosen = core::decideCandidate(candidate, effective);
+            const core::SelectionDecision chosen = core::decideCandidate(candidate, effective, manifest);
             if (chosen.selected) selectedBytes += candidate.allocatedBytes;
         }
         if (!visible) continue;
@@ -557,7 +566,7 @@ void CleanupViewModel::rebuild(bool keepSelection) {
         node.selectable = selectable;
         node.riskyHidden = riskyHidden;
         if (checked) {
-            const core::SelectionDecision chosen = core::decideCandidate(candidate, effective);
+            const core::SelectionDecision chosen = core::decideCandidate(candidate, effective, manifest);
             node.action = chosen.action;
             node.skip = chosen.skip;
             node.bytes = chosen.selected ? candidate.allocatedBytes : 0U;
@@ -701,8 +710,15 @@ bool CleanupViewModel::hasCandidates() const noexcept {
 
 void CleanupViewModel::publishCandidates(
     std::shared_ptr<const std::vector<CleanupCandidate>> candidates) {
+    publishCandidates(std::move(candidates), nullptr);
+}
+
+void CleanupViewModel::publishCandidates(
+    std::shared_ptr<const std::vector<CleanupCandidate>> candidates,
+    std::shared_ptr<const std::vector<core::CandidateManifest>> manifests) {
     auto& s = *impl_;
     s.candidates = std::move(candidates);
+    s.manifests = std::move(manifests);
     s.error.clear();
     s.progress = CleanupProgress{};
     s.progress.state = s.candidates != nullptr ? ScreenState::Ready : ScreenState::Idle;
@@ -719,6 +735,7 @@ void CleanupViewModel::publishCandidates(
 void CleanupViewModel::clear() {
     auto& s = *impl_;
     s.candidates.reset();
+    s.manifests.reset();
     s.selected.clear();
     s.expanded.clear();
     s.focusKey.clear();
@@ -760,6 +777,18 @@ void CleanupViewModel::setUseTrash(bool useTrash) {
     if (s.options.useTrash == useTrash) return;
     s.options.useTrash = useTrash;
     rebuild(true);
+}
+
+void CleanupViewModel::setIncludeReview(bool include) {
+    auto& s = *impl_;
+    const core::SafetyLevel level = include ? core::SafetyLevel::Review : core::SafetyLevel::Safe;
+    if (s.options.maxDefaultSafety == level) return;
+    s.options.maxDefaultSafety = level;
+    rebuild(true);
+}
+
+bool CleanupViewModel::includeReview() const noexcept {
+    return impl_->options.maxDefaultSafety >= core::SafetyLevel::Review;
 }
 
 void CleanupViewModel::setConfidenceThreshold(int threshold) {
@@ -1136,6 +1165,18 @@ std::string CleanupViewModel::statusText() const {
     return std::string();
 }
 
+const core::CandidateManifest* CleanupViewModel::manifestOf(std::size_t candidateIndex) const noexcept {
+    const auto& s = *impl_;
+    if (!s.manifests) return nullptr;
+    const std::vector<core::CandidateManifest>& manifests = *s.manifests;
+    const auto found = std::lower_bound(manifests.begin(), manifests.end(), candidateIndex,
+                                        [](const core::CandidateManifest& manifest, std::size_t index) {
+                                            return manifest.candidateIndex < index;
+                                        });
+    if (found == manifests.end() || found->candidateIndex != candidateIndex) return nullptr;
+    return &*found;
+}
+
 std::vector<CleanupCandidate> CleanupViewModel::selectedCandidates() const {
     const auto& s = *impl_;
     std::vector<CleanupCandidate> out;
@@ -1147,18 +1188,41 @@ std::vector<CleanupCandidate> CleanupViewModel::selectedCandidates() const {
     return out;
 }
 
+core::CleanupPlan CleanupViewModel::planFor(const std::vector<core::CleanupCandidate>& selected) const {
+    const std::vector<core::CandidateManifest> manifests = selectedManifests();
+    return core::buildPlan(selected, effectiveOptions(), manifests.empty() ? nullptr : &manifests);
+}
+
+std::vector<core::CandidateManifest> CleanupViewModel::selectedManifests() const {
+    const auto& s = *impl_;
+    std::vector<core::CandidateManifest> out;
+    if (!s.candidates) return out;
+    // Список разрешённого переносится на позиции сжатого списка выбранного:
+    // индекс в effectivePlan — это позиция там, а не во всём списке скана, и
+    // без переноса план удалял бы по списку одного элемента для другого (F-01).
+    for (const ItemNode& item : s.items) {
+        if (!item.checked) continue;
+        const core::CandidateManifest* manifest = manifestOf(item.candidateIndex);
+        if (manifest == nullptr) continue;
+        core::CandidateManifest moved = *manifest;
+        moved.candidateIndex = out.size();
+        out.push_back(std::move(moved));
+    }
+    return out;
+}
+
 core::CleanupPlan CleanupViewModel::effectivePlan() const {
-    return core::buildPlan(selectedCandidates(), effectiveOptions());
+    return planFor(selectedCandidates());
 }
 
 std::vector<std::string> CleanupViewModel::problems() const {
     const std::vector<CleanupCandidate> selected = selectedCandidates();
-    return core::validatePlan(selected, core::buildPlan(selected, effectiveOptions()));
+    return core::validatePlan(selected, planFor(selected));
 }
 
 core::DryRunReport CleanupViewModel::dryRunReport() const {
     const std::vector<CleanupCandidate> selected = selectedCandidates();
-    return core::makeDryRunReport(selected, core::buildPlan(selected, effectiveOptions()));
+    return core::makeDryRunReport(selected, planFor(selected));
 }
 
 bool CleanupViewModel::dryRunAcknowledged() const { return impl_->gate.alreadyShown(effectivePlan()); }
@@ -2508,8 +2572,14 @@ void CleanupScreen::publishScanProgress(ScanProgress progress) {
 
 void CleanupScreen::publishCandidates(
     std::shared_ptr<const std::vector<core::CleanupCandidate>> candidates) {
+    publishCandidates(std::move(candidates), nullptr);
+}
+
+void CleanupScreen::publishCandidates(
+    std::shared_ptr<const std::vector<core::CleanupCandidate>> candidates,
+    std::shared_ptr<const std::vector<core::CandidateManifest>> manifests) {
     auto& state = *impl_;
-    state.model.publishCandidates(std::move(candidates));
+    state.model.publishCandidates(std::move(candidates), std::move(manifests));
     state.refreshAll();
 }
 

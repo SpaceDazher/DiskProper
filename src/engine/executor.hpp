@@ -56,6 +56,13 @@
 //      своя транзакция корзины и своя копия отчёта, опубликованная как
 //      shared_ptr<const> (SPEC §6.4 — «результаты не мутируются после
 //      публикации»).
+//   5. Не решает, что именно удалять ВНУТРИ каталога-кандидата: это манифест
+//      (core::CandidateManifest) из плана (docs/review-02.md F-01). Право снести
+//      корень целиком есть только у манифеста с rootDeleteAllowed; у остальных
+//      исполнитель идёт по списку allowed, и строка без манифеста не
+//      выполняется вовсе (SkippedNoManifest). Раньше операция получала путь
+//      корня и сносила его целиком, вместе со «свежими» файлами и файлами под
+//      locatorExcludes, — это и был подтверждённый обход F-01.
 #pragma once
 
 #include <atomic>
@@ -226,6 +233,11 @@ enum class ItemOutcome : std::uint8_t {
     SkippedReparse,        // symlink/junction: FR-6 — не раскрываем
     SkippedChanged,        // объект изменился после сканирования (§10)
     SkippedInvalid,        // путь пуст, относительный или в пространстве имён устройств
+    // У кандидата нет списка того, что ему разрешено удалять, либо список
+    // неполон: снести корень «на всякий случай» нельзя (docs/review-02.md
+    // F-01). План такому кандидату действия не назначает, а исполнитель
+    // отказывается даже тогда, когда чек-лист собран вручную.
+    SkippedNoManifest,
     Cancelled,             // отмена пришла во время операции
     Failed,                // отказ Win32 или исключение внутри операции
 };
@@ -556,8 +568,19 @@ private:
     bool recheckLock(std::string_view path, ItemReport& item);
     // Закрыть держателей кандидата по подтверждению пользователя.
     bool closeHolders(ItemReport& item, std::string& note);
-    // Прямое удаление: дерево для каталога, один объект для файла.
+    // Прямое удаление: дерево для каталога, один объект для файла, а по
+    // манифесту — поштучно по списку разрешённого (docs/review-02.md F-01).
     void deleteItem(ItemReport& item);
+    // Удаление строго по списку разрешённого, который лежит в плане:
+    // каждый путь проходит ту же границу корня правила, что и дерево, но
+    // ничего за пределами списка не трогается.
+    void deleteAllowedList(ItemReport& item, const core::AllowedSet& allowed);
+    // Перенос в корзину по списку разрешённого: элемент транзакции на каждый
+    // путь («item-000001.000042»), иначе в корзину уехал бы весь каталог.
+    void trashAllowedList(ItemReport& item, RunContext& run, const core::AllowedSet& allowed);
+    // Манифест кандидата из активного плана прогона. nullptr — плана нет или
+    // в нём нет этого кандидата: удалять нельзя ничем.
+    [[nodiscard]] const core::CandidateManifest* manifestForItem(const ItemReport& item) const;
     // Перенос в корзину приложения (FR-7). Элемент транзакции кладётся в
     // журнал прогона — так манифест в финализации увидит всё, что перенесено.
     void trashItem(ItemReport& item, RunContext& run);
@@ -591,6 +614,12 @@ private:
     std::vector<core::CleanupCandidate> runCandidates_;
     core::CleanupPlan runPlan_;
     Checklist runChecklist_;
+
+    // План текущего прогона. Фаза C работает в потоках, а план — аргумент
+    // execute(), поэтому указатель кладётся сюда на время прогона: манифест
+    // (что кандидату разрешено удалять) читают рабочие потоки, и он должен
+    // быть тем же самым, с которым чек-лист сверили до старта.
+    const core::CleanupPlan* activePlan_{nullptr};
 
     mutable std::mutex mutex_;
     std::condition_variable doneCv_;

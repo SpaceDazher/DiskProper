@@ -46,6 +46,14 @@
          недоступным вместо выдуманной карты (FR-1), отказ по правам приходит
          документированным кодом с путём, и ничто не делается «в обход» ACL.
 
+    Инвариант «ничего не удалилось» проверяется снимком ДЕРЕВА ПЕСОЧНИЦЫ
+    (New-FixtureSnapshot + Assert-FixtureUnchanged), а не разностью свободного
+    места на томе. Том общий: рядом собираются другие агенты, и прогон G4
+    поймал именно это — место уехало на 1.36 МиБ при допуске 1 МиБ, хотя
+    утилита ничего не удаляла. Взамен проверка стала строже: снимок ловит любое
+    удаление и любое создание в песочнице точно, без допуска, а свободное место
+    остаётся наблюдением в preconditions.json.
+
     Пропуски не молчаливые: строка «SKIPPED: <причина>» печатается в консоль,
     пишется в build\e2e-artifacts\edge\skipped.log (свой каталог, чтобы
     параллельный прогон Test-FullCycle.ps1 не затирал свой журнал) и попадает в
@@ -139,12 +147,6 @@ $script:IsElevated = $false
 # пересчитываться уже относительно самого Pester.
 $script:ScriptPath = $PSCommandPath
 if ($script:ScriptPath -eq '') { $script:ScriptPath = $MyInvocation.MyCommand.Path }
-
-# Допуски на свободное место — как в Test-FullCycle.ps1: удаление округляется к
-# кластеру, а соседний процесс пишет на тот же том. Для «ничего не удалилось»
-# 1 МиБ достаточно, чтобы не ловить чужую активность, и мало, чтобы пропустить
-# само удаление.
-$script:FreeSpaceToleranceBytes = 1MB
 
 if ($null -eq (Get-Command -Name 'Describe' -ErrorAction SilentlyContinue)) {
     throw ('Pester не загружен: запускайте файл через Invoke-Pester, например ' +
@@ -852,6 +854,47 @@ function Get-TreeFiles {
     return [pscustomobject]@{ Count = $files.Count; Bytes = $bytes }
 }
 
+function New-FixtureSnapshot {
+    <#
+    .SYNOPSIS Снимок состояния, которым владеет сценарий: дерево фикстуры и место на томе.
+    .DESCRIPTION «Ничего не удалилось» — это утверждение о песочнице, а не обо всём
+    томе. Том общий: соседние агенты пишут в него своими сборками, и прогон G4
+    упал ровно на этом — свободное место уехало на 1.36 МиБ при допуске 1 МиБ,
+    хотя утилита ничего не удаляла (допуск в 1 МиБ при фикстуре 64 КиБ и не ловил
+    ничего: за ним не видно ни удаления файла, ни переноса в корзину). Дерево
+    песочницы — то, что сценарий создал сам и что никто чужой не трогает.
+    Свободное место в снимке остаётся: это полезное наблюдение о машине, оно
+    уходит в preconditions.json через Assert-FixtureUnchanged.
+    #>
+    param($Fixture)
+
+    return [pscustomobject]@{
+        Tree      = (Get-TreeFiles $Fixture.Root)
+        FreeBytes = [int64] (Get-VolumeFreeBytes $script:SandboxRoot)
+    }
+}
+
+function Assert-FixtureUnchanged {
+    <#
+    .SYNOPSIS Проверить, что песочница не изменилась, и записать место на томе.
+    .DESCRIPTION Проверка точная, без допуска: любое удаление, любой перенос в
+    корзину и любое создание файла меняют либо количество файлов, либо сумму
+    байт. Проверять надо и после освобождения блокировки держателем, и до него:
+    сценарий без этого проверял бы только «файл не удалили», а не «и не должны
+    были удалять, пока держат».
+    #>
+    param($Before, $Fixture, [string] $Label)
+
+    $after = New-FixtureSnapshot -Fixture $Fixture
+    $after.Tree.Count | Should Be $Before.Tree.Count
+    $after.Tree.Bytes | Should Be $Before.Tree.Bytes
+    Add-Precondition -Key ('volumeFreeSpace.' + $Label) -Value ([ordered]@{
+            before = $Before.FreeBytes
+            after  = $after.FreeBytes
+            delta  = ($after.FreeBytes - $Before.FreeBytes)
+        })
+}
+
 # ---------------------------------------------------------------------------
 # Сценарии
 # ---------------------------------------------------------------------------
@@ -987,12 +1030,11 @@ Describe 'MrProper: сценарии защиты (SPEC §11 п.3, §12)' -Tag '
             Write-JsonFile -Path $candidatesPath -Document (New-CandidateDocument -Path $candidatesPath `
                     -Candidates @(New-Candidate -Path $fixture.BusyDir -RuleId 'e2e.busy' -Bytes $FileSizeBytes))
 
-            $freeBefore = Get-VolumeFreeBytes $script:SandboxRoot
+            $snapshot = New-FixtureSnapshot -Fixture $fixture
             $plan = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
                 -Arguments @('plan', '--json', '--candidates', $candidatesPath)
             $apply = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
                 -Arguments @('apply', '--yes', '--json', '--candidates', $candidatesPath)
-            $freeAfter = Get-VolumeFreeBytes $script:SandboxRoot
 
             # Планирование и сухой прогон обязаны отработать: они не трогают ФС.
             $plan.Exit | Should Be 0
@@ -1011,7 +1053,7 @@ Describe 'MrProper: сценарии защиты (SPEC §11 п.3, §12)' -Tag '
             # «файл не удалили», а не «и не должен были удалять, пока держат».
             (Test-Path -LiteralPath $fixture.BusyFile -PathType Leaf) | Should Be $true
             (Get-Item -LiteralPath $fixture.BusyFile).Length | Should Be $FileSizeBytes
-            ([Math]::Abs($freeAfter - $freeBefore)) | Should BeLessThan $script:FreeSpaceToleranceBytes
+            Assert-FixtureUnchanged -Before $snapshot -Fixture $fixture -Label 'busy'
 
             Stop-FileLocker -Handle $locker
             $script:Locker = $null
@@ -1023,10 +1065,19 @@ Describe 'MrProper: сценарии защиты (SPEC §11 п.3, §12)' -Tag '
             $fixture = $script:Fixture
 
             $candidatesPath = Join-Path $script:SandboxRoot 'locked-candidates.json'
+            # fileCount задан явно и обязан совпадать с числом файлов в каталоге:
+            # секции manifest в дампе нет (её пишет настоящий скан), поэтому
+            # список разрешённого CLI восстанавливает перечислением корня — но
+            # берёт его ТОЛЬКО при совпадении с объявленным fileCount
+            # (src/cli/cmd_apply.cpp, synthesizeManifest). Расхождение означало бы
+            # needs-enumeration у обоих элементов: план снулём 0 операций вместо
+            # «занятое пропустили, свободное в корзину». Второй кандидат —
+            # контрольный: он свободен, и его судьба отличает «занятое пропустили»
+            # от «ничего не выбрали вообще».
             Write-JsonFile -Path $candidatesPath -Document (New-CandidateDocument -Path $candidatesPath -Candidates @(
-                    New-Candidate -Path $fixture.BusyDir -RuleId 'e2e.busy' -Bytes $FileSizeBytes `
+                    New-Candidate -Path $fixture.BusyDir -RuleId 'e2e.busy' -Bytes $FileSizeBytes -FileCount 1 `
                     -LockedBy @([ordered]@{ pid = 4242; name = 'msedge' }, [ordered]@{ pid = 4343; name = 'Photos' })
-                    New-Candidate -Path $fixture.DeniedDir -RuleId 'e2e.free' -Bytes $FileSizeBytes
+                    New-Candidate -Path $fixture.DeniedDir -RuleId 'e2e.free' -Bytes $FileSizeBytes -FileCount 1
                 ))
 
             $plan = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
@@ -1082,10 +1133,9 @@ Describe 'MrProper: сценарии защиты (SPEC §11 п.3, §12)' -Tag '
             Write-JsonFile -Path $candidatesPath -Document (New-CandidateDocument -Path $candidatesPath `
                     -Candidates @(New-Candidate -Path $fixture.BusyDir -RuleId 'e2e.busy' -LockedOnly $true))
 
-            $freeBefore = Get-VolumeFreeBytes $script:SandboxRoot
+            $snapshot = New-FixtureSnapshot -Fixture $fixture
             $plan = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
                 -Arguments @('plan', '--json', '--allow-risky', '--profile', 'everything', '--candidates', $candidatesPath)
-            $freeAfter = Get-VolumeFreeBytes $script:SandboxRoot
 
             # 4 = NoCandidates (src/cli/cmd_apply.hpp): список не разобран, и это
             # отказ, а не план с нулём операций. Главное — элемент не попал в
@@ -1094,7 +1144,7 @@ Describe 'MrProper: сценарии защиты (SPEC §11 п.3, §12)' -Tag '
             ([string]::IsNullOrEmpty($plan.Out)) | Should Be $true
             $plan.Err | Should Match 'lockedBy'
             (Test-Path -LiteralPath $fixture.BusyFile -PathType Leaf) | Should Be $true
-            ([Math]::Abs($freeAfter - $freeBefore)) | Should BeLessThan $script:FreeSpaceToleranceBytes
+            Assert-FixtureUnchanged -Before $snapshot -Fixture $fixture -Label 'lockedWithoutLockedBy'
         }
     }
 
@@ -1286,18 +1336,34 @@ Describe 'MrProper: сценарии защиты (SPEC §11 п.3, §12)' -Tag '
             $link.LinkType | Should Not BeNullOrEmpty
             $link.Target | Should Not BeNullOrEmpty
 
-            # Причина пропуска берётся из реального отказа программы, а не
-            # выдумывается: обход ФС — единственное, что может наступить на
-            # петлю, и на этой сборке он не подключён.
+            # Скан — единственное, что может наступить на петлю, и его код
+            # возврата различает три разных исхода, а не два (как было раньше,
+            # где ЛЮБОЙ ненулевой код уходил в пропуск и прогон G4 это поймал:
+            # прогон в слоте a5 вернул -1073741819 = 0xC0000005, то есть упал с
+            # нарушением доступа, а шаг отрапортовал это как «обход не подключён»).
             $scan = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
                 -Arguments @('scan', '--json', '--rules', $script:RulesPath, '--quiet')
             $scan.Exit | Should Not Be 70
+            $reason = Get-FirstMeaningfulLine $scan.Err
             if ($scan.Exit -eq 0) {
                 Write-Host ('скан отработал, петля пережита: ' + $fixture.LoopPath)
                 return
             }
-            Add-SkippedStep ('обход ФС не подключён — репarse-петлю обойти нечем (Win32 4390 не проверен). ' +
-                'scan вернул код ' + $scan.Exit + ': ' + (Get-FirstMeaningfulLine $scan.Err))
+            # Пропуск законен только там, где обход действительно не отработал
+            # и это сказано кодом из таблицы ScanExit (src/cli/cmd_scan.hpp):
+            # 3 RulesUnavailable, 4 ScanFailed, 130 Interrupted. Всё остальное —
+            # в том числе краш (отрицательный код вида 0xC0000005) и 70
+            # (необработанное исключение) — §12 называет дефектом, и такой код
+            # обязан валить шаг с настоящим кодом в сообщении, а не прятаться
+            # за формулировкой «петлю обойти нечем».
+            $honest = @(3, 4, 130)
+            if ($honest -notcontains $scan.Exit) {
+                throw ('scan упал на репarse-петле с кодом ' + $scan.Exit + ' (' + $reason +
+                    '). Обход ФС обязан пережить петлю (FR-6, пропуск reparse points), ' +
+                    'а §12 требует 0 крашей на сценариях 2-6: это дефект, не пропуск.')
+            }
+            Add-SkippedStep ('обход ФС не отработал — репarse-петлю обойти нечем (Win32 4390 не проверен). ' +
+                'scan вернул код ' + $scan.Exit + ': ' + $reason)
         }
     }
 
@@ -1320,12 +1386,11 @@ Describe 'MrProper: сценарии защиты (SPEC §11 п.3, §12)' -Tag '
                     -Candidates @(New-Candidate -Path $fixture.EncryptedDir -RuleId 'e2e.efs' `
                     -Bytes $FileSizeBytes -FileCount 1))
 
-            $freeBefore = Get-VolumeFreeBytes $script:SandboxRoot
+            $snapshot = New-FixtureSnapshot -Fixture $fixture
             $plan = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
                 -Arguments @('plan', '--json', '--candidates', $candidatesPath)
             $apply = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
                 -Arguments @('apply', '--yes', '--json', '--candidates', $candidatesPath)
-            $freeAfter = Get-VolumeFreeBytes $script:SandboxRoot
 
             # Зашифрованный файл — обычный кандидат для планировщика: он не
             # ломает план и не исчезает. Проверять тут нечего, кроме того, что
@@ -1335,7 +1400,7 @@ Describe 'MrProper: сценарии защиты (SPEC §11 п.3, §12)' -Tag '
             (Get-RequiredProperty ($apply.Out | ConvertFrom-Json) 'executed' 'apply') | Should Be $false
             (Test-Path -LiteralPath $fixture.EncryptedFile -PathType Leaf) | Should Be $true
             (Get-Item -LiteralPath $fixture.EncryptedFile).Length | Should Be $FileSizeBytes
-            ([Math]::Abs($freeAfter - $freeBefore)) | Should BeLessThan $script:FreeSpaceToleranceBytes
+            Assert-FixtureUnchanged -Before $snapshot -Fixture $fixture -Label 'efs'
 
             # Отчёт по зашифрованному тому не должен выдавать наружу то, чего
             # не должен (§5 «Приватность»): маскирование серийников включено.
@@ -1385,11 +1450,16 @@ Describe 'MrProper: сценарии защиты (SPEC §11 п.3, §12)' -Tag '
 
             # §12: «Приложение запускается без повышения прав». На повышенном
             # прогоне этот шач не имеет смысла, и это говорится прямо, а не
-            # делается вид, что непривилегированная ветка проверена.
+            # делается вид, что непривилегированная ветка проверена. Шаг
+            # заканчивается здесь: в Pester 4 Set-ItResult -Skipped помечает
+            # проверку пропущенной, но НЕ прерывает её, и четыре команды ниже
+            # отработали бы вхолостую — отчёт показал бы пропуск при полном
+            # списке выполненных проверок.
             if ($script:IsElevated) {
                 Add-SkippedStep ('прогон идёт с повышенными правами (' + $script:UserName +
                     ') — сценарий «отсутствие прав» проверяет непривилегированную ветку, ' +
                     'запустите Pester из обычного сеанса')
+                return
             }
 
             $candidatesPath = Join-Path $script:SandboxRoot 'rights-candidates.json'
@@ -1530,10 +1600,9 @@ Describe 'MrProper: сценарии защиты (SPEC §11 п.3, §12)' -Tag '
             Set-DenyAce -Path $candidatesPath -Rights 'R' | Out-Null
             (Test-AccessDenied -Path $candidatesPath -Mode 'read') | Should Be $true
 
-            $freeBefore = Get-VolumeFreeBytes $script:SandboxRoot
+            $snapshot = New-FixtureSnapshot -Fixture $fixture
             $plan = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
                 -Arguments @('plan', '--json', '--candidates', $candidatesPath)
-            $freeAfter = Get-VolumeFreeBytes $script:SandboxRoot
 
             # 4 = NoCandidates с текстом «не открылся файл со списком
             # кандидатов». Молчаливый пустой план здесь был бы опаснее отказа:
@@ -1542,7 +1611,7 @@ Describe 'MrProper: сценарии защиты (SPEC §11 п.3, §12)' -Tag '
             ([string]::IsNullOrEmpty($plan.Out)) | Should Be $true
             $plan.Err | Should Match ([regex]::Escape($candidatesPath))
             (Test-Path -LiteralPath $fixture.BusyFile -PathType Leaf) | Should Be $true
-            ([Math]::Abs($freeAfter - $freeBefore)) | Should BeLessThan $script:FreeSpaceToleranceBytes
+            Assert-FixtureUnchanged -Before $snapshot -Fixture $fixture -Label 'deniedCandidatesFile'
         }
     }
 

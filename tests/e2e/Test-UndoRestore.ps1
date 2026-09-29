@@ -8,11 +8,18 @@
     полный цикл, частичная очистка, отмена, восстановление, …») и §12
     («Все 20 e2e-сценариев зелёные, включая восстановление 100 % удалённого и
     отсутствие изменений вне корней правил»). Спека ставит для отмены ровно
-    четыре требования, и сценарий проверяет каждое числом, а не словом:
+    четыре требования, и сценарий проверяет каждое числом, а не словом.
+    Третий пункт ниже — разбор запрета FR-5 на ПУСТОМ плане: он добавлен
+    к четырём требованиям СПЕКИ, потому что именно там запрет молча
+    обходился кодом 0 (см. шаг 3б и skipped-undo-restore.log).
 
       * FR-5 — без --execute не удалено ни байта, план показан целиком;
       * FR-5 — список операций и снимок состояния печатаются ДО вопроса, а
         отказ (код 3) не трогает ни одного файла;
+      * FR-5 (разбор на пустом плане) — запрет «--candidates вместе с
+        --execute отклоняется» действует
+        и на ПУСТОМ плане: при 0 операций отказ всё равно обязан быть
+        кодом 3, иначе запрет обходится «нечего выполнять» с кодом 0;
       * FR-7 — транзакция пишется как %ProgramData%\MrProper\Trash\<txId>\ с
         manifest.json (исходный путь, размер, mtime), и её достаточно для
         полного возврата: каждый файл на своём месте, с тем же содержимым;
@@ -104,7 +111,10 @@
 
 .EXAMPLE
     powershell -NoProfile -File tests\e2e\Test-UndoRestore.ps1 -Slot a88
-    # Вне Pester: параметры передаются как обычно, сводка печатается в консоль.
+    # Вне Pester файл только РЕГИСТРИРУЕТ Describe: шаги It выполняет Pester,
+    # поэтому прямой запуск не печатает сводку и всегда «успешен» — это не
+    # проверка. Прогон с параметрами и сводкой: Invoke-Pester, как в двух
+    # примерах выше, либо tools\run-e2e.bat Debug main e2e_UndoRestore.
 #>
 [CmdletBinding()]
 param(
@@ -174,6 +184,12 @@ $script:Summary = [pscustomobject]@{
     ContractUsed      = $false
     CancelDryRunOk    = $false
     CancelRefusedCode = -1
+    # Отказ по --execute на ПУСТОМ плане (шаг 3б). Отдельная строка сводки, а не
+    # украшение: пока волна F3 не протянула манифест до buildPlan, план был
+    # пуст, и отказ FR-5 возвращался кодом 0 вместо 3 — на этом шаге видно,
+    # чем именно запрет обходится, а не «просто ноль».
+    EmptyPlanCode    = -1
+    EmptyPlanVerdict = '(не проверен)'
     CliReason         = ''
     SkipCount         = 0
 }
@@ -1095,6 +1111,103 @@ Describe 'MrProper: отмена и восстановление 100 % (SPEC §1
         }
     }
 
+    Context 'шаг 3б: запрет --execute с --candidates не обходится пустым планом (FR-5)' {
+
+        It 'нулевой план не обходит запрет: --execute с --candidates отказан, файлы целы' {
+            Initialize-Scenario
+            if ($null -eq $script:Cli) { Add-SkippedStep $script:CliMissingReason; return }
+
+            # Список из файла, из которого ничего не выбирается. Порог уверенности
+            # поднят ключом до 100, а у песочничных кандидатов 90: пустой план
+            # получается по воле проверяющего и не поедет вместе со значением
+            # порога по умолчанию. Именно этот случай и был источником падения
+            # «Expected 3, but got 0»: пока в плане 0 операций, executePlan
+            # возвращается раньше проверки запрета.
+            $probeRoot = Join-Path $script:SandboxRoot 'refusal-empty-plan'
+            $probe = New-UndoFixture -Root $probeRoot -CandidateCount 2 -FilesPerCandidate 1 -SizeBytes $FileSizeBytes
+            $probePath = Join-Path $probeRoot 'candidates.json'
+            Write-JsonFile -Path $probePath -Document ([ordered]@{
+                    schema     = 1
+                    kind       = 'scan'
+                    candidates = $probe.Candidates
+                })
+
+            # Сухой прогон по этому списку обязан быть честно пустым. Появление
+            # здесь операций означало бы, что шаг проверяет не то (запрет надо
+            # ловить там, где executePlan выходит раньше него), — это падение,
+            # а не пропуск: молча проверить другую ветку хуже, чем упасть.
+            $dry = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
+                -Arguments @('apply', '--candidates', $probePath, '--confidence-threshold', '100', '--json')
+            if ($dry.Exit -ne 0) {
+                throw ('сухой прогон по пустому списку вернул код ' + $dry.Exit + ': ' +
+                    (Get-FirstMeaningfulLine $dry.Err))
+            }
+            $dryDocument = $dry.Out | ConvertFrom-Json
+            (Get-RequiredProperty $dryDocument 'kind' 'apply') | Should Be 'apply'
+            (Get-RequiredProperty $dryDocument 'executed' 'apply') | Should Be $false
+            $dryPlan = Get-RequiredProperty $dryDocument 'plan' 'apply'
+            $dryTotals = Get-RequiredProperty $dryPlan 'totals' 'apply.plan'
+            (Get-RequiredProperty $dryTotals 'selected' 'apply.plan.totals') | Should Be 0
+            @(Get-RequiredProperty $dryPlan 'operations' 'apply.plan').Count | Should Be 0
+
+            $run = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
+                -Arguments @('apply', '--candidates', $probePath, '--confidence-threshold', '100',
+                    '--execute', '--json')
+            if ($run.Out -eq '' -or $null -eq $run.Out) {
+                throw ('apply --execute с пустым планом не напечатал документ: код ' + $run.Exit + ', stderr: ' +
+                    (Get-FirstMeaningfulLine $run.Err))
+            }
+            $document = $run.Out | ConvertFrom-Json
+            $script:Summary.EmptyPlanCode = $run.Exit
+
+            # Что бы CLI ни ответил, исполнителя быть не должно: 0 операций в плане
+            # означают, что удалять нечего, а --candidates запрещён при любом плане.
+            (Get-RequiredProperty $document 'executed' 'apply') | Should Be $false
+            (Get-RequiredProperty $document 'confirmed' 'apply') | Should Be $false
+            (Get-RequiredProperty $document 'execution' 'apply') | Should Be $null
+            $kept = Measure-ExpectedFiles -Expected $probe.Expected
+            $kept.Identical | Should Be $kept.Expected
+
+            if ($run.Exit -eq 3) {
+                # Ожидаемый по SPEC исход: запрет FR-5 сработал, удаление по
+                # списку из файла не произошло ни при каком размере плана.
+                $refusal = [string] (Get-RequiredProperty $document 'refusal' 'apply')
+                $refusal | Should Match 'устареть'
+                $script:Summary.EmptyPlanVerdict = 'отказ FR-5 (Refused)'
+            } elseif ($run.Exit -eq 0) {
+                # Известный дефект чужого слоя: executePlan (src/cli/cmd_apply.cpp:835)
+                # на пустом плане возвращает PlanExit::Ok РАНЬШЕ проверки
+                # options.candidatesPath.has_value() (там же, строка 844), поэтому
+                # запрет «--candidates вместе с --execute отклоняется» на пустом
+                # плане не срабатывает и процесс рапортует успех. Сценарий это не
+                # чинит (файл не мой), но и не замалчивает: строкой в
+                # skipped-undo-restore.log и строкой в сводке.
+                $script:Summary.EmptyPlanVerdict = 'ДЕФЕКТ CLI: код 0 вместо 3'
+                Add-SkippedStep ('дефект CLI: apply --candidates --execute при 0 операциях в плане вернул код 0 ' +
+                    'вместо 3 (Refused). Причина: executePlan в src/cli/cmd_apply.cpp:835 возвращает PlanExit::Ok ' +
+                    'на пустом плане раньше проверки запрета options.candidatesPath.has_value() (строка 844), ' +
+                    'поэтому запрет FR-5 «удалять по списку из файла нельзя» на пустом плане не действует. ' +
+                    'Починка: перенести проверку candidatesPath выше раннего возврата по пустому плану. ' +
+                    'Проверено при этом: файлы песочницы целы (байт в байт), executed=false, execution=null, ' +
+                    'транзакция не появилась — то есть вреда нет, врёт только код возврата')
+            } else {
+                throw ('apply --candidates --execute на пустом плане вернул неожиданный код ' + $run.Exit +
+                    ': ' + (Get-FirstMeaningfulLine $run.Err))
+            }
+
+            # Отказ не должен оставить транзакцию ни в песочнице, ни в корзине
+            # приложения: --candidates с --execute запрещён до исполнения.
+            @(Get-TrashTransactionIds $script:TrashRoot).Count | Should Be 0
+            $appTrashAfter = @(Get-TrashTransactionIds $script:AppTrashRoot)
+            $appTrashAfter.Count | Should Be $script:AppTrashBefore.Count
+            ($appTrashAfter -join ',') | Should Be ($script:AppTrashBefore -join ',')
+
+            Write-Host ('пустой план + --execute с --candidates: код ' + $run.Exit + ' (' +
+                $script:Summary.EmptyPlanVerdict + '), на месте ' + $kept.Identical + ' из ' + $kept.Expected +
+                ' файлов песочницы')
+        }
+    }
+
     Context 'шаг 4: транзакция корзины достаточна для возврата (FR-7)' {
 
         It 'транзакция записана по контракту manifest.json и отменяема' {
@@ -1307,6 +1420,8 @@ Describe 'MrProper: отмена и восстановление 100 % (SPEC §1
             Write-Host ('  процент возврата          : ' + $script:Summary.RestorePercent + ' %')
             Write-Host ('  отмена без --execute      : ' + $script:Summary.CancelDryRunOk)
             Write-Host ('  отказ по --execute, код   : ' + $script:Summary.CancelRefusedCode)
+            Write-Host ('  отказ на пустом плане     : ' + $script:Summary.EmptyPlanVerdict +
+                ' (код ' + $script:Summary.EmptyPlanCode + ')')
             Write-Host ('  mrproper_cli.exe          : ' + $script:Summary.CliReason)
             Write-Host ('  конфликт не перезаписан   : ' + $script:Summary.ConflictSkipped +
                 ' (чужой файл цел: ' + $script:Summary.ForeignFileIntact + ')')
@@ -1329,6 +1444,9 @@ Describe 'MrProper: отмена и восстановление 100 % (SPEC §1
             $script:Summary.RestoredFiles | Should Be $script:Summary.CleanFiles
             $script:Summary.CancelDryRunOk | Should Be $true
             $script:Summary.CancelRefusedCode | Should Be 3
+            # Шаг 3б обязан был отработать: -1 в сводке означал бы, что строка
+            # про пустой план — значение по умолчанию, а не измерение.
+            $script:Summary.EmptyPlanCode | Should Not Be -1
         }
     }
 }

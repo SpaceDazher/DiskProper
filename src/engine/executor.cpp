@@ -184,6 +184,9 @@ const char* skipDetail(ItemOutcome outcome) noexcept {
             return "объект изменился после сканирования";
         case ItemOutcome::SkippedInvalid:
             return "путь непригоден как цель операции";
+        case ItemOutcome::SkippedNoManifest:
+            return "нет списка того, что кандидату разрешено удалять: корень сносить нельзя "
+                   "(docs/review-02.md F-01)";
         case ItemOutcome::Cancelled:
             return "операция прервана отменой";
         default:
@@ -236,6 +239,41 @@ std::int32_t hresultOrZero(std::uint32_t win32Code) noexcept {
     return static_cast<std::int32_t>(platform::hresultFromWin32(win32Code));
 }
 
+// Каталог, в котором лежит путь: всё до последнего разделителя. Модель пишет
+// пути с обратным слэшем (§6.3), а список разрешённого может прийти из файла,
+// поэтому оба разделителя равноправны.
+std::string parentOf(std::string_view path) {
+    const std::size_t cut = path.find_last_of("/\\");
+    if (cut == std::string_view::npos) return {};
+    if (cut == 0) return std::string(1, path[0]);  // «C:\file.bin» → «C:\»
+    return std::string(path.substr(0, cut));
+}
+
+// Пути сравниваются регистронезависимо (NTFS) и с приведёнными разделителями:
+// один и тот же каталог приходит из манифеста с обратным слэшем, а из
+// вызывающего — с прямым.
+std::string comparablePath(std::string_view path) {
+    std::string text = core::normalizeSeparators(path);
+    for (char& c : text) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return text;
+}
+
+// Имя элемента транзакции корзины для одного пути из списка:
+// «item-000001.000042». Нумерация с ведущими нулями — чтобы имена в
+// каталоге транзакции читались по порядку, и чтобы core::isValidPayloadName
+// (только цифры, буквы, «_», «-», «.») их принял без правок.
+std::string listPayloadName(std::string_view base, std::size_t index) {
+    std::string name(base.empty() ? std::string_view{"item"} : base);
+    std::string suffix(6, '0');
+    for (std::size_t i = 0; i < 6; ++i) {
+        suffix[5 - i] = static_cast<char>('0' + static_cast<int>(index % 10));
+        index /= 10;
+    }
+    return name + "." + suffix;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -266,6 +304,8 @@ const char* toString(ItemOutcome outcome) noexcept {
             return "skipped-changed";
         case ItemOutcome::SkippedInvalid:
             return "skipped-invalid";
+        case ItemOutcome::SkippedNoManifest:
+            return "skipped-no-manifest";
         case ItemOutcome::Cancelled:
             return "cancelled";
         case ItemOutcome::Failed:
@@ -289,6 +329,7 @@ bool isSkipped(ItemOutcome outcome) noexcept {
         case ItemOutcome::SkippedReparse:
         case ItemOutcome::SkippedChanged:
         case ItemOutcome::SkippedInvalid:
+        case ItemOutcome::SkippedNoManifest:
             return true;
         default:
             break;
@@ -577,6 +618,9 @@ void skipItem(ItemReport& item, ItemOutcome outcome) {
 // Один поток на одну строку чек-листа. Проверки идут строго в порядке FR-6 и
 // §10, и каждая следующая дешевле той, что может запретить операцию:
 //
+//   0. что удалять вообще? Нет манифеста или он неполон — SkippedNoManifest,
+//      до любых обращений к ФС: операция без списка разрешённого не выполняется
+//      (docs/review-02.md F-01);
 //   1. корень правила задан? Нет — SkippedOutsideRoot, даже без обращения к ФС;
 //   2. нормализация пути (GetFinalPathNameByHandleW), принадлежность корню
 //      правила, белый список защищённых каталогов, признак reparse — всё это
@@ -599,6 +643,17 @@ void CleanupExecutor::checkItem(const core::CleanupCandidate& candidate, ItemRep
     }
     if (token.stop_requested()) {
         skipItem(item, ItemOutcome::NotStarted);
+        return;
+    }
+    // 1. Что именно удалять. Проверка идёт до любых обращений к файловой
+    // системе: строка без манифеста не должна ни доходить до вопроса «закрыть
+    // эти приложения», ни до deleteTree. Право снести корень целиком есть
+    // только у манифеста с rootDeleteAllowed, у остальных операция идёт по
+    // списку allowed (docs/review-02.md F-01).
+    const core::CandidateManifest* manifest = manifestForItem(item);
+    if (manifest == nullptr || !manifest->deletable()) {
+        skipItem(item, ItemOutcome::SkippedNoManifest);
+        if (manifest != nullptr) item.detail = manifest->blockReason();
         return;
     }
     if (item.ruleRoot.empty()) {
@@ -931,11 +986,26 @@ bool locatorStillMatches(const ItemReport& item) {
     return core::matchPath(item.ruleLocator, core::normalizeSeparators(item.path));
 }
 
-// Прямое удаление: дерево для каталога, один объект для файла. «Повтор с
-// backoff 3×» (FR-6) задаётся платформенному модулю, который сам решает, какие
-// коды отказа повторяемы (SHARING/LOCK_VIOLATION), а какие нет (ACCESS_DENIED
-// на каталоге — это права, а не блокировка).
+// Прямое удаление: дерево для каталога, один объект для файла, а когда правило
+// что-то отсекало — поштучно по списку разрешённого из манифеста (docs/review-02.md
+// F-01). «Повтор с backoff 3×» (FR-6) задаётся платформенному модулю, который сам
+// решает, какие коды отказа повторяемы (SHARING/LOCK_VIOLATION), а какие нет
+// (ACCESS_DENIED на каталоге — это права, а не блокировка).
 void CleanupExecutor::deleteItem(ItemReport& item) {
+    // Что удалять — из манифеста, а не из пути строки. Манифеста нет или он
+    // неполон: корнем каталога идти нельзя, и запасного пути здесь быть не
+    // должно — иначе обвязанный план сносит корень целиком (F-01).
+    const core::CandidateManifest* manifest = manifestForItem(item);
+    if (manifest == nullptr || !manifest->deletable()) {
+        skipItem(item, ItemOutcome::SkippedNoManifest);
+        if (manifest != nullptr) item.detail = manifest->blockReason();
+        return;
+    }
+    if (!manifest->rootDeleteAllowed && manifest->allowed != nullptr) {
+        deleteAllowedList(item, *manifest->allowed);
+        return;
+    }
+
     const std::wstring pathWide = wide(item.path);
     const std::wstring rootWide = wide(item.ruleRoot);
 
@@ -1025,8 +1095,243 @@ void CleanupExecutor::deleteItem(ItemReport& item) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Удаление и перенос ПО СПИСКУ разрешённого (docs/review-02.md F-01)
+// ---------------------------------------------------------------------------
+//
+// Правило, которое хоть что-то отсекает (min-age, locatorExcludes, порог
+// размера, фильтр листьев), не даёт права снести корень: остаётся перечисление
+// путей. Операция по такому списку — это тысячи deleteEntry вместо одного
+// deleteTree, и именно этим отличается «удалить кэш» от «удалить всё, что лежит
+// в каталоге, включая файлы, которые правило оставило».
+//
+// Что здесь не обходится:
+//   * каждый путь проходит ту же границу корня правила (deleteOptions.allowedRoot),
+//     что и дерево, — список не отменяет FR-6;
+//   * файл вне списка не удаляется вообще: обход дерева не запускается;
+//   * каталоги снимаются только пустые и только строго внутри корня кандидата:
+//     RemoveDirectoryW на непустом каталоге отказывает сам, а корень кандидата
+//     в список не входит, потому что списком перечислены файлы, а не структура.
+
+const core::CandidateManifest* CleanupExecutor::manifestForItem(const ItemReport& item) const {
+    if (activePlan_ == nullptr) return nullptr;
+    return activePlan_->manifestFor(item.candidateIndex);
+}
+
+void CleanupExecutor::deleteAllowedList(ItemReport& item, const core::AllowedSet& allowed) {
+    vfs::DeleteOptions deleteOptions;
+    deleteOptions.allowedRoot = wide(item.ruleRoot);
+    deleteOptions.maxAttempts = options_.deleteAttempts;
+    deleteOptions.backoff = options_.deleteBackoff;
+    deleteOptions.maxBackoff = options_.maxDeleteBackoff;
+
+    const std::int64_t startTick = steadyTicks();
+    std::uint32_t removed = 0;
+    std::uint32_t alreadyGone = 0;
+    std::uint32_t skipped = 0;
+    bool cancelled = false;
+    std::int32_t firstHr = 0;
+    std::string firstDetail;
+    // Каталоги, в которых лежали удалённые файлы: их имеет смысл убрать,
+    // если после списка они остались пустыми.
+    std::vector<std::string> parents;
+
+    for (std::size_t index = 0; index < allowed.entries.size(); ++index) {
+        if (runToken_.stop_requested()) {
+            cancelled = true;
+            break;
+        }
+        const core::AllowedEntry& entry = allowed.entries[index];
+        vfs::DeleteRequest request;
+        request.path = wide(entry.path);
+        request.kind = vfs::DeleteKind::File;
+        const vfs::DeleteResult result = vfs::deleteEntry(request, deleteOptions, runToken_);
+        switch (result.status) {
+            case vfs::DeleteStatus::Deleted:
+                ++removed;
+                parents.push_back(parentOf(entry.path));
+                break;
+            case vfs::DeleteStatus::AlreadyGone:
+                ++alreadyGone;
+                break;
+            case vfs::DeleteStatus::SkippedCancelled:
+                cancelled = true;
+                break;
+            default:
+                ++skipped;
+                if (firstHr == 0) firstHr = result.hr;
+                if (firstDetail.empty()) firstDetail = core::toUtf8(result.detail);
+                break;
+        }
+        // Полоса прогресса на длинном списке: без этого строка «удалено 200 000
+        // файлов» выглядит как зависание (§6.4 — прогресс виден в UI).
+        if ((index % 512u) == 511u) emitProgress(false);
+    }
+
+    std::uint32_t dirsRemoved = 0;
+    std::size_t dirsLeft = 0;
+    if (!cancelled) {
+        // Глубже — раньше: каталог убирается только тогда, когда вложенные уже
+        // пусты, иначе RemoveDirectoryW откажет, и мы бы считали это отказом.
+        std::sort(parents.begin(), parents.end(),
+                  [](const std::string& left, const std::string& right) { return left.size() > right.size(); });
+        parents.erase(std::unique(parents.begin(), parents.end(), [](const std::string& left, const std::string& right) {
+                         return comparablePath(left) == comparablePath(right);
+                     }),
+                     parents.end());
+        const std::string root = comparablePath(item.path);
+        for (const std::string& directory : parents) {
+            if (runToken_.stop_requested()) {
+                cancelled = true;
+                break;
+            }
+            // Корень кандидата и всё выше него — не трогаем: это решение плана
+            // (rootDeleteOnly), а не следствие списка файлов.
+            const std::string normalized = comparablePath(directory);
+            if (normalized.size() <= root.size()) continue;
+            if (normalized.rfind(root, 0) != 0) continue;
+            if (normalized[root.size()] != '\\' && normalized[root.size()] != '/') continue;
+            {
+                vfs::DeleteRequest request;
+                request.path = wide(directory);
+                request.kind = vfs::DeleteKind::Directory;
+                const vfs::DeleteResult result = vfs::deleteEntry(request, deleteOptions, runToken_);
+                if (result.status == vfs::DeleteStatus::Deleted) {
+                    ++dirsRemoved;
+                } else if (result.status != vfs::DeleteStatus::AlreadyGone) {
+                    // «Каталог не пуст» — это не отказ: в нём осталось то, чего в
+                    // списке не было, и именно так должно выглядеть частичное
+                    // удаление по списку.
+                    ++dirsLeft;
+                }
+            }
+        }
+    }
+
+    item.duration = sinceTick(startTick);
+    item.filesDone = removed;
+    item.dirsDone = dirsRemoved;
+    item.problems = skipped;
+    if (firstHr != 0) item.hr = firstHr;
+    item.detail = "удалено по списку разрешённого: файлов " + std::to_string(removed) + ", каталогов " +
+                  std::to_string(dirsRemoved);
+    if (alreadyGone != 0) item.detail += ", уже не было " + std::to_string(alreadyGone);
+    if (skipped != 0) item.detail += ", пропущено " + std::to_string(skipped);
+    if (dirsLeft != 0) item.detail += ", каталогов осталось: " + std::to_string(dirsLeft);
+    if (!firstDetail.empty()) item.detail += "; причина пропуска: " + firstDetail;
+
+    if (cancelled) {
+        item.outcome = ItemOutcome::Cancelled;
+    } else if (skipped != 0) {
+        item.outcome = ItemOutcome::Failed;
+    } else if (removed != 0 || dirsRemoved != 0) {
+        item.outcome = ItemOutcome::Done;
+    } else {
+        item.outcome = ItemOutcome::AlreadyGone;
+    }
+    item.code = toString(item.outcome);
+    if (isSuccess(item.outcome)) item.reclaimedBytes = item.plannedBytes;
+    emitProgress(true);
+}
+
+void CleanupExecutor::trashAllowedList(ItemReport& item, RunContext& run, const core::AllowedSet& allowed) {
+    if (!run.trashReady || run.txId.empty()) {
+        item.outcome = ItemOutcome::Failed;
+        item.code = toString(item.outcome);
+        item.detail = "корзина недоступна: перенос по списку не выполнен, а прямое удаление не заменяет его "
+                      "(решение о размещении принимает план, FR-7)";
+        return;
+    }
+    item.txId = run.txId;
+
+    const std::int64_t startTick = steadyTicks();
+    std::uint32_t moved = 0;
+    std::uint32_t alreadyGone = 0;
+    std::uint32_t failed = 0;
+    std::uint64_t bytes = 0;
+    bool cancelled = false;
+    std::string firstDetail;
+
+    for (std::size_t index = 0; index < allowed.entries.size(); ++index) {
+        if (runToken_.stop_requested()) {
+            cancelled = true;
+            break;
+        }
+        platform::TrashStageRequest request;
+        request.transactionDir = run.trashDir;
+        request.originalPath = allowed.entries[index].path;
+        request.payload = listPayloadName(item.payload, index);
+        // Граница правила уходит в слой корзины для каждого элемента: обход
+        // внутри переноса работает с лексическими путями (тот же довод, что и
+        // для одного элемента, FR-6).
+        request.allowedRoot = item.ruleRoot;
+        const platform::TrashStageResult staged = platform::stageTrashItem(request, run.trashOptions);
+        switch (staged.transfer.status) {
+            case platform::TrashStatus::Ok: {
+                ++moved;
+                bytes += staged.transfer.bytesMoved;
+                // Элемент — в журнал транзакции: манифест в финализации увидит
+                // всё, что перенесено, и только после этого транзакция станет
+                // отменяемой (FR-7).
+                std::lock_guard lock(run.ledgerMutex);
+                run.ledger.addItem(run.txId, staged.item);
+                break;
+            }
+            case platform::TrashStatus::NotFound:
+                ++alreadyGone;
+                break;
+            case platform::TrashStatus::Cancelled:
+                cancelled = true;
+                break;
+            default:
+                ++failed;
+                if (item.hr == 0) item.hr = hresultOrZero(staged.transfer.win32Error);
+                if (firstDetail.empty()) {
+                    firstDetail = platform::formatStatus(staged.transfer.status, staged.transfer.win32Error);
+                    if (!staged.transfer.failedPath.empty()) firstDetail += ": " + staged.transfer.failedPath;
+                }
+                break;
+        }
+        if ((index % 512u) == 511u) emitProgress(false);
+    }
+
+    item.duration = sinceTick(startTick);
+    item.filesDone = moved;
+    item.problems = failed;
+    item.detail = "перенесено в корзину по списку разрешённого: файлов " + std::to_string(moved);
+    if (alreadyGone != 0) item.detail += ", уже не было " + std::to_string(alreadyGone);
+    if (failed != 0) {
+        item.detail += ", не перенесено " + std::to_string(failed);
+        if (!firstDetail.empty()) item.detail += "; причина: " + firstDetail;
+    }
+    if (cancelled) {
+        item.outcome = ItemOutcome::Cancelled;
+    } else if (failed != 0) {
+        item.outcome = ItemOutcome::Failed;
+    } else if (moved != 0) {
+        item.outcome = ItemOutcome::Done;
+    } else {
+        item.outcome = ItemOutcome::AlreadyGone;
+    }
+    item.code = toString(item.outcome);
+    if (isSuccess(item.outcome)) item.reclaimedBytes = bytes != 0 ? bytes : item.plannedBytes;
+    emitProgress(true);
+}
+
 // Перенос в корзину приложения (FR-7).
 void CleanupExecutor::trashItem(ItemReport& item, RunContext& run) {
+    // Список разрешённого обязателен и здесь: перенос каталога целиком увёл бы
+    // в корзину в том числе файлы, которых в списке нет (docs/review-02.md F-01).
+    const core::CandidateManifest* manifest = manifestForItem(item);
+    if (manifest == nullptr || !manifest->deletable()) {
+        skipItem(item, ItemOutcome::SkippedNoManifest);
+        if (manifest != nullptr) item.detail = manifest->blockReason();
+        return;
+    }
+    if (!manifest->rootDeleteAllowed && manifest->allowed != nullptr) {
+        trashAllowedList(item, run, *manifest->allowed);
+        return;
+    }
     if (!run.trashReady || run.txId.empty()) {
         item.outcome = ItemOutcome::Failed;
         item.code = toString(item.outcome);
@@ -1553,6 +1858,19 @@ ExecutionRefusal CleanupExecutor::execute(const std::vector<core::CleanupCandida
         logRefusal(ExecutionRefusal::Cancelled, checklist);
         return ExecutionRefusal::Cancelled;
     }
+
+    // План текущего прогона: из него фаза C берёт манифест — что кандидату
+    // разрешено удалять. Ссылка живёт ровно прогон (execute завершается раньше,
+    // чем вызывающий решит, что делать с планом), а RAII-guard снимает её даже
+    // на исключении: иначе рабочий поток следующего прогона увидел бы план
+    // предыдущего.
+    const core::CleanupPlan* const previousPlan = activePlan_;
+    activePlan_ = &plan;
+    struct PlanScope {
+        const core::CleanupPlan** slot;
+        const core::CleanupPlan* previous;
+        ~PlanScope() { *slot = previous; }
+    } planScope{&activePlan_, previousPlan};
 
     RunContext run;
     const std::size_t workers = resolveWorkers(checklist.executable());

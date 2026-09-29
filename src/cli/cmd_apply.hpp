@@ -109,6 +109,13 @@ struct ApplyOptions {
     // (раздел "candidates") либо голый массив кандидатов. Только для показа
     // плана: вместе с --execute такая комбинация отклоняется (см. выше).
     std::optional<std::string> candidatesPath;
+
+    // --include-review — брать кандидатов уровня Review (SPEC §4 FR-3, FR-4).
+    // По умолчанию берётся только Safe: пароли браузера, prefetch и доставка
+    // не должны попадать в план сами (docs/review-02.md F-03). Включение —
+    // явное действие человека, как галочка на экране «Очистка»; профиль
+    // everything берёт Review и без этого ключа.
+    bool includeReview{false};
 };
 
 // Разбор аргументов команды (без имени команды: caller отдаёт только хвост).
@@ -196,6 +203,7 @@ struct ExecutionSummary {
 
 struct ApplyReport {
     std::vector<core::CleanupCandidate> candidates;  // по ним построен план; нужны исполнителю и отчёту
+    std::vector<core::CandidateManifest> manifests;  // что каждому кандидату разрешено удалять (F-01)
     core::CleanupPlan plan;        // что решил core::plan
     core::DryRunReport dryRun;     // тот же список операций текстом (FR-5)
     core::PlanSnapshot snapshot;   // снимок состояния перед исполнением (FR-5)
@@ -230,9 +238,19 @@ int runApplyCommand(const std::vector<std::string>& args, const ApplyIo& io, con
 // которой потом удаляют. Ошибка всегда называет элемент, который не разобрался.
 std::vector<core::CleanupCandidate> parseCandidatesJson(std::string_view text, std::string& error);
 
+// То же плюс манифесты разрешённого к удалению (docs/review-02.md F-01): файл
+// скана несёт ключ "manifest" в каждом кандидате, и без него план не знает, что
+// именно удалять. Кандидату без манифеста CLI восстанавливает перечень сам —
+// перечислением корня, и только если перечень совпадает с объявленным числом
+// файлов; иначе манифеста не будет, и элемент останется в плане с причиной.
+bool parseCandidatesJson(std::string_view text, std::vector<core::CleanupCandidate>& candidates,
+                         std::vector<core::CandidateManifest>& manifests, std::string& error);
+
 // Тот же разбор из файла. Путь в UTF-8 (как везде в модели, §6.3), BOM и
 // переводы строк переживаются, файл больше kMaxCandidatesFileBytes не читается.
 bool loadCandidatesFile(const std::string& path, std::vector<core::CleanupCandidate>& out, std::string& error);
+bool loadCandidatesFile(const std::string& path, std::vector<core::CleanupCandidate>& out,
+                        std::vector<core::CandidateManifest>& manifests, std::string& error);
 
 // Потолок файла кандидатов: список на 64 МБ — это уже не «дамп скана», а
 // подозрительный вход, и читать его молча нельзя.

@@ -17,8 +17,10 @@
       * scan   — stdout строго JSON (§6.2: прогресс и ошибки в stderr), схема
                   отчёта, маскирование серийников (§5 «Приватность»);
       * plan   — dryRun, сходимость totals.selectedBytes с суммой операций и с
-                  агрегатами по действиям (§6.3), скрытые Risky (§12) и их
-                  появление только с --allow-risky;
+                  агрегатами по действиям (§6.3) и три разных умолчания отбора:
+                  Risky скрыт (§12) и появляется только с --allow-risky, Review
+                  выключен по умолчанию (FR-3) и берётся только профилем
+                  «выбрать всё»;
       * apply  — FR-5: без --execute не удалено ни байта; --execute вместе с
                   --candidates отказано (код 3); настоящая очистка и освобождение
                   места — по ключу -Destructive;
@@ -121,11 +123,15 @@ $script:FixtureRoot = ''
 $script:Fixture = $null
 $script:CandidatesPath = ''
 
-# Допуски на свободное место. Соседний процесс может писать на тот же диск, а
-# удаление округляется к кластеру: 1 МиБ «свободы» при песочнице в единицы МиБ
-# достаточно, чтобы не ловить чужую активность, и мало, чтобы пропустить
-# «ничего не удалилось». Для обратной проверки (место должно вырасти) снос даётся
-# на округление файлов — кластер 4 КиБ на файл, округляем вниз до 64 КиБ.
+# Допуски на свободное место. Соседний процесс пишет и удаляет на том же диске, и
+# на этой машине это видно: за 1.1 с вызова CLI чужой прогон освободил 5.1 МиБ.
+# Поэтому в сухом прогоне (шаг 3) свободное место — измерение с предупреждением,
+# а не приговор: песочница сценария — единицы МиБ, и на общем томе она не
+# отличима от чужой активности ни в одну сторону. Приговор «ничего не удалено»
+# дают точные проверки песочницы (файлы и байты) и поля отчёта самой команды
+# (executed=false, execution=null). Для обратной проверки (место должно вырасти
+# после настоящего удаления) снос даётся на округление файлов — кластер 4 КиБ на
+# файл, округляем вниз до 64 КиБ.
 $script:FreeSpaceToleranceBytes = 1MB
 $script:FreedSpaceSlackBytes = 64KB
 $script:FreedSpaceCeilingBytes = 64MB
@@ -291,6 +297,67 @@ function ConvertTo-CountArray {
     return , @($Value)
 }
 
+function Get-PlanFingerprint {
+    <#
+    .SYNOPSIS Компактный отпечаток решения плана: что выбрано, что не и почему.
+    .DESCRIPTION Документы плана целиком сравнивать нельзя: они несут пути,
+    имена и человеческий текст причин, которые меняются вместе с формулировкой.
+    Сравнивать нужно решение, поэтому отпечаток берёт машинные поля (действие,
+    уровень, объём) и итоговые цифры. Смена слов в reason на отпечаток не
+    влияет, а расхождение в решении видно сразу.
+    .PARAMETER WithSkipReasons
+    Добавить машинную причину пропуска (skipReason). Нужен там, где сравниваются
+    не два способа отобрать одно и то же, а два разных решения: у профилей
+    recommended и safe-only выбор совпадает, а причины у Review разные, и это
+    ровно то, чем профили отличаются.
+    #>
+    param($Document, [switch] $WithSkipReasons)
+
+    $lines = @()
+    $lines += ('totals selected=' + (Get-RequiredProperty $Document 'totals.selected' 'plan') +
+        ' bytes=' + (Get-RequiredProperty $Document 'totals.selectedBytes' 'plan') +
+        ' all=' + (Get-RequiredProperty $Document 'totals.allCount' 'plan') +
+        ' riskyHidden=' + (Get-RequiredProperty $Document 'totals.hiddenRisky' 'plan') +
+        ' profileFiltered=' + (Get-RequiredProperty $Document 'totals.profileFiltered' 'plan'))
+
+    # ConvertTo-CountArray отдаёт массив как ЕДИНСТВенНЫЙ объект (запятая внутри),
+    # поэтому обращаться к нему надо без обёртки @(): обёртка собрала бы массив
+    # массивов, и Get-RequiredProperty ниже искал бы поле index у массива.
+    $items = @()
+    $items += ConvertTo-CountArray (Get-RequiredProperty $Document 'operations' 'plan')
+    $items += ConvertTo-CountArray (Get-RequiredProperty $Document 'untouched' 'plan')
+    $ordered = @($items | Sort-Object { [int] (Get-RequiredProperty $_ 'index' 'plan.items[]') })
+    foreach ($item in $ordered) {
+        $line = 'item index=' + (Get-RequiredProperty $item 'index' 'plan.items[]') +
+            ' action=' + (Get-RequiredProperty $item 'action' 'plan.items[]')
+        if ($WithSkipReasons) {
+            $line += ' skip=' + (Get-RequiredProperty $item 'skipReason' 'plan.items[]')
+        }
+        $line += ' safety=' + (Get-RequiredProperty $item 'safety' 'plan.items[]') +
+            ' bytes=' + (Get-RequiredProperty $item 'bytes' 'plan.items[]')
+        $lines += $line
+    }
+    return ($lines -join "`n")
+}
+
+function Get-SkipReasonBySafety {
+    <#
+    .SYNOPSIS Причина пропуска элемента заданного уровня из раздела «не трогаем».
+    .DESCRIPTION Уровень — единственный способ указать элемент, не зная его номера:
+    номер зависит от порядка обхода, а уровень задан самим кандидатом. Пустая
+    строка означает «такого элемента в невыбранных нет», и вызывающий это видит.
+    #>
+    param($Document, [string] $Safety)
+
+    $untouched = ConvertTo-CountArray (Get-RequiredProperty $Document 'untouched' 'plan')
+    foreach ($item in $untouched) {
+        if ([string] (Get-RequiredProperty $item 'safety' 'plan.untouched[]') -eq $Safety) {
+            return [string] (Get-RequiredProperty $item 'skipReason' 'plan.untouched[]')
+        }
+    }
+    return ''
+}
+
 function New-CleanupFixture {
     <#
     .SYNOPSIS Подготовить «мусор» для цикла: три кандидата, три уровня риска.
@@ -299,8 +366,12 @@ function New-CleanupFixture {
     на томе не равно сумме bytes из отчёта — сверять было бы не с чем. Вторая:
     allocatedBytes кандидата тогда не совпадает с логическим размером, и
     сравнение плана с местом врало бы.
-    Три уровня безопасности нужны, чтобы главное из §12 проверялось числами, а не
-    словами: Risky по умолчанию скрыты, и это видно в totals.hiddenRisky.
+    Три уровня безопасности нужны, чтобы умолчания отбора проверялись числами, а
+    не словами. Уровней три, и планов из них выходит три, а не два: Risky скрыт
+    (§12) и появляется только с --allow-risky, Review выключен по умолчанию
+    (FR-3, FR-4) и берётся профилем «выбрать всё», Safe берётся всегда. Одна
+    сумма «сколько можно выбрать» скрыла бы, какой из планов проверяется, поэтому
+    ожидаемые суммы считаются по уровням.
     #>
     param([string] $Root, [int] $SizeBytes, [int] $FilesPerCandidate)
 
@@ -317,7 +388,9 @@ function New-CleanupFixture {
 
     $candidates = @()
     $totalBytes = [int64] 0
-    $selectableBytes = [int64] 0
+    $safeBytes = [int64] 0
+    $reviewBytes = [int64] 0
+    $riskyBytes = [int64] 0
     $expectedFiles = 0
     for ($index = 0; $index -lt $specs.Count; $index++) {
         $spec = $specs[$index]
@@ -330,8 +403,9 @@ function New-CleanupFixture {
             $expectedFiles++
         }
         $totalBytes += $bytes
-        # Профиль recommended берёт safe и review; risky скрыт (§12).
-        if ($spec.Safety -ne 'risky') { $selectableBytes += $bytes }
+        if ($spec.Safety -eq 'safe') { $safeBytes += $bytes }
+        elseif ($spec.Safety -eq 'review') { $reviewBytes += $bytes }
+        else { $riskyBytes += $bytes }
         $candidates += [ordered]@{
             ruleId         = $spec.Rule
             category       = $spec.Category
@@ -350,10 +424,20 @@ function New-CleanupFixture {
     }
 
     return [pscustomobject]@{
-        Candidates         = $candidates
-        TotalBytes         = $totalBytes
-        SelectableBytes    = $selectableBytes
-        ExpectedFiles      = $expectedFiles
+        Candidates      = $candidates
+        TotalBytes      = $totalBytes
+        SafeBytes       = $safeBytes
+        ReviewBytes     = $reviewBytes
+        RiskyBytes      = $riskyBytes
+        # Три ожидаемые суммы — по одной на каждый реальный план этой фикстуры.
+        # recommended берёт только Safe: потолок по умолчанию safe, а Review
+        # выключен (FR-3, FR-4). everything берёт Safe и Review. --allow-risky
+        # берёт Safe и Risky, но не Review: «показать скрытое по уровню риска»
+        # и «выбрать всё» — разные действия, и второе остаётся за профилем.
+        RecommendedBytes = $safeBytes
+        EverythingBytes  = $safeBytes + $reviewBytes
+        AllowRiskyBytes  = $safeBytes + $riskyBytes
+        ExpectedFiles    = $expectedFiles
     }
 }
 
@@ -594,7 +678,7 @@ Describe 'MrProper: полный цикл (SPEC §11.3, §12)' -Tag 'e2e' {
 
     Context 'шаг 2: план' {
 
-        It 'plan строит dry-run: суммы сходятся, Risky скрыты, план детерминирован' {
+        It 'plan строит dry-run: суммы сходятся, Risky и Review скрыты, план детерминирован' {
             if ($null -eq $script:Cli) { Add-SkippedStep $script:CliMissingReason; return }
 
             $plan = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
@@ -604,8 +688,12 @@ Describe 'MrProper: полный цикл (SPEC §11.3, §12)' -Tag 'e2e' {
             $document = $plan.Out | ConvertFrom-Json
             (Get-RequiredProperty $document 'schema' 'plan') | Should Be 1
             (Get-RequiredProperty $document 'dryRun' 'plan') | Should Be $true
-            # Профиль по умолчанию — recommended, Risky скрыты (§12).
+            # Профиль по умолчанию — recommended с потолком safe: Risky скрыты
+            # (§12) и Review выключен по умолчанию (FR-3, FR-4). Потолок
+            # печатается в самом плане, и именно он объясняет вторую причину
+            # пропуска, а не только первый.
             (Get-RequiredProperty $document 'profile' 'plan') | Should Be 'recommended'
+            (Get-RequiredProperty $document 'options.maxDefaultSafety' 'plan') | Should Be 'safe'
             (Get-RequiredProperty $document 'options.allowRisky' 'plan') | Should Be $false
 
             $operations = ConvertTo-CountArray (Get-RequiredProperty $document 'operations' 'plan')
@@ -614,6 +702,10 @@ Describe 'MrProper: полный цикл (SPEC §11.3, §12)' -Tag 'e2e' {
             $operations.Count | Should Be (Get-RequiredProperty $document 'totals.selected' 'plan')
             $untouched.Count | Should Be ($totalCandidates - $operations.Count)
             (Get-RequiredProperty $document 'totals.hiddenRisky' 'plan') | Should Be 1
+            # Review отфильтрован профилем, и это отдельная причина, отдельная от
+            # скрытого Risky: смешивать их в одной цифре нельзя, иначе теряется
+            # объяснение, почему элемент не выбран.
+            (Get-RequiredProperty $document 'totals.profileFiltered' 'plan') | Should Be 1
 
             # Инвариант §6.3: сумма операций равна объявленному объёму. План, у
             # которого reclaimBytes не сходится с allocatedBytes, удаляет не то.
@@ -625,7 +717,10 @@ Describe 'MrProper: полный цикл (SPEC §11.3, §12)' -Tag 'e2e' {
                 if ($safety -eq 'risky') { $riskyInPlan++ }
             }
             $sum | Should Be (Get-RequiredProperty $document 'totals.selectedBytes' 'plan')
-            $sum | Should Be $script:Fixture.SelectableBytes
+            # Ровно Safe-элемент. recommended не берёт Review, поэтому ожидание
+            # равно safe-сумме фикстуры, а не «всё, кроме Risky»: вторая цифра
+            # проверяла бы поведение, которого SPEC не обещает (FR-3).
+            $sum | Should Be $script:Fixture.RecommendedBytes
             $riskyInPlan | Should Be 0
 
             # Агрегаты по действиям обязаны покрывать каждого кандидата ровно
@@ -649,15 +744,30 @@ Describe 'MrProper: полный цикл (SPEC §11.3, §12)' -Tag 'e2e' {
                 (Get-RequiredProperty $operation 'category' 'plan.operations[]') | Should Not BeNullOrEmpty
                 $confidence = [int] (Get-RequiredProperty $operation 'confidence' 'plan.operations[]')
                 ($confidence -ge 0 -and $confidence -le 100) | Should Be $true
+                # Элемент в operations — это то, что действительно удалится: у него
+                # нет причины пропуска, а действие обязано быть удаляющим (§6.3).
+                # Иначе «операция» может оказаться Keep, и обещание места в плане
+                # окажется неисполнимым.
+                (Get-RequiredProperty $operation 'skipReason' 'plan.operations[]') | Should Be 'none'
+                $action = [string] (Get-RequiredProperty $operation 'action' 'plan.operations[]')
+                ($action -eq 'delete' -or $action -eq 'trash') | Should Be $true
             }
 
-            # Скрытый Risky обязан быть виден в «не трогаем» с причиной, а не исчезнуть.
-            $hiddenReasons = 0
+            # Скрытые уровни обязаны быть видны в «не трогаем» с причиной, а не
+            # исчезнуть. Причина сверяется машинным полем skipReason, а не
+            # подстрокой в тексте reason: текст при reasons переписывают, и
+            # проверка подстроки тогда молча перестаёт что-либо проверять, оставаясь
+            # зелёной. У Review и Risky причины разные, и их нельзя считать одной.
+            $riskyHidden = 0
+            $reviewOff = 0
             foreach ($item in $untouched) {
-                $reason = [string] (Get-RequiredProperty $item 'reason' 'plan.untouched[]')
-                if ($reason -match 'Risky') { $hiddenReasons++ }
+                $skipReason = [string] (Get-RequiredProperty $item 'skipReason' 'plan.untouched[]')
+                (Get-RequiredProperty $item 'reason' 'plan.untouched[]') | Should Not BeNullOrEmpty
+                if ($skipReason -eq 'risky-hidden') { $riskyHidden++ }
+                if ($skipReason -eq 'review-off-by-default') { $reviewOff++ }
             }
-            $hiddenReasons | Should Be 1
+            $riskyHidden | Should Be 1
+            $reviewOff | Should Be 1
 
             # План детерминирован: те же кандидаты — тот же документ. На этом стоят
             # golden-тесты §11.4, и на этом же ловится плавающий порядок обхода.
@@ -667,7 +777,7 @@ Describe 'MrProper: полный цикл (SPEC §11.3, §12)' -Tag 'e2e' {
             $again.Out | Should Be $plan.Out
         }
 
-        It 'plan --allow-risky показывает Risky, скрытый профилем по умолчанию' {
+        It 'plan --allow-risky показывает Risky, но не становится «выбрать всё»' {
             if ($null -eq $script:Cli) { Add-SkippedStep $script:CliMissingReason; return }
 
             $plan = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
@@ -675,6 +785,9 @@ Describe 'MrProper: полный цикл (SPEC §11.3, §12)' -Tag 'e2e' {
             $plan.Exit | Should Be 0
 
             $document = $plan.Out | ConvertFrom-Json
+            # Профиль остаётся тем же: --allow-risky снимает скрытие по уровню
+            # риска и ничего не меняет в отборе по умолчанию.
+            (Get-RequiredProperty $document 'profile' 'plan') | Should Be 'recommended'
             (Get-RequiredProperty $document 'options.allowRisky' 'plan') | Should Be $true
             (Get-RequiredProperty $document 'totals.hiddenRisky' 'plan') | Should Be 0
 
@@ -685,7 +798,87 @@ Describe 'MrProper: полный цикл (SPEC §11.3, §12)' -Tag 'e2e' {
                 $sum += [int64] (Get-RequiredProperty $operation 'bytes' 'plan.operations[]')
             }
             $risky | Should Be 1
-            $sum | Should Be $script:Fixture.TotalBytes
+            # --allow-risky — это «показать скрытое по уровню риска», а не
+            # «выбрать всё»: Review остаётся выключенным по умолчанию (FR-3),
+            # иначе пароли браузера попадали бы в план сразу после скана
+            # (docs/review-02.md F-03). Поэтому в сумму входят Safe и Risky, а не
+            # все три кандидата фикстуры.
+            $sum | Should Be $script:Fixture.AllowRiskyBytes
+
+            $reviewOff = 0
+            foreach ($item in (ConvertTo-CountArray (Get-RequiredProperty $document 'untouched' 'plan'))) {
+                if ([string] (Get-RequiredProperty $item 'skipReason' 'plan.untouched[]') -eq 'review-off-by-default') {
+                    $reviewOff++
+                }
+            }
+            $reviewOff | Should Be 1
+        }
+
+        It 'plan --profile everything — Review берётся явно, Risky всё ещё скрыт' {
+            if ($null -eq $script:Cli) { Add-SkippedStep $script:CliMissingReason; return }
+
+            $plan = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
+                -Arguments @('plan', '--json', '--profile', 'everything', '--candidates', $script:CandidatesPath)
+            $plan.Exit | Should Be 0
+
+            $document = $plan.Out | ConvertFrom-Json
+            (Get-RequiredProperty $document 'profile' 'plan') | Should Be 'everything'
+            # «Выбрать всё» берёт Review (FR-3) — это единственный способ CLI
+            # включить его. Risky при этом остаётся за --allow-risky: даже самый
+            # широкий профиль не отменяет требование подтверждения по уровню
+            # риска (FR-4, §12).
+            (Get-RequiredProperty $document 'totals.hiddenRisky' 'plan') | Should Be 1
+            (Get-RequiredProperty $document 'totals.profileFiltered' 'plan') | Should Be 0
+
+            $risky = 0
+            $sum = [int64] 0
+            foreach ($operation in (ConvertTo-CountArray (Get-RequiredProperty $document 'operations' 'plan'))) {
+                if ([string] (Get-RequiredProperty $operation 'safety' 'plan.operations[]') -eq 'risky') { $risky++ }
+                $sum += [int64] (Get-RequiredProperty $operation 'bytes' 'plan.operations[]')
+            }
+            $risky | Should Be 0
+            $sum | Should Be $script:Fixture.EverythingBytes
+
+            $riskyHidden = 0
+            foreach ($item in (ConvertTo-CountArray (Get-RequiredProperty $document 'untouched' 'plan'))) {
+                if ([string] (Get-RequiredProperty $item 'skipReason' 'plan.untouched[]') -eq 'risky-hidden') {
+                    $riskyHidden++
+                }
+            }
+            $riskyHidden | Should Be 1
+        }
+
+        It 'plan --profile safe-only совпадает с recommended при потолке safe' {
+            if ($null -eq $script:Cli) { Add-SkippedStep $script:CliMissingReason; return }
+
+            # recommended с maxDefaultSafety=safe и safe-only обязаны отбирать одно
+            # и то же. Расхождение означало бы, что у профилей разный смысл, и
+            # тогда документ плана перестаёт объяснять свой выбор — а по §12
+            # именно из него читается, что именно будет удалено.
+            $recommended = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
+                -Arguments @('plan', '--json', '--candidates', $script:CandidatesPath)
+            $safeOnly = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
+                -Arguments @('plan', '--json', '--profile', 'safe-only', '--candidates', $script:CandidatesPath)
+            $recommended.Exit | Should Be 0
+            $safeOnly.Exit | Should Be 0
+
+            $safeOnlyDocument = $safeOnly.Out | ConvertFrom-Json
+            $recommendedDocument = $recommended.Out | ConvertFrom-Json
+            (Get-RequiredProperty $safeOnlyDocument 'profile' 'plan') | Should Be 'safe-only'
+            (Get-PlanFingerprint $safeOnlyDocument) |
+                Should Be (Get-PlanFingerprint $recommendedDocument)
+
+            # Отличие профилей ровно одно, и оно обязательное: Review отсекается с
+            # разными машинными причинами — recommended говорит «выключен по
+            # умолчанию» (FR-3), safe-only «профиль только безопасное». Обе причины
+            # объясняют один и тот же отказ, но свалить их в одну цифру нельзя: по
+            # одной нельзя понять, что именно человек собирался включить.
+            (Get-RequiredProperty $safeOnlyDocument 'totals.profileFiltered' 'plan') | Should Be 1
+            (Get-RequiredProperty $recommendedDocument 'totals.profileFiltered' 'plan') | Should Be 1
+            $safeOnlyReview = (Get-SkipReasonBySafety $safeOnlyDocument 'review')
+            $recommendedReview = (Get-SkipReasonBySafety $recommendedDocument 'review')
+            $safeOnlyReview | Should Be 'profile-filtered'
+            $recommendedReview | Should Be 'review-off-by-default'
         }
     }
 
@@ -712,7 +905,20 @@ Describe 'MrProper: полный цикл (SPEC §11.3, §12)' -Tag 'e2e' {
             $left = Get-TreeFiles $script:FixtureRoot
             $left.Count | Should Be $script:Fixture.ExpectedFiles
             $left.Bytes | Should Be $script:Fixture.TotalBytes
-            ([Math]::Abs($freeAfter - $freeBefore)) | Should BeLessThan $script:FreeSpaceToleranceBytes
+
+            # Свободное место на томе здесь — измерение, а не приговор. Том общий с
+            # соседними прогонами: наблюдалось, как за 1.1 с этого вызова чужой
+            # процесс освободил 5.1 МиБ, тогда как вся песочница сценария — 768 КиБ.
+            # Сравнение |delta| с допуском ловило поэтому чужую активность, а не
+            # своё удаление, и делало зелёный прогон случайным. Приговор «не
+            # удалено ни байта» остаётся точным и стоит выше: файлы и байты
+            # песочницы сверены дословно, а сама команда сообщила executed=false и
+            # execution=null. Само место печатается, чтобы разрыв виден в логе.
+            $freeDelta = $freeAfter - $freeBefore
+            if ([Math]::Abs($freeDelta) -gt $script:FreeSpaceToleranceBytes) {
+                Write-Warning ('соседний процесс сдвинул свободное место на ' + $freeDelta +
+                    ' байт; песочница сверена точно, см. проверки выше')
+            }
         }
 
         It 'apply --execute вместе с --candidates отказано (FR-5)' {
@@ -720,16 +926,41 @@ Describe 'MrProper: полный цикл (SPEC §11.3, §12)' -Tag 'e2e' {
 
             $freeBefore = Get-VolumeFreeBytes $script:SandboxRoot
             # Код 3 = PlanExit::Refused (src/cli/cmd_apply.hpp): список из файла мог
-            # устареть между сканом и очисткой, удалять по нему нельзя.
+            # устареть между сканом и очисткой, удалять по нему нельзя. Отказ не
+            # зависит от того, что попало в план: запрещена сама комбинация ключей,
+            # поэтому пустой план не превращает её в «очистил, но нечего».
             $apply = Invoke-MrProperCli -Cli $script:Cli -LogDirectory $script:SandboxRoot `
                 -Arguments @('apply', '--execute', '--yes', '--json', '--candidates', $script:CandidatesPath)
             $freeAfter = Get-VolumeFreeBytes $script:SandboxRoot
 
             $apply.Exit | Should Be 3
             $apply.Err | Should Match '--candidates'
+
+            # Отказ объяснён и в машинном документе, а не только в stderr: код 0 на
+            # запрещённой комбинации читался бы вызывающим как успех.
+            $document = $apply.Out | ConvertFrom-Json
+            (Get-RequiredProperty $document 'kind' 'apply') | Should Be 'apply'
+            (Get-RequiredProperty $document 'executed' 'apply') | Should Be $false
+            (Get-RequiredProperty $document 'refusal' 'apply') | Should Match '--candidates'
+            (Get-RequiredProperty $document 'execution' 'apply') | Should BeNullOrEmpty
+
             $left = Get-TreeFiles $script:FixtureRoot
             $left.Count | Should Be $script:Fixture.ExpectedFiles
-            ([Math]::Abs($freeAfter - $freeBefore)) | Should BeLessThan $script:FreeSpaceToleranceBytes
+            $left.Bytes | Should Be $script:Fixture.TotalBytes
+
+            # Свободное место на томе здесь — измерение, а не приговор. Том общий с
+            # соседними прогонами: наблюдалось, как за 1.1 с этого вызова чужой
+            # процесс освободил 5.1 МиБ, тогда как вся песочница сценария — 768 КиБ.
+            # Сравнение |delta| с допуском ловило поэтому чужую активность, а не
+            # своё удаление, и делало зелёный прогон случайным. Приговор «не
+            # удалено ни байта» остаётся точным и стоит выше: файлы и байты
+            # песочницы сверены дословно, а сама команда сообщила executed=false и
+            # execution=null. Само место печатается, чтобы разрыв виден в логе.
+            $freeDelta = $freeAfter - $freeBefore
+            if ([Math]::Abs($freeDelta) -gt $script:FreeSpaceToleranceBytes) {
+                Write-Warning ('соседний процесс сдвинул свободное место на ' + $freeDelta +
+                    ' байт; песочница сверена точно, см. проверки выше')
+            }
         }
 
         It 'apply --execute освобождает место, и freedBytes сходится с томом' {

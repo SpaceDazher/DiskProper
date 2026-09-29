@@ -41,6 +41,7 @@
 #include "json.hpp"
 #include "model.hpp"
 #include "plan.hpp"
+#include "report_json.hpp"
 
 using mrproper::json::Value;
 using namespace mrproper::core;
@@ -1269,5 +1270,238 @@ TEST(plan_jsonCarriesEvidenceForEveryOperation) {
     const Value snapshotDoc = mrproper::json::parse(snapshotToJson(makeSnapshot(list, plan, context)));
     for (const Value& op : snapshotDoc.require("operations").items()) {
         CHECK(op.require("reason").asString().find("тестовый кандидат") != std::string::npos);
+    }
+}
+
+// =====================================================================
+// G1: манифест доходит до плана, до JSON и до отказа по умолчанию
+// =====================================================================
+//
+// Волна F3 ввела манифест разрешённого к удалению, но не протянула его до
+// потребителей: buildPlan без манифеста справедливо fail-closed даёт 0 операций
+// и needs-enumeration у каждого кандидата, а CLI и UI манифест не передавали вовсе.
+// Утилита получалась честной и бесполезной («ничего не удаляю, но и почистить
+// не могу»). Проверка ниже закрывает оба края этого перехода:
+//
+//   * с манифестом план даёт операции, и операция несёт СПИСОК (allowedPaths /
+//     allowedCount), а не только путь корня — это то, что исполнитель удаляет;
+//   * без манифеста план не выбирает ничего, и у каждого элемента есть причина
+//     пропуска: тишина здесь означала бы «мы не проверяли», а не «нельзя».
+//
+// Набор — тот же, что у остальных проверок файла: три уровня риска, из них
+// Review по умолчанию выключен (docs/review-02.md F-03), Risky скрыт, Safe берётся.
+
+namespace {
+
+// Манифест «правило что-то отсекло»: два пути из четырёх, корнем сносить нельзя.
+CandidateManifest listManifest(std::size_t index, const CleanupCandidate& candidate) {
+    CandidateManifest manifest;
+    manifest.candidateIndex = index;
+    manifest.ruleId = candidate.ruleId;
+    manifest.rootPath = candidate.path;
+    manifest.rootDeleteAllowed = false;
+    manifest.allowed = CandidateManifest::makeAllowedSet({
+        AllowedEntry{candidate.path + "/old-1.bin", 400},
+        AllowedEntry{candidate.path + "/sub/old-2.bin", 600},
+    });
+    return manifest;
+}
+
+std::vector<CleanupCandidate> g1Candidates() {
+    std::vector<CleanupCandidate> list;
+    list.push_back(candidate("temp", SafetyLevel::Safe, 90, 1000));
+    list.push_back(candidate("logs", SafetyLevel::Review, 80, 5000));
+    list.push_back(candidate("other", SafetyLevel::Risky, 95, 9000));
+    return list;
+}
+
+}  // namespace
+
+TEST(plan_manifestProducesOperationsWithoutItFailsClosed) {
+    const std::vector<CleanupCandidate> list = g1Candidates();
+    std::vector<CandidateManifest> manifests;
+    manifests.reserve(list.size());
+    for (std::size_t i = 0; i < list.size(); ++i) manifests.push_back(listManifest(i, list[i]));
+
+    // 1. С манифестом: операция есть, и она несёт список того, что удалит.
+    //    Сумма списка обязана сойтись с allocatedBytes кандидата — иначе
+    //    validatePlan отвергает план, и обещание «освободится N» не опиралось
+    //    бы ни на что (docs/review-02.md F-01).
+    const CleanupPlan plan = buildPlan(list, PlanOptions{}, &manifests);
+    CHECK_EQ(plan.operationCount(), std::size_t{1});
+    CHECK_EQ(plan.totals.selectedCount, std::size_t{1});
+    CHECK_EQ(plan.totals.selectedBytes, kSmall);
+    CHECK(validatePlan(list, plan).empty());
+
+    const DryRunReport report = makeDryRunReport(list, plan);
+    CHECK_EQ(report.operations.size(), std::size_t{1});
+    const PlanOperation& op = report.operations.front();
+    CHECK_EQ(op.candidateIndex, std::size_t{0});
+    CHECK(!op.rootDeleteOnly);
+    CHECK_EQ(op.allowedCount, std::size_t{2});
+    CHECK_EQ(op.allowedPaths.size(), std::size_t{2});
+    CHECK_EQ(op.allowedPaths[0], list[0].path + "/old-1.bin");
+    CHECK_EQ(op.bytes, kSmall);
+
+    // JSON плана — то, что читает CLI и человек перед удалением: список виден и
+    // там, иначе подтверждение относится к пути корня, а не к операции.
+    const Value doc = mrproper::json::parse(planToJson(list, plan));
+    const Value* operations = doc.find("operations");
+    CHECK(operations != nullptr);
+    if (operations != nullptr) {
+        CHECK_EQ(operations->items().size(), std::size_t{1});
+        const Value& first = operations->items().front();
+        CHECK_EQ(first.require("rootDeleteOnly").asBool(), false);
+        CHECK_EQ(first.require("allowedCount").asNumber(), 2.0);
+        CHECK_EQ(first.require("allowedPaths").items().size(), std::size_t{2});
+    }
+
+    // 2. Без манифеста — fail-closed: ни одной операции, и у КАЖДОГО элемента
+    //    есть причина пропуска. Молчаливый Keep читался бы как «мы всё
+    //    рассмотрели и решили оставить».
+    const CleanupPlan blocked = buildPlan(list, PlanOptions{});
+    CHECK_EQ(blocked.operationCount(), std::size_t{0});
+    CHECK_EQ(blocked.totals.selectedCount, std::size_t{0});
+    CHECK_EQ(blocked.totals.selectedBytes, std::uint64_t{0});
+    CHECK(validatePlan(list, blocked).empty());  // план согласован, просто пуст
+    const DryRunReport blockedReport = makeDryRunReport(list, blocked);
+    CHECK_EQ(blockedReport.operations.size(), std::size_t{0});
+    CHECK_EQ(blockedReport.untouched.size(), list.size());
+    for (const PlanOperation& item : blockedReport.untouched) {
+        CHECK(item.action == PlanAction::Keep);
+        CHECK(!item.reason.empty());
+        CHECK_EQ(item.bytes, std::uint64_t{0});
+    }
+    // Safe и Review без списка отсекаются одинаково: «список не получен»
+    // проверяется раньше профиля, иначе причиной отказа был бы уровень, а не
+    // отсутствие права удалять. Risky отсекается ещё раньше — он скрыт.
+    CHECK_EQ(blockedReport.untouched.size(), list.size());
+    CHECK(blockedReport.untouched[0].skip == SkipReason::NeedsEnumeration);
+    CHECK(blockedReport.untouched[1].skip == SkipReason::NeedsEnumeration);
+    CHECK(blockedReport.untouched[2].skip == SkipReason::RiskyHidden);
+    for (const CleanupPlanItem& item : blocked.items) {
+        CHECK_EQ(item.reclaimBytes, std::uint64_t{0});
+    }
+    // needs-enumeration — запрет, который не снимается ни профилем, ни
+    // подтверждением: ручная галочка человека его не преодолевает.
+    CHECK(isRuleBlock(SkipReason::NeedsEnumeration));
+    for (const PlanOptions& options : {testOptions(), riskyAllowed()}) {
+        PlanOptions everything = options;
+        everything.profile = SelectionProfile::Everything;
+        everything.allowRisky = true;
+        CHECK_EQ(buildPlan(list, everything).operationCount(), std::size_t{0});
+    }
+
+    // 3. Неполный список — тоже не удаляемый, и это должен видеть validatePlan,
+    //    если бы план вдруг выбрал такой элемент: «список неполон» и «снести
+    //    всё» несовместимы.
+    std::vector<CandidateManifest> truncated = manifests;
+    truncated[0].allowed = CandidateManifest::makeAllowedSet({AllowedEntry{list[0].path + "/old-1.bin", 1000}}, false, 3);
+    const CleanupPlan partial = buildPlan(list, PlanOptions{}, &truncated);
+    CHECK_EQ(partial.operationCount(), std::size_t{0});
+    CHECK_EQ(makeDryRunReport(list, partial).untouched[0].skip, SkipReason::NeedsEnumeration);
+    CHECK(partial.manifests.size() == manifests.size());
+    CHECK(partial.manifestFor(0) != nullptr);
+    CHECK(!partial.manifestFor(0)->deletable());
+    CHECK(!partial.manifestFor(0)->blockReason().empty());
+    CHECK(partial.manifestFor(3) == nullptr);
+
+    // 4. Список в плане — тот же объект, что отдал сборщик: списки файлов
+    //    разделяются указателем, и исполнитель получает из плана и решение, и
+    //    перечень того, что удалять.
+    const CandidateManifest* inPlan = plan.manifestFor(0);
+    CHECK(inPlan != nullptr);
+    if (inPlan != nullptr) {
+        CHECK(inPlan->allowed != nullptr);
+        CHECK_EQ(inPlan->allowed->entries.size(), std::size_t{2});
+        CHECK(inPlan->allowed.get() == manifests[0].allowed.get());
+        CHECK_EQ(inPlan->allowed->bytes, std::uint64_t{1000});
+    }
+}
+
+// =====================================================================
+// G1: манифест переживает отчёт и читается обратно тем же ключом
+// =====================================================================
+//
+// `plan --candidates f.json` получает список разрешённого из файла. Записать его
+// должен отчёт скана (core::report_json пишет ключ «manifest» в секцию
+// кандидата), а прочитать — cmd_apply::parseManifest. Писатель и читатель живут
+// в разных слоях и в разных наборах тестов, поэтому расхождение в названиях
+// ключей проскочило бы незамеченным: отчёт вышел бы «с манифестом», а план —
+// снова пустой. Проверка ниже фиксирует форму документа, которую читает CLI.
+//
+// Отдельная важная деталь: обрезанный список (длиннее kMaxReportManifestPaths)
+// помечается неполным, и читатель обязан трактовать его как запрет на удаление.
+// Молчаливый «начало списка» — это ровно тот обход, который манифест и закрывал.
+
+TEST(plan_manifestSurvivesReportJsonForTheCli) {
+    Report report;
+    report.kind = ReportKind::Scan;
+    const std::vector<CleanupCandidate> list = g1Candidates();
+    report.candidates = list;
+    // Кандидат 0 — по списку (правило что-то отсекло), кандидат 1 — корень
+    // целиком (правило ничего не отсекло), кандидата 2 манифеста нет вовсе.
+    report.manifests.push_back(listManifest(0, list[0]));
+    CandidateManifest rootWide;
+    rootWide.candidateIndex = 1;
+    rootWide.ruleId = list[1].ruleId;
+    rootWide.rootPath = list[1].path;
+    rootWide.rootDeleteAllowed = true;
+    report.manifests.push_back(rootWide);
+
+    const Value doc = mrproper::json::parse(reportToJson(report, 2));
+    const Value& candidates = doc.require("candidates");
+    CHECK_EQ(candidates.items().size(), std::size_t{3});
+
+    const Value& first = candidates.items().at(0);
+    const Value* manifest = first.find("manifest");  // ключ, который читает cmd_apply
+    CHECK(manifest != nullptr);
+    if (manifest != nullptr) {
+        CHECK_EQ(manifest->require("rootDelete").asBool(), false);
+        CHECK_EQ(manifest->require("allowedComplete").asBool(), true);
+        CHECK_EQ(manifest->require("allowedCount").asNumber(), 2.0);
+        CHECK_EQ(manifest->require("allowedBytes").asNumber(), 1000.0);
+        CHECK_EQ(manifest->require("minFileBytes").asNumber(), 0.0);
+        const Value& paths = manifest->require("allowedPaths");
+        CHECK_EQ(paths.items().size(), std::size_t{2});
+        // Список — пары {path, bytes}: по одним путям сумма не сойдётся с
+        // allocatedBytes кандидата, и validatePlan отвергнет план.
+        CHECK_EQ(paths.items().at(0).require("path").asString(), list[0].path + "/old-1.bin");
+        CHECK_EQ(paths.items().at(0).require("bytes").asNumber(), 400.0);
+        CHECK_EQ(paths.items().at(1).require("bytes").asNumber(), 600.0);
+    }
+    const Value* rootManifest = candidates.items().at(1).find("manifest");
+    CHECK(rootManifest != nullptr);
+    if (rootManifest != nullptr) {
+        CHECK_EQ(rootManifest->require("rootDelete").asBool(), true);
+        CHECK_EQ(rootManifest->require("allowedPaths").items().size(), std::size_t{0});
+    }
+    // У кандидата без манифеста ключа нет вовсе: пустой объект читался бы как
+    // «список пуст, а значит удалять нечего» — это другое утверждение.
+    CHECK(candidates.items().at(2).find("manifest") == nullptr);
+    CHECK(validateReport(report).empty());
+
+    // Обрезанный список честно помечается неполным: восстановленный из отчёта
+    // манифест не должен давать права удалять начало перечисления.
+    Report wide;
+    wide.kind = ReportKind::Scan;
+    wide.candidates = {list[0]};
+    CandidateManifest huge;
+    huge.candidateIndex = 0;
+    huge.ruleId = list[0].ruleId;
+    huge.rootPath = list[0].path;
+    std::vector<AllowedEntry> entries;
+    for (std::size_t i = 0; i < kMaxReportManifestPaths + 10; ++i) {
+        entries.push_back(AllowedEntry{list[0].path + "/file" + std::to_string(i) + ".bin", 1});
+    }
+    huge.allowed = CandidateManifest::makeAllowedSet(entries);
+    wide.manifests.push_back(huge);
+    const Value wideDoc = mrproper::json::parse(reportToJson(wide, 2));
+    const Value* wideManifest = wideDoc.require("candidates").items().at(0).find("manifest");
+    CHECK(wideManifest != nullptr);
+    if (wideManifest != nullptr) {
+        CHECK_EQ(wideManifest->require("allowedComplete").asBool(), false);
+        CHECK_EQ(wideManifest->require("allowedPaths").items().size(), kMaxReportManifestPaths);
+        CHECK_EQ(wideManifest->require("allowedOmitted").asNumber(), 10.0);
     }
 }

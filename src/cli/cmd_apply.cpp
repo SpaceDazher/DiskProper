@@ -303,6 +303,184 @@ bool parseCandidate(const mrproper::json::Value& item, core::CleanupCandidate& o
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Манифест разрешённого к удалению (docs/review-02.md F-01)
+// ---------------------------------------------------------------------------
+//
+// Список того, что правило оставило кандидату, — половина отбора: без него
+// buildPlan справедливо не выбирает ничего, и утилита не чистит вовсе (план с
+// нулем операций и skipReason=needs-enumeration у каждого). Отсюда два пути:
+//
+//   1. Манифест пришёл в файле (его пишет core::report_json в секцию кандидата
+//      того же скана). Он и есть список: перечисление не нужно, ничего не
+//      измеряется, ничего не додумывается.
+//   2. Манифеста в файле нет (рукописный дамп, старый отчёт, чужой генератор).
+//      Тогда список восстанавливает сам CLI: он перечисляет корень кандидата и
+//      берёт этот перечень ТОЛЬКО если он совпадает с тем, что кандидат
+//      объявляет (число файлов). Совпадение означает, что правило ничего не
+//      оставило внутри, и весь перечень — разрешённое. Расхождение означает
+//      либо устаревший файл, либо то, что правило что-то отсекло, — и тогда
+//      список неизвестен: элемент остаётся в плане как «не трогаем» с причиной
+//      (needs-enumeration), а не с выдуманным перечнем.
+//
+// Оговорка о честности: перечисление измеряет логические размеры, а модель
+// ждёт аллоцированные (с округлением на кластер). Поэтому при восстановлении
+// манифеста кандидату проставляются измеренные числа, а в его reasons добавляется
+// строка о том, что объём пересчитан CLI. Обещание от этого получается меньше
+// фактического освобождения, а не больше: недобор безопаснее, чем перебор.
+
+constexpr std::size_t kMaxEnumeratedPaths = 200000;  // столько же, сколько держит сборщик
+constexpr std::size_t kMaxEnumerationDepth = 64;     // junction-петля (FR-6) не должна увести обход
+
+std::string pathToUtf8(const std::filesystem::path& path) {
+    const std::u8string text = path.u8string();
+    return std::string(reinterpret_cast<const char*>(text.data()), text.size());
+}
+
+std::filesystem::path pathFromUtf8(std::string_view text) {
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(text.data()), text.size()));
+}
+
+struct RootEnumeration {
+    std::vector<core::AllowedEntry> entries;
+    bool complete{true};
+    std::string note;  // причина, если перечисление не вышло
+};
+
+// Перечисление корня кандидата: все обычные файлы, ссылки не раскрываются
+// (FR-6), глубина и число элементов ограничены.
+RootEnumeration enumerateRoot(std::string_view rootUtf8) {
+    RootEnumeration result;
+    const std::filesystem::path root = pathFromUtf8(rootUtf8);
+    std::error_code ec;
+    const std::filesystem::file_status status = std::filesystem::symlink_status(root, ec);
+    if (ec || !std::filesystem::exists(status)) {
+        result.complete = false;
+        result.note = "корень кандидата не открывается: " + std::string(rootUtf8);
+        return result;
+    }
+    if (!std::filesystem::is_directory(status)) {
+        // Кандидат-файл: правило «MEMORY.DMP» и подобные. Список из одного пути.
+        std::error_code sizeEc;
+        const std::uintmax_t size = std::filesystem::file_size(root, sizeEc);
+        result.entries.push_back(core::AllowedEntry{pathToUtf8(root), static_cast<std::uint64_t>(size)});
+        return result;
+    }
+
+    std::vector<std::pair<std::filesystem::path, std::size_t>> stack;
+    stack.emplace_back(root, 0);
+    while (!stack.empty()) {
+        const auto [directory, depth] = stack.back();
+        stack.pop_back();
+        std::error_code itEc;
+        std::filesystem::directory_iterator it(directory, std::filesystem::directory_options::none, itEc);
+        if (itEc) {
+            result.complete = false;
+            result.note = "каталог не перечислен: " + pathToUtf8(directory);
+            return result;
+        }
+        const std::filesystem::directory_iterator end;
+        while (it != end) {
+            // Всё читается до increment: после шага итератор указывает уже на
+            // следующий элемент, и обращение к нему читало бы чужой путь.
+            const std::filesystem::directory_entry& entry = *it;
+            const std::filesystem::path entryPath = entry.path();
+            std::error_code kindEc;
+            const bool isLink = entry.is_symlink(kindEc);
+            const bool isDir = !isLink && entry.is_directory(kindEc);
+            const bool isFile = !isLink && entry.is_regular_file(kindEc);
+            std::uint64_t size = 0;
+            if (isFile) {
+                std::error_code sizeEc;
+                size = static_cast<std::uint64_t>(entry.file_size(sizeEc));
+            }
+            std::error_code stepEc;
+            it.increment(stepEc);
+            if (stepEc) {
+                result.complete = false;
+                result.note = "перечисление прервано: " + pathToUtf8(directory);
+                return result;
+            }
+            if (isLink) continue;  // FR-6: ссылку не раскрываем
+            if (isFile) {
+                if (result.entries.size() >= kMaxEnumeratedPaths) {
+                    result.complete = false;
+                    result.note = "в корне больше " + std::to_string(kMaxEnumeratedPaths) + " файлов: перечень неполон";
+                    return result;
+                }
+                // Размер, который прочитать нельзя (нет прав на атрибуты), — это
+                // ноль, а не выдуманное число: кандидату тогда обещается меньше,
+                // и в reasons попадает строка о неполном объёме.
+                result.entries.push_back(core::AllowedEntry{pathToUtf8(entryPath), size});
+            } else if (isDir) {
+                if (depth + 1 >= kMaxEnumerationDepth) {
+                    result.complete = false;
+                    result.note = "глубина вложенности больше " + std::to_string(kMaxEnumerationDepth) +
+                                  ": перечень неполон (junction-петля?)";
+                    return result;
+                }
+                stack.emplace_back(entryPath, depth + 1);
+            }
+        }
+    }
+    return result;
+}
+
+// Манифест из секции кандидата (core::report_json пишет ключ «manifest»).
+// Отсутствие ключа — не ошибка: файл мог быть собран без него. Возвращает
+// false и пустой out, если манифеста в элементе нет.
+bool parseManifest(const mrproper::json::Value& item, std::size_t candidateIndex, core::CandidateManifest& out,
+                   std::string& error) {
+    const mrproper::json::Value* node = item.find("manifest");
+    if (node == nullptr) return false;
+    if (!node->isObject()) {
+        error = "ключ \"manifest\" не объект";
+        return false;
+    }
+    core::CandidateManifest manifest;
+    manifest.candidateIndex = candidateIndex;
+    manifest.ruleId = readString(*node, "ruleId");
+    manifest.rootPath = readString(*node, "rootPath");
+    manifest.rootDeleteAllowed = readBool(*node, "rootDelete");
+    manifest.estimateOnly = readBool(*node, "estimateOnly");
+    manifest.userData = readBool(*node, "userData");
+    if (const std::optional<std::uint64_t> value = readUint(*node, "minFileBytes")) {
+        manifest.minFileBytes = *value;
+    }
+    if (manifest.rootPath.empty()) manifest.rootPath = readString(item, "path");
+
+    if (!manifest.rootDeleteAllowed) {
+        std::vector<core::AllowedEntry> entries;
+        const mrproper::json::Value* paths = node->find("allowedPaths");
+        if (paths != nullptr && paths->isArray()) {
+            entries.reserve(paths->items().size());
+            for (const mrproper::json::Value& entry : paths->items()) {
+                std::string path;
+                std::uint64_t bytes = 0;
+                if (entry.isString()) {
+                    path = entry.asString();  // список без размеров: сумма не сойдётся с кандидатом
+                } else if (entry.isObject()) {
+                    path = readString(entry, "path");
+                    if (const std::optional<std::uint64_t> value = readUint(entry, "bytes")) bytes = *value;
+                }
+                if (trim(path).empty()) {
+                    error = "в списке разрешённого путь пуст";
+                    return false;
+                }
+                entries.push_back(core::AllowedEntry{path, bytes});
+            }
+        }
+        // complete=false означает «список неполон», а CandidateManifest::deletable
+        // на таком списке возвращает false: элемент останется неудаляемым, и
+        // это правильный исход для обрезанного отчёта.
+        const bool complete = readBool(*node, "allowedComplete");
+        const std::size_t omitted = readUint(*node, "allowedOmitted").value_or(0);
+        manifest.allowed = core::CandidateManifest::makeAllowedSet(std::move(entries), complete, omitted);
+    }
+    out = std::move(manifest);
+    return true;
+}
+
 mrproper::json::Value embedJson(const std::string& text, const char* what) {
     // Встраиваем документ, который построили сами (core::planToJson и
     // core::snapshotToJson), а не собираем ключи заново: так схема
@@ -395,6 +573,65 @@ std::string applyJson(bool executed, bool confirmed, const std::string& refusal,
 // Сборка плана
 // ---------------------------------------------------------------------------
 
+// Восстановление манифеста перечислением корня (docs/review-02.md F-01).
+//
+// Возвращает true, если манифест построен и кандидату можно доверять измеренные
+// числа; false — если перечень неизвестен, и тогда элемент остаётся в плане без
+// операции с причиной needs-enumeration. Причина пишется в note: по ней видно,
+// чего именно не хватило — «файл устарел» и «правило оставило часть файлов»
+// требуют от человека разных действий.
+bool synthesizeManifest(core::CleanupCandidate& candidate, core::CandidateManifest& out, std::string& note) {
+    if (candidate.path.empty()) return false;
+    const RootEnumeration enumeration = enumerateRoot(candidate.path);
+    if (!enumeration.complete) {
+        note = candidate.displayName + ": " + enumeration.note;
+        return false;
+    }
+    if (enumeration.entries.empty()) {
+        note = candidate.displayName + ": в корне нет файлов — удалять нечего";
+        return false;
+    }
+    // Сколько файлов кандидат объявляет. Ноль означает «счётчик не заполнен», и
+    // тогда сверять не с чем: доверяем только тому, что перечисление закончилось.
+    if (candidate.fileCount != 0 &&
+        static_cast<std::uint64_t>(candidate.fileCount) != enumeration.entries.size()) {
+        note = candidate.displayName + ": в файле нет манифеста, а в корне " +
+               std::to_string(enumeration.entries.size()) + " файлов при " + std::to_string(candidate.fileCount) +
+               " в кандидате — правило что-то оставило, какой перечень удалять, из файла не известно; "
+               "нужен отчёт скана вместе с манифестом или повторный скан";
+        return false;
+    }
+
+    std::uint64_t bytes = 0;
+    for (const core::AllowedEntry& entry : enumeration.entries) bytes += entry.allocatedBytes;
+
+    core::CandidateManifest manifest;
+    manifest.candidateIndex = 0;  // индекс проставляет вызывающий
+    manifest.ruleId = candidate.ruleId;
+    manifest.rootPath = candidate.path;
+    manifest.userData = core::isUserDataCategory(candidate.category);
+    // Оценка «только оценка» из файла не восстанавливается: такого поля в дампе
+    // нет. Правило, объявленное оценкой, таким способом к удалению не придёт
+    // (нужен настоящий скан), а не наоборот.
+    manifest.allowed = core::CandidateManifest::makeAllowedSet(enumeration.entries);
+
+    // Объём кандидата приводится к измеренному: обещание «освободится N» должно
+    // опираться на то, что лежит на диске сейчас, а логический размер и
+    // аллоцированный (с округлением на кластер) — не одно и то же число.
+    std::string noteText = "объём пересчитан CLI по файлам на диске";
+    if (candidate.allocatedBytes != bytes) {
+        noteText += " (в файле было " + std::to_string(candidate.allocatedBytes) + " байт, измерено " +
+                    std::to_string(bytes) + ")";
+    }
+    candidate.logicalBytes = bytes;
+    candidate.allocatedBytes = bytes;
+    candidate.fileCount = static_cast<std::uint32_t>(enumeration.entries.size());
+    candidate.reasons.push_back(noteText + ": план обещает меньше, чем освободится по-настоящему");
+
+    out = std::move(manifest);
+    return true;
+}
+
 std::vector<core::CleanupCandidate> filterByCategory(const std::vector<core::CleanupCandidate>& candidates,
                                                       const std::vector<std::string>& categories) {
     if (categories.empty()) return candidates;
@@ -436,9 +673,10 @@ PlanExit prepareRun(const ApplyOptions& options, const ApplyIo& io, const ApplyE
     out = ApplyReport{};
 
     std::vector<core::CleanupCandidate> candidates;
+    std::vector<core::CandidateManifest> manifests;
     if (options.candidatesPath.has_value()) {
         std::string error;
-        if (!loadCandidatesFile(*options.candidatesPath, candidates, error)) {
+        if (!loadCandidatesFile(*options.candidatesPath, candidates, manifests, error)) {
             io.err << "MrProper: " << error << "\n";
             core::logError("plan.candidates", "не прочитан список кандидатов",
                            core::LogFields{core::logField("file", *options.candidatesPath),
@@ -460,7 +698,26 @@ PlanExit prepareRun(const ApplyOptions& options, const ApplyIo& io, const ApplyE
 
     if (!options.categories.empty()) {
         const std::size_t before = candidates.size();
+        // Фильтр меняет индексы, а манифест привязан к индексу кандидата:
+        // без переноса список разрешённого достался бы не тому элементу, и
+        // plan --category удалял бы не то (F-01).
+        const std::vector<core::CleanupCandidate> all = candidates;
+        const std::vector<core::CandidateManifest> allManifests = manifests;
         candidates = filterByCategory(candidates, options.categories);
+        // Соответствие «было → стало» строим по правилу (путь кандидата), а не
+        // по номеру: после фильтра индексы сдвинуты, а путь остаётся тем же.
+        std::vector<core::CandidateManifest> filtered;
+        for (std::size_t newIndex = 0; newIndex < candidates.size(); ++newIndex) {
+            for (const core::CandidateManifest& manifest : allManifests) {
+                if (manifest.candidateIndex >= all.size()) continue;
+                if (all[manifest.candidateIndex].path != candidates[newIndex].path) continue;
+                core::CandidateManifest moved = manifest;
+                moved.candidateIndex = newIndex;
+                filtered.push_back(std::move(moved));
+                break;
+            }
+        }
+        manifests = std::move(filtered);
         if (candidates.size() != before) {
             io.err << "MrProper: фильтр по категориям оставил " << core::formatCount(candidates.size()) << " из "
                    << core::formatCount(before) << "\n";
@@ -468,11 +725,18 @@ PlanExit prepareRun(const ApplyOptions& options, const ApplyIo& io, const ApplyE
     }
 
     core::PlanOptions planOptions = options.plan;
+    // Review по умолчанию не берётся (SPEC §4 FR-3, FR-4; docs/review-02.md
+    // F-03): пароли браузера, prefetch и доставка не должны попадать в план
+    // сами. Включается либо профилем «выбрать всё», либо явным ключом — в CLI
+    // это то же самое, что галочка на экране «Очистка».
+    if (options.includeReview && planOptions.maxDefaultSafety < core::SafetyLevel::Review) {
+        planOptions.maxDefaultSafety = core::SafetyLevel::Review;
+    }
     // FR-5: dry-run обязателен и включается по умолчанию. Флаг --execute — это
     // единственный способ его выключить, и он ничего не добавляет к «сначала
     // показать»: список операций печатается в обоих случаях.
     planOptions.dryRun = !options.execute;
-    out.plan = core::buildPlan(candidates, planOptions);
+    out.plan = core::buildPlan(candidates, planOptions, manifests.empty() ? nullptr : &manifests);
 
     // Инварианты §6.3 проверяются до показа и тем более до удаления: план, в
     // котором reclaimBytes не сходится с allocatedBytes, удаляет не то.
@@ -487,6 +751,7 @@ PlanExit prepareRun(const ApplyOptions& options, const ApplyIo& io, const ApplyE
     }
 
     out.candidates = std::move(candidates);
+    out.manifests = std::move(manifests);
     out.dryRun = core::makeDryRunReport(out.candidates, out.plan);
 
     core::PlanSnapshotContext context;
@@ -747,6 +1012,12 @@ std::optional<ApplyOptions> parseApplyOptions(const std::vector<std::string>& ar
             options.plan.allowRisky = true;
             continue;
         }
+        if (arg == "--include-review") {
+            // Явное «да» на уровень Review: в CLI это то же, что галочка в
+            // настройках экрана «Очистка» (docs/review-02.md F-03).
+            options.includeReview = true;
+            continue;
+        }
         if (arg == "--profile") {
             std::string value;
             if (!takeValue(value)) return std::nullopt;
@@ -845,6 +1116,7 @@ const char* planUsage() {
            "  --profile <имя>                 safe-only | recommended (по умолчанию) | everything\n"
            "  --confidence-threshold <0..100> порог уверенности кандидата (по умолчанию 50)\n"
            "  --allow-risky                   показать и выбрать Risky (по умолчанию скрыты, §12)\n"
+           "  --include-review                брать и уровень Review (по умолчанию только Safe, FR-3)\n"
            "  --no-trash                      всё прямым удалением, минуя корзину приложения\n"
            "  --min-reclaim <размер>          не брать кандидатов меньше размера (1024 в k/m/g)\n"
            "  --trash-direct-delete-above <размер>\n"
@@ -868,6 +1140,7 @@ const char* applyUsage() {
            "  --profile <имя>                 safe-only | recommended (по умолчанию) | everything\n"
            "  --confidence-threshold <0..100> порог уверенности кандидата (по умолчанию 50)\n"
            "  --allow-risky                   разрешить Risky; подтверждение станет DELETE-RISKY\n"
+           "  --include-review                брать и уровень Review (по умолчанию только Safe, FR-3)\n"
            "  --no-trash                      всё прямым удалением, минуя корзину приложения\n"
            "  --min-reclaim <размер>          не брать кандидатов меньше размера (1024 в k/m/g)\n"
            "  --trash-direct-delete-above <размер>\n"
@@ -888,9 +1161,45 @@ const char* applyUsage() {
 // Кандидаты из JSON
 // ---------------------------------------------------------------------------
 
+// Внутренний разбор с причинами восстановления манифеста: наружу они идут
+// через reasons кандидата, а наружу (в stderr) — вызывающая команда.
+bool parseCandidatesJsonImpl(std::string_view text, std::vector<core::CleanupCandidate>& candidates,
+                             std::vector<core::CandidateManifest>& manifests, std::vector<std::string>& notes,
+                             std::string& error);
+
 std::vector<core::CleanupCandidate> parseCandidatesJson(std::string_view text, std::string& error) {
-    error.clear();
     std::vector<core::CleanupCandidate> candidates;
+    std::vector<core::CandidateManifest> manifests;
+    std::string parseError;
+    (void)parseCandidatesJson(text, candidates, manifests, parseError);
+    if (!parseError.empty()) {
+        error = parseError;
+        candidates.clear();
+    }
+    return candidates;
+}
+
+bool parseCandidatesJson(std::string_view text, std::vector<core::CleanupCandidate>& candidates,
+                         std::vector<core::CandidateManifest>& manifests, std::string& error) {
+    std::vector<std::string> notes;
+    const bool ok = parseCandidatesJsonImpl(text, candidates, manifests, notes, error);
+    if (!ok) {
+        candidates.clear();
+        manifests.clear();
+    }
+    return ok;
+}
+
+// notes — человекочитаемые причины, по которым у элементов не оказалось
+// манифеста. Они же дописываются в reasons кандидата: причина обязана быть
+// видна в dry-run и в JSON плана, а не только в stderr.
+bool parseCandidatesJsonImpl(std::string_view text, std::vector<core::CleanupCandidate>& candidates,
+                             std::vector<core::CandidateManifest>& manifests, std::vector<std::string>& notes,
+                             std::string& error) {
+    error.clear();
+    candidates.clear();
+    manifests.clear();
+    notes.clear();
 
     std::string_view body = text;
     if (body.size() >= 3 && static_cast<unsigned char>(body[0]) == 0xEFu && static_cast<unsigned char>(body[1]) == 0xBBu &&
@@ -899,7 +1208,7 @@ std::vector<core::CleanupCandidate> parseCandidatesJson(std::string_view text, s
     }
     if (trim(std::string(body)).empty()) {
         error = "пустой документ";
-        return candidates;
+        return false;
     }
 
     mrproper::json::Value root;
@@ -907,7 +1216,7 @@ std::vector<core::CleanupCandidate> parseCandidatesJson(std::string_view text, s
         root = mrproper::json::parse(body);
     } catch (const mrproper::json::ParseError& exception) {
         error = std::string("не разобрался JSON: ") + exception.what();
-        return candidates;
+        return false;
     }
 
     const mrproper::json::Value* array = nullptr;
@@ -917,15 +1226,15 @@ std::vector<core::CleanupCandidate> parseCandidatesJson(std::string_view text, s
         array = root.find("candidates");
         if (array == nullptr) {
             error = "в объекте нет раздела \"candidates\" (ожидался отчёт core::report_json или массив кандидатов)";
-            return candidates;
+            return false;
         }
     } else {
         error = "ожидался объект с разделом \"candidates\" или массив кандидатов";
-        return candidates;
+        return false;
     }
     if (!array->isArray()) {
         error = "раздел \"candidates\" не массив";
-        return candidates;
+        return false;
     }
 
     candidates.reserve(array->items().size());
@@ -935,15 +1244,47 @@ std::vector<core::CleanupCandidate> parseCandidatesJson(std::string_view text, s
         if (!parseCandidate(array->items()[i], candidate, itemError)) {
             error = "кандидат " + std::to_string(i) + ": " + itemError;
             candidates.clear();
-            return candidates;
+            return false;
+        }
+        // Манифест — вторая половина отбора (F-01). Он либо пришёл в файле
+        // (тогда он и есть список), либо его нет и список восстанавливается
+        // перечислением корня; и в том и в другом случае элемент без списка
+        // остаётся в плане с причиной needs-enumeration, а не выкидывается.
+        core::CandidateManifest manifest;
+        if (!parseManifest(array->items()[i], i, manifest, itemError)) {
+            if (!itemError.empty()) {
+                error = "кандидат " + std::to_string(i) + ": манифест: " + itemError;
+                candidates.clear();
+                return false;
+            }
+            std::string note;
+            if (synthesizeManifest(candidate, manifest, note)) {
+                manifest.candidateIndex = i;
+                manifests.push_back(std::move(manifest));
+            } else if (!note.empty()) {
+                // Причина уходит и в stderr, и в reasons кандидата: элемент
+                // останется в плане как «не трогаем», и объяснение обязано быть
+                // там, где человек его читает.
+                notes.push_back(note);
+                candidate.reasons.push_back(note);
+            }
+        } else {
+            manifests.push_back(std::move(manifest));
         }
         candidates.push_back(std::move(candidate));
     }
-    return candidates;
+    return true;
 }
 
 bool loadCandidatesFile(const std::string& path, std::vector<core::CleanupCandidate>& out, std::string& error) {
+    std::vector<core::CandidateManifest> manifests;
+    return loadCandidatesFile(path, out, manifests, error);
+}
+
+bool loadCandidatesFile(const std::string& path, std::vector<core::CleanupCandidate>& out,
+                        std::vector<core::CandidateManifest>& manifests, std::string& error) {
     out.clear();
+    manifests.clear();
     error.clear();
 
     // Путь в модели — UTF-8 (§6.3), а std::filesystem::path на Windows ждёт
@@ -967,9 +1308,11 @@ bool loadCandidatesFile(const std::string& path, std::vector<core::CleanupCandid
     }
 
     std::string parseError;
-    std::vector<core::CleanupCandidate> candidates = parseCandidatesJson(buffer.str(), parseError);
-    if (!parseError.empty()) {
+    std::vector<core::CleanupCandidate> candidates;
+    if (!parseCandidatesJson(buffer.str(), candidates, manifests, parseError)) {
         error = path + ": " + parseError;
+        candidates.clear();
+        manifests.clear();
         return false;
     }
     out = std::move(candidates);

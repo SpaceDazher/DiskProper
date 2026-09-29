@@ -284,6 +284,14 @@ public:
     void setUseTrash(bool useTrash);
     void setMinReclaimBytes(std::uint64_t bytes);
 
+    // Потолок уровня по умолчанию (SPEC §4 FR-3, FR-4; docs/review-02.md F-03):
+    // Safe — по умолчанию, Review — только явным действием человека (эта
+    // функция, то есть галочка в настройках) или профилем «выбрать всё».
+    // Выше Review не поднимается: Risky включается отдельно, двойным
+    // подтверждением (askRevealRisky + confirmRiskyReveal, §9).
+    void setMaxDefaultSafety(core::SafetyLevel level);
+    [[nodiscard]] core::SafetyLevel maxDefaultSafety() const noexcept { return options_.maxDefaultSafety; }
+
     // ---- Risky: показать можно только через «показать всё» с подтверждением
     //      (FR-4, §12) ----
     [[nodiscard]] bool riskyRevealPending() const noexcept { return riskyRevealPending_; }

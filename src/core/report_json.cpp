@@ -189,7 +189,53 @@ Value diskValue(const PhysicalDisk& disk, const ReportOptions& options) {
     });
 }
 
-Value candidateValue(const CleanupCandidate& candidate) {
+// Манифест удаления как объект секции кандидата (docs/review-02.md F-01).
+// Ключ «manifest» — продолжение кандидата, а не отдельный раздел отчёта:
+// список разрешённого относится к своему кандидату и без него бессмыслен.
+//
+// Полный перечень может быть длиннее kMaxReportManifestPaths; тогда в файл
+// попадает начало, а «complete» становится false — читатель обязан считать
+// такой список запретом на удаление, а не разрешением удалить начало.
+Value manifestValue(const CandidateManifest& manifest) {
+    std::vector<Value> allowed;
+    bool complete = true;
+    std::size_t omitted = 0;
+    std::size_t count = 0;
+    std::uint64_t bytes = 0;
+    if (manifest.allowed != nullptr) {
+        complete = manifest.allowed->complete;
+        omitted = manifest.allowed->omitted;
+        count = manifest.allowed->entries.size();
+        bytes = manifest.allowed->bytes;
+        allowed.reserve(count < kMaxReportManifestPaths ? count : kMaxReportManifestPaths);
+        for (const AllowedEntry& entry : manifest.allowed->entries) {
+            if (allowed.size() >= kMaxReportManifestPaths) {
+                omitted += count - allowed.size();
+                count = allowed.size();
+                complete = false;
+                break;
+            }
+            allowed.push_back(Value::object({{"path", Value(entry.path)}, {"bytes", num(entry.allocatedBytes)}}));
+        }
+    }
+    return Value::object({
+        {"ruleId", Value(manifest.ruleId)},
+        {"rootPath", Value(manifest.rootPath)},
+        // Право снести корень целиком: правило доказало, что отбирать нечего.
+        // Список при этом не печатается — он и не нужен, корень и есть всё.
+        {"rootDelete", Value(manifest.rootDeleteAllowed)},
+        {"estimateOnly", Value(manifest.estimateOnly)},
+        {"userData", Value(manifest.userData)},
+        {"minFileBytes", num(manifest.minFileBytes)},
+        {"allowedComplete", Value(complete)},
+        {"allowedCount", num(count)},
+        {"allowedBytes", num(bytes)},
+        {"allowedOmitted", num(omitted)},
+        {"allowedPaths", Value::array(std::move(allowed))},
+    });
+}
+
+Value candidateValue(const CleanupCandidate& candidate, const CandidateManifest* manifest) {
     std::vector<Value> reasons;
     reasons.reserve(candidate.reasons.size());
     for (const std::string& reason : candidate.reasons) reasons.push_back(Value(reason));
@@ -200,7 +246,7 @@ Value candidateValue(const CleanupCandidate& candidate) {
         lockedBy.push_back(Value::object({{"pid", num(process.pid)}, {"name", Value(process.name)}}));
     }
 
-    return Value::object({
+    std::vector<std::pair<std::string, Value>> members{
         {"ruleId", Value(candidate.ruleId)},
         {"category", Value(candidate.category)},
         {"path", Value(candidate.path)},
@@ -218,7 +264,9 @@ Value candidateValue(const CleanupCandidate& candidate) {
         {"locked", Value(!candidate.lockedBy.empty())},
         {"reasons", Value::array(std::move(reasons))},
         {"lockedBy", Value::array(std::move(lockedBy))},
-    });
+    };
+    if (manifest != nullptr) members.emplace_back("manifest", manifestValue(*manifest));
+    return Value::object(std::move(members));
 }
 
 Value operationValue(const ReportOperation& op) {
@@ -308,11 +356,21 @@ void collectDisks(const std::vector<PhysicalDisk>& disks, const ReportOptions& o
     for (const PhysicalDisk& disk : disks) out.push_back(diskValue(disk, options));
 }
 
-void collectCandidates(const std::vector<CleanupCandidate>& candidates, const ReportOptions& options,
-                       std::vector<Value>& out) {
+void collectCandidates(const std::vector<CleanupCandidate>& candidates, const std::vector<CandidateManifest>& manifests,
+                       const ReportOptions& options, std::vector<Value>& out) {
     if (!options.includeCandidates) return;
     out.reserve(candidates.size());
-    for (const CleanupCandidate& candidate : candidates) out.push_back(candidateValue(candidate));
+    // Манифесты отсортированы по candidateIndex (контракт core::CleanupPlan),
+    // поэтому идём по ним одним указателем, а не ищем каждый заново.
+    std::size_t next = 0;
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+        while (next < manifests.size() && manifests[next].candidateIndex < index) ++next;
+        const CandidateManifest* manifest = nullptr;
+        if (options.includeManifests && next < manifests.size() && manifests[next].candidateIndex == index) {
+            manifest = &manifests[next];
+        }
+        out.push_back(candidateValue(candidates[index], manifest));
+    }
 }
 
 void collectOperations(const std::vector<ReportOperation>& operations, std::vector<Value>& out) {
@@ -470,7 +528,7 @@ std::string reportToJson(const Report& report, int indent) {
     std::vector<Value> errors;
 
     collectDisks(report.disks, report.options, disks);
-    collectCandidates(report.candidates, report.options, candidates);
+    collectCandidates(report.candidates, report.manifests, report.options, candidates);
     if (report.options.includeOperations) collectOperations(report.operations, operations);
     if (report.options.includeUntouched) collectOperations(report.untouched, untouched);
     collectErrors(report.errors, report.options, errors);
@@ -591,6 +649,20 @@ std::vector<std::string> validateReport(const Report& report) {
         if (candidate.oldestWrite != 0 && candidate.newestWrite != 0 && candidate.oldestWrite > candidate.newestWrite) {
             problems.push_back(where + ": самый старый mtime позже самого нового");
         }
+    }
+
+    // Манифесты удаления (docs/review-02.md F-01): привязаны к своему
+    // кандидату, и сохранённый отчёт без этого списка не даёт плана. Проверка
+    // границ — чтобы файл со сдвинутыми индексами не выглядел рабочим.
+    for (std::size_t i = 0; i < report.manifests.size(); ++i) {
+        const CandidateManifest& manifest = report.manifests[i];
+        const std::string where = "манифест " + std::to_string(i);
+        if (!report.candidates.empty() && manifest.candidateIndex >= report.candidates.size()) {
+            problems.push_back(where + ": candidateIndex " + std::to_string(manifest.candidateIndex) +
+                               " вне списка кандидатов (" + std::to_string(report.candidates.size()) + ")");
+        }
+        if (manifest.allowed == nullptr) continue;
+        checkBytes(manifest.allowed->bytes, where, problems);
     }
 
     checkOperations(report.operations, report.candidates.size(), true, problems);

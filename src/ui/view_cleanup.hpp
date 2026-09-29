@@ -378,6 +378,14 @@ public:
     // значило бы удалять то, о чём человек не informed. Профиль, «показать
     // все» и строка фильтра — настройки пользователя, они переживают скан.
     void publishCandidates(std::shared_ptr<const std::vector<core::CleanupCandidate>> candidates);
+    // То же плюс манифесты скана: что правило разрешило удалить каждому
+    // кандидату (docs/review-02.md F-01). Без них план не выбирает ничего —
+    // корень каталога удалять нельзя, пока не сказано, что именно можно, — и
+    // экран показывал бы нулевую очистку при полном дереве. Старый вызов
+    // оставлен для вызывающих, которые манифестов ещё не собирают: план у них
+    // останется пустым, и это честно.
+    void publishCandidates(std::shared_ptr<const std::vector<core::CleanupCandidate>> candidates,
+                           std::shared_ptr<const std::vector<core::CandidateManifest>> manifests);
     void clear();
     [[nodiscard]] bool hasCandidates() const noexcept;
 
@@ -400,6 +408,12 @@ public:
     [[nodiscard]] bool useTrash() const noexcept;
 
     // Порог уверенности (FR-4 ConfidenceScore, core::kPlanDefaultConfidenceThreshold).
+    // Уровень Review по умолчанию: выкл. (SPEC §4 FR-3, FR-4; docs/review-02.md
+    // F-03). Включение — явное действие человека, то есть эта галочка в
+    // настройках; профиль «выбрать всё» берёт Review и без неё.
+    void setIncludeReview(bool include);
+    [[nodiscard]] bool includeReview() const noexcept;
+
     void setConfidenceThreshold(int threshold);
     [[nodiscard]] int confidenceThreshold() const noexcept;
 
@@ -484,6 +498,10 @@ public:
     [[nodiscard]] const core::CleanupPlan& profilePlan() const noexcept;
     [[nodiscard]] core::CleanupPlan effectivePlan() const;
     [[nodiscard]] std::vector<core::CleanupCandidate> selectedCandidates() const;
+    // Манифесты для сжатого списка выбранного: индексы в effectivePlan — это
+    // позиции в selectedCandidates(), а не во всём списке скана, и без переноса
+    // список разрешённого достался бы не тому элементу (docs/review-02.md F-01).
+    [[nodiscard]] std::vector<core::CandidateManifest> selectedManifests() const;
 
     // Проверка инвариантов §6.3 на выбранном: reclaimBytes == allocatedBytes для
     // Delete/Trash и 0 для Keep/SkipLocked, ровно один элемент на кандидата.
@@ -573,6 +591,15 @@ private:
     // Ключи видимых узлов в порядке дерева — по ним ходит фокус.
     [[nodiscard]] std::vector<std::string> visibleOrder() const;
 
+    // Пересобрать план так, чтобы в нём были манифесты выбранного: без них
+    // buildPlan справедливо не выбирает ничего.
+    [[nodiscard]] core::CleanupPlan planFor(const std::vector<core::CleanupCandidate>& selected) const;
+
+    // Манифест кандидата из снимка скана, nullptr — манифестов нет. Поиск
+    // двоичный: список отсортирован по candidateIndex (контракт
+    // core::CleanupPlan), а rebuild спрашивает его для каждой строки.
+    [[nodiscard]] const core::CandidateManifest* manifestOf(std::size_t candidateIndex) const noexcept;
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
@@ -659,6 +686,10 @@ public:
     // --- Приём кадров из фонового потока (звонятся в UI-потоке) -------------
     void publishScanProgress(ScanProgress progress);
     void publishCandidates(std::shared_ptr<const std::vector<core::CleanupCandidate>> candidates);
+    // То же с манифестами скана (docs/review-02.md F-01). Без них модель не
+    // выбирает ничего, и экран показывает «нечего удалять» при полном дереве.
+    void publishCandidates(std::shared_ptr<const std::vector<core::CleanupCandidate>> candidates,
+                           std::shared_ptr<const std::vector<core::CandidateManifest>> manifests);
     void publishOperationResult(bool ok, std::uint64_t freedBytes);
     void publishFinished();
     void setUndoAvailable(bool available);

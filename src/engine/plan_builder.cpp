@@ -242,6 +242,13 @@ const core::CandidateManifest* PlanBuilder::manifestFor(std::size_t candidateInd
 // Параметры отбора
 // ---------------------------------------------------------------------------
 
+void PlanBuilder::setMaxDefaultSafety(core::SafetyLevel level) {
+    const core::SafetyLevel clamped = level > core::SafetyLevel::Review ? core::SafetyLevel::Review : level;
+    if (options_.maxDefaultSafety == clamped) return;
+    options_.maxDefaultSafety = clamped;
+    rebuild();
+}
+
 void PlanBuilder::setOptions(core::PlanOptions options) {
     riskyRevealPending_ = false;
     options_ = options;
