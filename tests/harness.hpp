@@ -5,6 +5,8 @@
 #pragma once
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <string>
 #include <vector>
@@ -42,10 +44,44 @@ void checkEq(const A& a, const B& b, const char* ea, const char* eb, const char*
     }
 }
 
+// Фильтр по префиксу имени проверки через переменную окружения
+// MRPROPER_TEST_FILTER. Нужен, чтобы задача команды могла доказать свою часть
+// одной автоматической командой: пока соседняя задача чинит свой слой, её
+// провалы не должны обнулять наш результат (и наоборот).
+// Чтение переменной окружения. На Windows getenv помечен устаревшим (C4996),
+// а заглушать предупреждение нельзя: под /WX это тихая замена планки сборки.
+// Поэтому ветка Windows читает через _dupenv_s, ветка POSIX — обычный getenv.
+inline const char* envValue(const char* name) {
+#if defined(_WIN32)
+    static std::string storage;
+    char* value = nullptr;
+    std::size_t size = 0;
+    if (_dupenv_s(&value, &size, name) != 0 || value == nullptr) return nullptr;
+    storage.assign(value);
+    std::free(value);
+    return storage.empty() ? nullptr : storage.c_str();
+#else
+    return std::getenv(name);
+#endif
+}
+
+inline const char* testFilter() {
+    static const char* value = [] {
+        const char* raw = envValue("MRPROPER_TEST_FILTER");
+        return (raw != nullptr && raw[0] != '\0') ? raw : nullptr;
+    }();
+    return value;
+}
+
 inline int runAll(const char* suite) {
     int failed = 0;
+    int selected = 0;
     std::printf("== %s ==\n", suite);
     for (const auto& test : registry()) {
+        if (const char* filter = testFilter()) {
+            if (std::strncmp(test.name, filter, std::strlen(filter)) != 0) continue;
+        }
+        ++selected;
         try {
             test.fn();
             std::printf("  [ ok ] %s\n", test.name);
@@ -60,8 +96,11 @@ inline int runAll(const char* suite) {
             ++failed;
         }
     }
-    std::printf("%s: %d проверок, провалов %d\n", failed == 0 ? "ALL PASS" : "FAIL", static_cast<int>(registry().size()),
-                failed);
+    std::printf("%s: %d проверок, провалов %d\n", failed == 0 ? "ALL PASS" : "FAIL", selected, failed);
+    if (selected == 0) {
+        std::printf("FAIL: фильтр %s не выбрал ни одной проверки\n", testFilter() ? testFilter() : "");
+        return 1;
+    }
     return failed == 0 ? 0 : 1;
 }
 
