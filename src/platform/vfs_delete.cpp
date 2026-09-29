@@ -226,6 +226,11 @@ constexpr std::chrono::milliseconds kBackoffSlice{25};
             index = end + 1;
             continue;
         }
+        // Разделитель между компонентами: без него «C:\Users\Daniil\Temp» склеивался
+        // в «C:\Users\Daniil\TempX» — deleteEntry отказывал собственному файлу как
+        // лежащему вне корня, а deleteTree рапортовал об удалённом дереве, которое
+        // оставалось на диске (находка ревью F2, интеграционные провалы vfsEdge).
+        if (!out.empty() && out.back() != L'\\') out.push_back(L'\\');
         out.append(text, index, length);
         lastStart = out.size();
         index = end + 1;

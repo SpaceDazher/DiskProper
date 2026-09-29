@@ -83,6 +83,11 @@ struct HtmlReportOperation {
     std::string name;    // «Кэш браузера» — человекочитаемое имя
     std::string path;    // UTF-8 путь, как в модели
     std::uint64_t bytes{};  // освобождено по факту (0 для Keep/SkipLocked)
+    // Уровень риска операции. Рендерер печатает его отдельной колонкой в
+    // таблице операций (review-05 F-02): поле заполняют оба сборщика
+    // (cmd_report.cpp, view_report.cpp), и потерять его на выводе нельзя —
+    // отчёт обязан отвечать не только «что удалили», но и «насколько это было
+    // опасно» (FR-4, §12).
     SafetyLevel safety{SafetyLevel::Review};
     int confidence{};
     bool success{true};  // false — операция провалилась, error обязателен

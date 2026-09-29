@@ -49,6 +49,18 @@ const char* actionToken(PlanAction action) {
     return "keep";
 }
 
+// Уровень риска по-русски. safetyToken() даёт машинное слово для JSON, а
+// подтверждение перед удалением (FR-5) читает человек: «safe» там не ответ на
+// вопрос «это безопасно удалить?».
+const char* riskLabel(SafetyLevel safety) {
+    switch (safety) {
+        case SafetyLevel::Safe: return "безопасно";
+        case SafetyLevel::Review: return "проверить";
+        case SafetyLevel::Risky: return "риск";
+    }
+    return "проверить";
+}
+
 // «1 элемент / 2 элемента / 5 элементов» — в units.cpp своя склонка для файлов,
 // а здесь речь об элементах плана, поэтому слова свои.
 const char* itemWord(std::size_t count) {
@@ -122,13 +134,46 @@ int effectiveThreshold(const PlanOptions& options) {
     return std::clamp(options.confidenceThreshold, 0, 100);
 }
 
+// Ранг уровня риска: чем больше, тем опаснее. Порядок задан моделью
+// (core/model.hpp: Safe < Review < Risky) и нужен, чтобы «Review не выше того
+// уровня, что разрешён по умолчанию» не переписывалось вручную в трёх местах.
+int safetyRank(SafetyLevel safety) {
+    switch (safety) {
+        case SafetyLevel::Safe: return 0;
+        case SafetyLevel::Review: return 1;
+        case SafetyLevel::Risky: return 2;
+    }
+    return 1;
+}
+
+// ASCII-в нижний регистр: сравнение путей на Windows нерегистрозависимо, а
+// модель хранит UTF-8 (ADR-004), поэтому приводим только ASCII-буквы.
+std::string lowerAscii(const std::string& text) {
+    std::string out = text;
+    for (char& symbol : out) {
+        if (symbol >= 'A' && symbol <= 'Z') symbol = static_cast<char>(symbol - 'A' + 'a');
+    }
+    return out;
+}
+
+// «path лежит внутри root». Ровно та же граница, на которой держится запрет
+// удаления чужих данных (FR-6): корень совпадает или путь продолжается
+// разделителем. Без неё список разрешённого — это просто список путей.
+bool insideRoot(const std::string& root, const std::string& path) {
+    if (root.empty() || path.size() < root.size()) return false;
+    if (lowerAscii(path.substr(0, root.size())) != lowerAscii(root)) return false;
+    if (path.size() == root.size()) return true;
+    const char next = path[root.size()];
+    return next == '\\' || next == '/';
+}
+
 std::string thresholdReason(int confidence, int threshold) {
     return "уверенность " + std::to_string(confidence) + " ниже порога отбора " + std::to_string(threshold) +
            " — элемент не выбран по умолчанию";
 }
 
 PlanOperation makeOperation(std::size_t index, const CleanupCandidate& candidate, PlanAction action, SkipReason skip,
-                            std::uint64_t bytes, const std::string& reason) {
+                            std::uint64_t bytes, const std::string& reason, const CandidateManifest* manifest) {
     PlanOperation op;
     op.candidateIndex = index;
     op.action = action;
@@ -140,16 +185,44 @@ PlanOperation makeOperation(std::size_t index, const CleanupCandidate& candidate
     op.safety = candidate.safety;
     op.confidence = candidate.confidence;
     op.reason = reason;
+    op.evidence = candidate.reasons;  // FR-4: «почему это мусор» едет вместе со строкой
+
+    // Что удалится на самом деле (F-01): список из манифеста, а не путь
+    // корня. Полный список — в манифесте, здесь только начало: человек
+    // подтверждает состав, а не перечитывает двести тысяч строк.
+    if (manifest != nullptr && isRemovableAction(action)) {
+        if (manifest->rootDeleteAllowed || manifest->allowed == nullptr) {
+            op.rootDeleteOnly = true;
+            op.allowedCount = 1;
+        } else {
+            op.rootDeleteOnly = false;
+            const AllowedSet& allowed = *manifest->allowed;
+            op.allowedCount = allowed.entries.size();
+            for (const AllowedEntry& entry : allowed.entries) {
+                if (op.allowedPaths.size() >= kMaxOperationPaths) break;
+                op.allowedPaths.push_back(entry.path);
+            }
+        }
+    }
     return op;
 }
 
+// Строка dry-run: категория, элемент, объём, действие, УРОВЕНЬ РИСКА и причина
+// (FR-5 + §12). Уровень риска и объяснение — обязательные части строки, а не
+// украшение: это последнее подтверждение перед удалением.
 std::string operationLine(std::size_t number, const PlanOperation& op) {
     std::string line = "  " + std::to_string(number) + ". [" + actionLabel(op.action) + "] ";
     line += op.displayName.empty() ? op.path : op.displayName;
     line += " — " + formatBytes(op.bytes);
-    line += " · " + std::string(safetyToken(op.safety));
+    line += " · уровень риска: " + std::string(riskLabel(op.safety));
     line += " · уверенность " + std::to_string(op.confidence);
     if (!op.path.empty() && op.path != op.displayName) line += " · " + op.path;
+    if (!op.rootDeleteOnly && op.allowedCount > 0) {
+        // «Удаляется не каталог, а вот эти файлы» — сама строка, без неё
+        // человек подтверждает то, чего не видел (docs/review-02.md F-01).
+        line += " · удаляется по списку: " + std::to_string(op.allowedCount) + " " + itemWord(op.allowedCount);
+        if (op.allowedPaths.size() < op.allowedCount) line += " (показаны первые " + std::to_string(op.allowedPaths.size()) + ")";
+    }
     return line;
 }
 
@@ -180,8 +253,65 @@ const char* toString(SkipReason reason) {
         case SkipReason::BelowConfidence: return "below-confidence";
         case SkipReason::ProfileFiltered: return "profile-filtered";
         case SkipReason::TooSmall: return "too-small";
+        case SkipReason::ReviewOffByDefault: return "review-off-by-default";
+        case SkipReason::EstimateOnly: return "estimate-only";
+        case SkipReason::NoSizeThreshold: return "no-size-threshold";
+        case SkipReason::NeedsEnumeration: return "needs-enumeration";
     }
     return "none";
+}
+
+bool isUserDataCategory(std::string_view category) {
+    // Категория из SPEC §4 FR-3, элемент которой — данные пользователя, а не
+    // мусор. Список короткий и явный: угадывать по названию правила нельзя,
+    // потому что цена ошибки — удалённый рабочий стол (F-02).
+    return category == "user.bigfiles";
+}
+
+std::shared_ptr<const AllowedSet> CandidateManifest::makeAllowedSet(std::vector<AllowedEntry> entries,
+                                                                   bool complete, std::size_t omitted) {
+    auto set = std::make_shared<AllowedSet>();
+    for (const AllowedEntry& entry : entries) {
+        set->bytes += entry.allocatedBytes;
+    }
+    set->entries = std::move(entries);
+    set->complete = complete;
+    set->omitted = omitted;
+    return set;
+}
+
+bool CandidateManifest::deletable() const {
+    if (estimateOnly) return false;
+    if (rootDeleteAllowed) return true;
+    if (allowed == nullptr) return false;  // список не получен: корень удалять нельзя
+    if (!allowed->complete) return false;   // список неполон: неполнота и «удалить всё» несовместимы
+    if (allowed->entries.empty()) return false;  // правило не оставило ни одного файла
+    return true;
+}
+
+std::string CandidateManifest::blockReason() const {
+    if (estimateOnly) {
+        return "правило «" + (ruleId.empty() ? std::string("без имени") : ruleId) +
+               "» объявлено «только оценка»: элемент не удаляется ни при каком протверждении (SPEC §4 FR-3)";
+    }
+    if (rootDeleteAllowed) return {};
+    if (allowed == nullptr) {
+        return "правило «" + (ruleId.empty() ? std::string("без имени") : ruleId) +
+               "» может что-то отсечь внутри корня, а список разрешённых файлов не получен: "
+               "удалять каталог целиком нельзя (SPEC §4 FR-7)";
+    }
+    if (!allowed->complete) {
+        return "список разрешённых файлов неполон: обход прерван или список обрезан (осталось неучтённых путей: " +
+               std::to_string(allowed->omitted) + ") — удалять нельзя, иначе пропадёт и неучтённое";
+    }
+    return "правило не оставило ни одного файла для удаления";
+}
+
+bool isRuleBlock(SkipReason reason) {
+    // Причины, которые нельзя снять ни профилем, ни подтверждением, ни сменой
+    // уровня: запрет задано самим правилом (docs/review-02.md F-01..F-04).
+    return reason == SkipReason::EstimateOnly || reason == SkipReason::NoSizeThreshold ||
+           reason == SkipReason::NeedsEnumeration;
 }
 
 bool isRemovableAction(PlanAction action) {
@@ -198,7 +328,8 @@ const ActionTotals& PlanActionTotals::forAction(PlanAction action) const {
     return keepOps;
 }
 
-SelectionDecision decideCandidate(const CleanupCandidate& candidate, const PlanOptions& options) {
+SelectionDecision decideCandidate(const CleanupCandidate& candidate, const PlanOptions& options,
+                                  const CandidateManifest* manifest) {
     SelectionDecision decision;
     const int threshold = effectiveThreshold(options);
 
@@ -212,14 +343,49 @@ SelectionDecision decideCandidate(const CleanupCandidate& candidate, const PlanO
         return decision;
     }
 
-    // 2. Risky по умолчанию скрыт: только «показать все» с подтверждением (FR-4, §12).
+    // 2. «Только оценка»: запрет задаёт правило, и снимать его нечем — ни
+    //    --allow-risky, ни профиль «выбрать всё», ни смена уровня элемента
+    //    (docs/review-02.md F-04: образ WSL и WinSxS удалялись целиком).
+    if (manifest != nullptr && manifest->estimateOnly) {
+        decision.skip = SkipReason::EstimateOnly;
+        decision.reason = manifest->blockReason();
+        return decision;
+    }
+
+    // 3. Risky по умолчанию скрыт: только «показать все» с подтверждением (FR-4, §12).
     if (candidate.safety == SafetyLevel::Risky && !options.allowRisky) {
         decision.skip = SkipReason::RiskyHidden;
         decision.reason = "уровень Risky скрыт по умолчанию — включить может только пользователь";
         return decision;
     }
 
-    // 3. Слишком мелкий вклад в освобождение места.
+    // 4. Пользовательские данные: FR-3 «файлы > 1 ГБ». Пока порога размера в
+    //    схеме правил не было, категория брала весь каталог документов, и
+    //    уверенность 100 при пороге 50 отбирала его по умолчанию (F-02).
+    const bool userData = manifest != nullptr ? manifest->userData : isUserDataCategory(candidate.category);
+    const std::uint64_t minFileBytes = manifest != nullptr ? manifest->minFileBytes : 0;
+    if (userData && minFileBytes == 0) {
+        decision.skip = SkipReason::NoSizeThreshold;
+        decision.reason = "категория «" + candidate.category +
+                          "» не объявляет порог размера файла: без него элемент не выбирается вовсе "
+                          "(SPEC §4 FR-3 «файлы > 1 ГБ»)";
+        return decision;
+    }
+
+    // 5. Что именно будет удалено. Корнем каталога нельзя: если правило хоть
+    //    что-то отсекает (min-age, исключения, порог размера, фильтр листьев),
+    //    удалять можно только перечисленные файлы, а их список обязателен
+    //    (docs/review-02.md F-01: «по возрасту отсечено файлов: 412» описывало
+    //    счёт, а удалялся весь %TEMP% вместе со свежими файлами).
+    if (manifest == nullptr || !manifest->deletable()) {
+        decision.skip = SkipReason::NeedsEnumeration;
+        decision.reason = manifest != nullptr
+                              ? manifest->blockReason()
+                              : "нет списка разрешённых файлов: удалять каталог целиком нельзя (SPEC §4 FR-7)";
+        return decision;
+    }
+
+    // 6. Слишком мелкий вклад в освобождение места.
     if (options.minReclaimBytes != 0 && candidate.allocatedBytes < options.minReclaimBytes) {
         decision.skip = SkipReason::TooSmall;
         decision.reason = "объём " + formatBytes(candidate.allocatedBytes) + " ниже минимального порога " +
@@ -227,7 +393,7 @@ SelectionDecision decideCandidate(const CleanupCandidate& candidate, const PlanO
         return decision;
     }
 
-    // 4. Профиль отбора и порог уверенности.
+    // 7. Профиль отбора и порог уверенности.
     switch (options.profile) {
         case SelectionProfile::SafeOnly:
             if (candidate.safety != SafetyLevel::Safe) {
@@ -237,8 +403,31 @@ SelectionDecision decideCandidate(const CleanupCandidate& candidate, const PlanO
                 return decision;
             }
             break;
-        case SelectionProfile::Recommended:
+        case SelectionProfile::Recommended: {
+            // Review по умолчанию выключен: FR-3 («выкл. по умолчанию, с явным
+            // подтверждением») и FR-4. Раньше единственным «не брать по
+            // умолчанию» был Risky, и пароли браузера попадали в план сразу
+            // после скана (docs/review-02.md F-03).
+            //
+            // Подтверждённый Risky (allowRisky — это и есть «показать всё» с
+            // согласием) потолком не повторяется: иначе явное действие
+            // оказывалось бы слабее умолчания.
+            if (candidate.safety == SafetyLevel::Risky && options.allowRisky) break;
+            if (safetyRank(candidate.safety) > safetyRank(options.maxDefaultSafety)) {
+                const bool review = candidate.safety == SafetyLevel::Review;
+                decision.skip = review ? SkipReason::ReviewOffByDefault : SkipReason::ProfileFiltered;
+                decision.reason = review
+                                      ? "уровень Review выключен по умолчанию: выбрать его может только "
+                                        "человек — галочкой или профилем «выбрать всё» (SPEC §4 FR-3, FR-4)"
+                                      : "уровень " + std::string(safetyToken(candidate.safety)) +
+                                        " выше уровня, разрешённого по умолчанию (SPEC §4 FR-4)";
+                return decision;
+            }
+            break;
+        }
         case SelectionProfile::Everything:
+            // «Выбрать всё» — явное действие человека, и оно берёт Review.
+            // Risky при этом по-прежнему требует подтверждения «показать всё».
             break;
     }
     if (options.profile != SelectionProfile::Everything && candidate.confidence < threshold) {
@@ -247,10 +436,17 @@ SelectionDecision decideCandidate(const CleanupCandidate& candidate, const PlanO
         return decision;
     }
 
-    // 5. Выбран. Куда именно: в корзину приложения (её можно восстановить) или
+    // 8. Выбран. Куда именно: в корзину приложения (её можно восстановить) или
     //    напрямую — большие кэши в корзине раздувают её (FR-7, ADR-005/006).
+    //    Пользовательские данные — всегда через корзину: категория состоит из
+    //    крупных файлов, то есть почти всегда «больше порога», и прямое
+    //    удаление документов необратимо (docs/review-02.md F-02).
     decision.selected = true;
-    if (options.useTrash && candidate.allocatedBytes <= options.trashDirectDeleteAboveBytes) {
+    if (userData) {
+        decision.action = PlanAction::Trash;
+        decision.reason = "выбран по умолчанию; удаление через корзину приложения — операцию можно отменить; "
+                          "для пользовательских данных прямое удаление запрещено (SPEC §4 FR-7)";
+    } else if (options.useTrash && candidate.allocatedBytes <= options.trashDirectDeleteAboveBytes) {
         decision.action = PlanAction::Trash;
         decision.reason = "выбран по умолчанию; удаление через корзину приложения — операцию можно отменить";
     } else if (options.useTrash) {
@@ -264,18 +460,30 @@ SelectionDecision decideCandidate(const CleanupCandidate& candidate, const PlanO
     return decision;
 }
 
-CleanupPlan buildPlan(const std::vector<CleanupCandidate>& candidates, const PlanOptions& options) {
+CleanupPlan buildPlan(const std::vector<CleanupCandidate>& candidates, const PlanOptions& options,
+                      const std::vector<CandidateManifest>* manifests) {
     CleanupPlan plan;
     plan.options = options;
     plan.dryRun = options.dryRun;
     plan.items.reserve(candidates.size());
     plan.totals.candidateCount = candidates.size();
 
+    // Манифесты копируются в план (списки файлов разделяются указателем), и
+    // план остаётся самодостаточным: исполнитель получает из него и решение,
+    // и перечень того, что удалять. Порядок — по индексу кандидата, чтобы
+    // поиск был двоичным, а не линейным на каждом элементе.
+    if (manifests != nullptr) plan.manifests = *manifests;
+    std::stable_sort(plan.manifests.begin(), plan.manifests.end(),
+                     [](const CandidateManifest& a, const CandidateManifest& b) {
+                         return a.candidateIndex < b.candidateIndex;
+                     });
+
     std::vector<CategoryAggregate> categories;
 
     for (std::size_t index = 0; index < candidates.size(); ++index) {
         const CleanupCandidate& candidate = candidates[index];
-        const SelectionDecision decision = decideCandidate(candidate, options);
+        const CandidateManifest* manifest = plan.manifestFor(index);
+        const SelectionDecision decision = decideCandidate(candidate, options, manifest);
 
         CleanupPlanItem item;
         item.candidateIndex = index;
@@ -295,7 +503,14 @@ CleanupPlan buildPlan(const std::vector<CleanupCandidate>& candidates, const Pla
                 case SkipReason::RiskyHidden: ++plan.totals.hiddenRiskyCount; break;
                 case SkipReason::BelowConfidence: ++plan.totals.belowThresholdCount; break;
                 case SkipReason::TooSmall: ++plan.totals.tooSmallCount; break;
-                case SkipReason::ProfileFiltered: ++plan.totals.profileFilteredCount; break;
+                case SkipReason::ProfileFiltered:
+                case SkipReason::ReviewOffByDefault: ++plan.totals.profileFilteredCount; break;
+                // Запреты, заданные правилом, и «нет списка разрешённого» — не
+                // «плохо набралось», а «нельзя»: в цифрах профиля они не живут,
+                // но видны в dry-run и в reasons элемента.
+                case SkipReason::EstimateOnly:
+                case SkipReason::NoSizeThreshold:
+                case SkipReason::NeedsEnumeration:
                 case SkipReason::Locked:
                 case SkipReason::None: break;
             }
@@ -357,10 +572,23 @@ std::vector<std::size_t> CleanupPlan::operationIndexes() const {
     return indexes;
 }
 
+const CandidateManifest* CleanupPlan::manifestFor(std::size_t candidateIndex) const {
+    // manifests отсортированы по индексу (buildPlan), поэтому достаточно
+    // двоичного поиска; nullptr — сборка не дала манифеста, и тогда элемент
+    // по правилам decideCandidate удалять нельзя.
+    const auto found = std::lower_bound(manifests.begin(), manifests.end(), candidateIndex,
+                                        [](const CandidateManifest& manifest, std::size_t index) {
+                                            return manifest.candidateIndex < index;
+                                        });
+    if (found == manifests.end() || found->candidateIndex != candidateIndex) return nullptr;
+    return &*found;
+}
+
 std::uint64_t CleanupPlan::planSignature() const {
     std::uint64_t hash = kFnvOffsetBasis;
     mixValue(hash, static_cast<std::uint64_t>(options.profile));
     mixValue(hash, static_cast<std::uint64_t>(effectiveThreshold(options)));
+    mixValue(hash, static_cast<std::uint64_t>(safetyRank(options.maxDefaultSafety)));
     mixValue(hash, options.allowRisky ? 1ull : 0ull);
     mixValue(hash, options.useTrash ? 1ull : 0ull);
     mixValue(hash, options.minReclaimBytes);
@@ -369,8 +597,38 @@ std::uint64_t CleanupPlan::planSignature() const {
         mixValue(hash, static_cast<std::uint64_t>(item.candidateIndex));
         mixValue(hash, static_cast<std::uint64_t>(item.action));
         mixValue(hash, item.reclaimBytes);
+        // Со СПИСКОМ удаляемого в отпечатке: сменился набор файлов под
+        // кандидатом — прежнее подтверждение dry-run относилось к другому
+        // списку, даже если сумма байт совпала (FR-5).
+        const CandidateManifest* manifest = manifestFor(item.candidateIndex);
+        mixValue(hash, manifest == nullptr ? 0ull : 1ull);
+        if (manifest != nullptr) {
+            mixValue(hash, manifest->rootDeleteAllowed ? 1ull : 0ull);
+            mixValue(hash, manifest->estimateOnly ? 1ull : 0ull);
+            mixValue(hash, manifest->minFileBytes);
+            mixValue(hash, manifest->allowed == nullptr
+                                ? 0ull
+                                : static_cast<std::uint64_t>(manifest->allowed->entries.size()));
+            mixValue(hash, manifest->allowed == nullptr ? 0ull : manifest->allowed->bytes);
+        }
     }
     return hash;
+}
+
+std::string operationReason(const PlanOperation& op) {
+    std::string text;
+    const auto append = [&text](const std::string& part) {
+        if (part.empty()) return;
+        if (!text.empty()) text += "; ";
+        text += part;
+    };
+    // Сначала «почему это мусор» (FR-4: объяснение кандидата), затем «почему
+    // такое действие» (FR-5: решение плана). Порядок не декоративный: человек
+    // сначала решает, мусор ли это, и только потом — куда оно денется.
+    for (const std::string& line : op.evidence) append(line);
+    append(op.reason);
+    if (text.empty()) text = "причина не указана";  // не молчим: пустота — тоже ответ
+    return text;
 }
 
 DryRunReport makeDryRunReport(const std::vector<CleanupCandidate>& candidates, const CleanupPlan& plan) {
@@ -383,14 +641,15 @@ DryRunReport makeDryRunReport(const std::vector<CleanupCandidate>& candidates, c
     for (const CleanupPlanItem& item : plan.items) {
         if (item.candidateIndex >= candidates.size()) continue;  // защита от чужого/битого плана
         const CleanupCandidate& candidate = candidates[item.candidateIndex];
-        const SelectionDecision decision = decideCandidate(candidate, plan.options);
+        const CandidateManifest* manifest = plan.manifestFor(item.candidateIndex);
+        const SelectionDecision decision = decideCandidate(candidate, plan.options, manifest);
         if (item.action != decision.action) {
             // План и кандидат разошлись — доверяем решению по кандидату и не показываем
             // пользователю операцию, которую движок выполнит иначе.
             continue;
         }
         PlanOperation op = makeOperation(item.candidateIndex, candidate, item.action, decision.skip, item.reclaimBytes,
-                                        decision.reason);
+                                        decision.reason, manifest);
         if (isRemovableAction(item.action)) {
             report.operations.push_back(std::move(op));
         } else {
@@ -429,7 +688,7 @@ DryRunReport makeDryRunReport(const std::vector<CleanupCandidate>& candidates, c
     }
     for (std::size_t i = 0; i < report.operations.size(); ++i) {
         text += operationLine(i + 1, report.operations[i]);
-        text += "\n    причина: " + report.operations[i].reason + "\n";
+        text += "\n    причина: " + operationReason(report.operations[i]) + "\n";
     }
     text += "Не трогаем (" + std::to_string(report.untouched.size()) + "):\n";
     if (report.untouched.empty()) {
@@ -437,7 +696,7 @@ DryRunReport makeDryRunReport(const std::vector<CleanupCandidate>& candidates, c
     }
     for (std::size_t i = 0; i < report.untouched.size(); ++i) {
         text += operationLine(i + 1, report.untouched[i]);
-        text += "\n    причина: " + report.untouched[i].reason + "\n";
+        text += "\n    причина: " + operationReason(report.untouched[i]) + "\n";
     }
     report.text = std::move(text);
     return report;
@@ -467,6 +726,12 @@ std::string planToJson(const std::vector<CleanupCandidate>& candidates, const Cl
 
     const DryRunReport report = makeDryRunReport(candidates, plan);
     const auto operationJson = [](const PlanOperation& op) {
+        std::vector<Value> evidence;
+        evidence.reserve(op.evidence.size());
+        for (const std::string& line : op.evidence) evidence.push_back(Value(line));
+        std::vector<Value> allowed;
+        allowed.reserve(op.allowedPaths.size());
+        for (const std::string& path : op.allowedPaths) allowed.push_back(Value(path));
         return Value::object({
             {"index", Value(static_cast<double>(op.candidateIndex))},
             {"action", Value(actionToken(op.action))},
@@ -477,7 +742,11 @@ std::string planToJson(const std::vector<CleanupCandidate>& candidates, const Cl
             {"bytes", Value(static_cast<double>(op.bytes))},
             {"safety", Value(safetyToken(op.safety))},
             {"confidence", Value(op.confidence)},
-            {"reason", Value(op.reason)},
+            {"rootDeleteOnly", Value(op.rootDeleteOnly)},
+            {"allowedCount", Value(static_cast<double>(op.allowedCount))},
+            {"allowedPaths", Value::array(std::move(allowed))},
+            {"reason", Value(operationReason(op))},
+            {"evidence", Value::array(std::move(evidence))},
         });
     };
 
@@ -496,6 +765,7 @@ std::string planToJson(const std::vector<CleanupCandidate>& candidates, const Cl
         {"options",
          Value::object({
              {"confidenceThreshold", Value(plan.options.confidenceThreshold)},
+             {"maxDefaultSafety", Value(safetyToken(plan.options.maxDefaultSafety))},
              {"allowRisky", Value(plan.options.allowRisky)},
              {"useTrash", Value(plan.options.useTrash)},
              {"trashDirectDeleteAboveBytes", Value(static_cast<double>(plan.options.trashDirectDeleteAboveBytes))},
@@ -558,6 +828,7 @@ std::string snapshotToJson(const PlanSnapshot& snapshot) {
             {"bytes", Value(static_cast<double>(op.bytes))},
             {"safety", Value(safetyToken(op.safety))},
             {"confidence", Value(op.confidence)},
+            {"reason", Value(operationReason(op))},
         }));
     }
 
@@ -620,6 +891,41 @@ std::vector<std::string> validatePlan(const std::vector<CleanupCandidate>& candi
             }
             if (!candidate.lockedBy.empty()) {
                 problems.push_back("кандидат " + std::to_string(i) + " выбран к удалению, но файлы заблокированы");
+            }
+            // ГЛАВНЫЙ инвариант F-01: операция удаления обязана нести список
+            // того, что правило разрешило, либо право удалить корень целиком.
+            // Оба «не доказаны» — это ровно тот случай, которым в review-02
+            // сносили %TEMP% вместе со свежими и исключёнными файлами.
+            const CandidateManifest* manifest = plan.manifestFor(i);
+            if (manifest == nullptr) {
+                problems.push_back("кандидат " + std::to_string(i) +
+                                   " выбран к удалению, но манифест (список разрешённого) не получен");
+            } else if (!manifest->deletable()) {
+                problems.push_back("кандидат " + std::to_string(i) + " выбран к удалению, хотя по правилу нельзя: " +
+                                   manifest->blockReason());
+            } else if (!manifest->rootDeleteAllowed && manifest->allowed != nullptr) {
+                const AllowedSet& allowed = *manifest->allowed;
+                std::uint64_t sum = 0;
+                for (const AllowedEntry& entry : allowed.entries) {
+                    sum += entry.allocatedBytes;
+                    if (!insideRoot(candidate.path, entry.path)) {
+                        problems.push_back("кандидат " + std::to_string(i) + ": в списке удаляемого путь вне корня " +
+                                           entry.path);
+                    }
+                    if (entry.allocatedBytes < manifest->minFileBytes) {
+                        problems.push_back("кандидат " + std::to_string(i) + ": в списке удаляемого файл " +
+                                           entry.path + " меньше порога правила " +
+                                           std::to_string(manifest->minFileBytes) + " байт");
+                    }
+                }
+                if (sum != candidate.allocatedBytes) {
+                    // Обещание «освободится N» и список того, что удаляем, обязаны
+                    // сходиться: иначе отчёт показывает одну цифру, а удаляется
+                    // другое множество файлов.
+                    problems.push_back("кандидат " + std::to_string(i) + ": сумма списка удаляемого " +
+                                       std::to_string(sum) + " != allocatedBytes " +
+                                       std::to_string(candidate.allocatedBytes));
+                }
             }
             selectedSum += item.reclaimBytes;
         } else if (item.reclaimBytes != 0) {

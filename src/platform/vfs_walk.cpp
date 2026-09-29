@@ -4,18 +4,37 @@
 //
 // Почему перечисление идёт через дескриптор, а не через FindFirstFileW:
 //
-//   1) GetFileInformationByHandleEx(FileFullDirectoryInfo) перечисляет каталог по
-//      уже открытому дескриптору и не требует собирать путь «родитель + имя»
-//      заново для Win32 — длинные пути (> MAX_PATH) не требуют ничего
-//      особенного, префикс \\?\ добавлен один раз, при открытии;
+//   1) GetFileInformationByHandleEx(FileIdBothDirectoryInfo) перечисляет каталог
+//      по уже открытому дескриптору и не требует собирать путь «родитель +
+//      имя» заново для Win32 — длинные пути (> MAX_PATH) не требуют ничего
+//      особенного, префикс \\?\ добавлен один раз, при открытии.
+//      Это не стилистический выбор: FindFirstFileW с шаблоном «\\?\путь\*»
+//      Win32 не понимает вовсе (шаблоны выключаются вместе с разбором пути) и
+//      отвечает ERROR_BAD_LENGTH на корне, который CreateFileW открывает без
+//      вопросов, — то есть ровно на путях, ради которых модуль и написан;
 //   2) тот же дескриптор отдаёт идентификацию каталога
-//      (GetFileInformationByHandle: dwVolumeSerialNumber + nFileIndex), то есть
-//      защита от петель не стоит дополнительного открытия на каталог;
+//      (GetFileInformationByHandle: dwVolumeSerialNumber + nFileIndexHigh/Low),
+//      а запись каталога отдаёт тот же идентификатор в FileId — то есть
+//      защита от петель не стоит дополнительного открытия на каталог и не
+//      требует усечения индекса до 32 бит;
 //   3) в ответе сразу лежат FILE_ATTRIBUTE_REPARSE_POINT, размер и времена —
 //      ровно то, что нужно посетителю, без повторного открытия каждого файла;
-//   4) «.», «..» в ответе не приходят вовсе, а GetFileInformationByHandleEx
-//      не переходит по ссылкам сам — обе защиты от петель из SPEC §4 FR-6
-//      получаются бесплатно.
+//   4) GetFileInformationByHandleEx не переходит по ссылкам сам — защита от
+//      петель из SPEC §4 FR-6 получается бесплатно.
+//
+// Две особенности API, на которых держится разбор буфера (обе проверены на
+// живой файловой системе, обе ломают наивную реализацию):
+//
+//   1) У GetFileInformationByHandleEx ЧЕТЫРЕ параметра, отдельного «сколько
+//      байт записано» среди них нет. Границу данных задаёт сама цепочка
+//      записей: у последней NextEntryOffset == 0. Отсюда две обязанности:
+//      буфер обнуляется перед каждым вызовом (остатки прошлого каталога иначе
+//      выглядели бы как записи текущего) и пустой кадр распознаётся как «записей
+//      не пришло», а не как запись без имени.
+//   2) «.», «..» в ответе ПРИХОДЯТ (проверено: первая запись каталога — «.»),
+//      вопреки распространённому предположению. Фильтруются здесь, на границе
+//      модуля: посетителю они не предъявляются, в счётчики не попадают и в
+//      спуск не ведут (иначе обход пошёл бы в «..» и ушёл за пределы корня).
 //
 // Чего этот обход принципиально не делает: не следует по ссылкам, не
 // разворачивает «..», не выходит за пределы переданного корня. Последнее
@@ -57,9 +76,10 @@ namespace {
 
 using ScopedHandle = unique_handle<KernelHandlePolicy>;
 
-// Буфер перечисления каталога: 64 КиБ. Запись FILE_FULL_DIR_INFO — это 104
-// байта заголовка плюс имя, а NTFS, ReFS и FAT ограничивают имя 255 символами,
-// то есть запись меньше килобайта и один вызов возвращает десятки записей.
+// Буфер перечисления каталога: 64 КиБ. Запись FILE_ID_BOTH_DIR_INFO — это 104
+// байта заголовка (включая 12 WCHAR короткого имени) плюс имя, а NTFS, ReFS и
+// FAT ограничивают имя 255 символами, то есть запись меньше килобайта и один
+// вызов возвращает десятки записей.
 // Теоретическое «имя не поместилось» (ERROR_MORE_DATA) на поддерживаемых ФС
 // невозможно, но обработка всё равно есть: пишем ошибку и выходим из каталога,
 // а не крутим перечисление заново.
@@ -172,22 +192,23 @@ constexpr DWORD kFileAttributePipe = 0x00000100u;
     return symbol == L'\\' || symbol == L'/';
 }
 
-// Идентификация каталога: серийный номер тома и индекс файла.
+// Идентификация каталога: серийный номер тома и 64-битный индекс файла.
 //
-// Индекс берётся ровно в том виде, в каком он гарантированно совпадает в двух
-// источниках: FILE_FULL_DIR_INFO::FileIndex — это ULONG (32 бита), а
-// GetFileInformationByHandle отдаёт 64-битный nFileIndexHigh/nFileIndexLow.
-// Верхние 32 бита на NTFS нулевые (идентификатор — это MFT-ссылка с
-// 16-битным номером последовательности в старших битах), но полагаться на
-// это нельзя: при полном томе сравнение 32 и 64 бит разошлось бы и обход
-// отказался бы раскрывать каталоги. Поэтому сравниваем и храним младшие
-// 32 бита — это и есть то, что обе стороны отдают.
+// Оба числа берутся в полном 64-битном виде, и это принципиально: запись
+// каталога даёт FILE_ID_BOTH_DIR_INFO::FileId, а открытый дескриптор —
+// BY_HANDLE_FILE_INFORMATION::nFileIndexHigh/nFileIndexLow, и это одно и то же
+// значение (MS-FSIZE: FileId — «64-битный идентификатор, уникальный для
+// файла»). Раньше здесь сравнивались младшие 32 бита, потому что у
+// FILE_FULL_DIR_INFO::FileIndex ULONG, а не потому, что 32 бит хватает: при
+// полном томе усечение дало бы «разные каталоги» там, где каталог один, и
+// обход молча перестал бы раскрывать поддеревья. С FileId такой осторожности
+// больше не нужно.
 struct DirectoryId {
     std::uint64_t volumeSerial{};
-    std::uint32_t fileIndex{};
+    std::uint64_t fileId{};
 
     [[nodiscard]] friend bool operator==(const DirectoryId& left, const DirectoryId& right) noexcept {
-        return left.volumeSerial == right.volumeSerial && left.fileIndex == right.fileIndex;
+        return left.volumeSerial == right.volumeSerial && left.fileId == right.fileId;
     }
 };
 
@@ -195,7 +216,7 @@ struct DirectoryIdHash {
     [[nodiscard]] std::size_t operator()(const DirectoryId& id) const noexcept {
         // Смешивание Фибоначчи: два числа в один ключ, иначе хеш-таблица
         // вырождается в линейный поиск при равных volumeSerial.
-        std::uint64_t mixed = id.volumeSerial * 0x9E3779B97F4A7C15ull + id.fileIndex;
+        std::uint64_t mixed = id.volumeSerial * 0x9E3779B97F4A7C15ull + id.fileId;
         mixed ^= mixed >> 33;
         mixed *= 0xFF51AFD7ED558CCDull;
         mixed ^= mixed >> 33;
@@ -210,7 +231,7 @@ struct DirectoryIdHash {
 struct Record {
     std::wstring name;
     std::uint32_t attributes{};
-    std::uint32_t fileIndex{};  // см. комментарий к DirectoryId: младшие 32 бита
+    std::uint64_t fileId{};  // FILE_ID_BOTH_DIR_INFO::FileId целиком, см. DirectoryId
     std::uint64_t logicalBytes{};
     std::uint64_t creationTime{};
     std::uint64_t lastAccessTime{};
@@ -237,7 +258,7 @@ private:
     // false — обход прекращён (отмена или Stop посетителя), иначе true, даже
     // если поддерево пропущено из-за ошибки.
     [[nodiscard]] bool walkDirectory(const std::wstring& dirPath, std::uint32_t depth, std::uint64_t volumeSerial,
-                                     std::uint32_t expectedIndex);
+                                     std::uint64_t expectedFileId);
     // false — прекратить весь обход.
     [[nodiscard]] bool visitChild(const Record& record, const std::wstring& dirPath, std::uint32_t depth,
                                   std::uint64_t volumeSerial);
@@ -253,9 +274,16 @@ private:
 
     WalkResult result_;
     std::unordered_set<DirectoryId, DirectoryIdHash> visited_;
-    // Буфер перечисления: один на весь обход, потому что вложенные вызовы
-    // перезаписывают его содержимое.
-    std::vector<std::byte> enumBuffer_;
+    // Буферы перечисления: СВОЙ НА КАЖДЫЙ УРОВЕНЬ ГЛУБИНЫ, а не один на весь
+    // обход. Общий буфер неработоспособен: вложенный обход перезаписывает его
+    // своими записями, а родителю после возврата из спуска ещё нужно идти по
+    // ЦЕПОЧКЕ записей своего каталога, а не только дочитать текущую запись.
+    // Копия записи (struct Record) спасала ровно от половины этой беды: обход
+    // молча терял все элементы каталога, стоявшие после первого вложенного
+    // каталога (типичное дерево: корень → sub → deep → файлы). Глубина
+    // ограничена WalkOptions::maxDepth (по умолчанию 64), то есть память
+    // остаётся O(глубина), как и обещает шапка vfs_walk.hpp.
+    std::vector<std::vector<std::byte>> enumBuffers_;
     std::vector<std::byte> reparseBuffer_;
     std::uint64_t sinceCancelCheck_{};
 };
@@ -319,16 +347,10 @@ void Walker::noteError(std::wstring_view path, DWORD code, std::wstring message)
 
 [[nodiscard]] bool Walker::visitChild(const Record& record, const std::wstring& dirPath, std::uint32_t depth,
                                      std::uint64_t volumeSerial) {
-    // Отмена проверяется на границе периода, а не на каждом элементе: stop_token
-    // — это чтение, а дерево в 500 тысяч файлов иначе платит за отмену по
-    // одному SystemFunction036 на элемент (§6.4: «проверка каждые 256
-    // элементов»).
-    if (++sinceCancelCheck_ >= cancelCheckPeriod(options_)) {
-        if (cancelled()) {
-            return false;
-        }
-    }
-
+    // Отмена здесь не проверяется: счётчик кадров живёт в цикле разбора
+    // перечисления, где считается каждый КАДР ответа файловой системы, а не
+    // только предъявленный посетителю элемент (кадры «.» и «..» отфильтровываются
+    // и в счётчик §6.4 не попадают — иначе отменять обход было бы нечем).
     WalkEntry entry;
     entry.name = record.name;
     entry.path = joinPath(dirPath, record.name);
@@ -387,7 +409,7 @@ void Walker::noteError(std::wstring_view path, DWORD code, std::wstring message)
         // каталог). Идентичность проверяется по данным записи каталога и
         // серийному номеру тома родителя: репоинты мы не раскрываем, поэтому
         // все дети одного каталога лежат на томе родителя.
-        const DirectoryId id{volumeSerial, record.fileIndex};
+        const DirectoryId id{volumeSerial, record.fileId};
         if (visited_.find(id) != visited_.end()) {
             result_.stats.loopsDetected += 1;
             entry.loopDetected = true;
@@ -407,14 +429,14 @@ void Walker::noteError(std::wstring_view path, DWORD code, std::wstring message)
         }
     }
 
-    if (descend && !walkDirectory(entry.path, entry.depth, volumeSerial, record.fileIndex)) {
+    if (descend && !walkDirectory(entry.path, entry.depth, volumeSerial, record.fileId)) {
         return false;
     }
     return true;
 }
 
 [[nodiscard]] bool Walker::walkDirectory(const std::wstring& dirPath, std::uint32_t depth, std::uint64_t volumeSerial,
-                                         std::uint32_t expectedIndex) {
+                                         std::uint64_t expectedFileId) {
     const std::wstring extended = toExtendedPath(dirPath);
     const ScopedHandle dir(::CreateFileW(extended.c_str(), kListAccess, kShareAll, nullptr, OPEN_EXISTING,
                                          kDirectoryFlags, nullptr));
@@ -446,16 +468,16 @@ void Walker::noteError(std::wstring_view path, DWORD code, std::wstring message)
         return true;
     }
 
-    const std::uint32_t shortIndex = static_cast<std::uint32_t>(toFileIndex(info));
-    if (depth > 0 && (info.dwVolumeSerialNumber != volumeSerial || shortIndex != expectedIndex)) {
+    const std::uint64_t actualFileId = toFileIndex(info);
+    if (depth > 0 && (info.dwVolumeSerialNumber != volumeSerial || actualFileId != expectedFileId)) {
         // Тот каталог, который мы перечислили, уже не тот: переименование,
         // монтирование тома, гонка с другим процессом. Идти по такому каталогу
         // нельзя — это ровно тот «выход за пределы корня правила», который
         // SPEC §4 FR-6 запрещает. Событие в лог, поддерево пропускаем.
         mrproper::core::LogFields fields;
         fields.push_back(mrproper::core::logField("path", core::toUtf8(dirPath)));
-        fields.push_back(mrproper::core::logField("expectedIndex", expectedIndex));
-        fields.push_back(mrproper::core::logField("actualIndex", shortIndex));
+        fields.push_back(mrproper::core::logField("expectedFileId", expectedFileId));
+        fields.push_back(mrproper::core::logField("actualFileId", actualFileId));
         mrproper::core::logWarn("vfs.walk.changed", "каталог изменился до раскрытия — поддерево пропущено", fields);
         return true;
     }
@@ -464,71 +486,129 @@ void Walker::noteError(std::wstring_view path, DWORD code, std::wstring message)
     // идентичность до спуска, а корень посещается один раз. insert() здесь
     // регистрирует каталог и заодно страхует от повторов, если проверка
     // родителя была ослаблена (followReparsePoint, гонка).
-    if (!visited_.insert(DirectoryId{info.dwVolumeSerialNumber, shortIndex}).second) {
+    if (!visited_.insert(DirectoryId{info.dwVolumeSerialNumber, actualFileId}).second) {
         result_.stats.loopsDetected += 1;
         return true;
     }
 
-    if (enumBuffer_.size() < kEnumBufferBytes) {
-        enumBuffer_.resize(kEnumBufferBytes);
+    // Свой буфер на уровень глубины (см. enumBuffers_). Обращение идёт ЧЕРЕЗ
+    // enumBuffers_[depth] в каждой точке, где нужен буфер, и ссылку на буфер
+    // хранить не приходится: вложенный спуск может расширить внешний вектор,
+    // переехав все внутренние, и сохранённая ссылка стала бы висячей.
+    if (enumBuffers_.size() <= static_cast<std::size_t>(depth)) {
+        enumBuffers_.resize(static_cast<std::size_t>(depth) + 1);
     }
+    if (enumBuffers_[depth].size() < kEnumBufferBytes) {
+        enumBuffers_[depth].resize(kEnumBufferBytes);
+    }
+    // Границы данных — размер буфера, который мы отдали, а не «сколько записал
+    // API»: у GetFileInformationByHandleEx четвёртого параметра «сколько записано»
+    // нет вообще. Верхняя граница записи — заголовок плюс имя.
+    constexpr std::size_t kHeaderBytes = offsetof(FILE_ID_BOTH_DIR_INFO, FileName);
 
     bool restart = true;
     for (;;) {
-        DWORD returned = 0;
+        // Обнуление перед КАЖДЫМ вызовом — обязательная часть разбора, а не
+        // гигиена: концом цепочки служит NextEntryOffset == 0, и без нулей
+        // остатки предыдущего каталога выглядели бы как записи текущего (а в
+        // худшем случае — как запись с именем, которого нет).
+        std::memset(enumBuffers_[depth].data(), 0, enumBuffers_[depth].size());
         const BOOL listed = ::GetFileInformationByHandleEx(
-            dir.get(), restart ? FileFullDirectoryRestartInfo : FileFullDirectoryInfo, enumBuffer_.data(),
-            static_cast<DWORD>(enumBuffer_.size()));
+            dir.get(), restart ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo,
+            enumBuffers_[depth].data(), static_cast<DWORD>(enumBuffers_[depth].size()));
         restart = false;
         if (!listed) {
             const DWORD code = ::GetLastError();
             if (code == ERROR_NO_MORE_FILES) {
                 return true;  // каталог закончился — обычное завершение
             }
+            // ERROR_MORE_DATA — запись не поместилась в буфер даже целиком.
+            // На поддерживаемых ФС имя короче килобайта, поэтому невозможно;
+            // обработка есть, чтобы каталог не крутился заново вечно.
             noteError(dirPath, code);
             return true;
         }
 
         std::size_t offset = 0;
         for (;;) {
-            if (offset + sizeof(FILE_FULL_DIR_INFO) > returned) {
+            // Отмена — на границе периода, а не на каждом кадре: stop_token
+            // это чтение, а дерево в 500 тысяч файлов иначе платит за отмену по
+            // одному SystemFunction036 на запись (§6.4: «проверка каждые 256
+            // элементов»). Считаются именно кадры ответа файловой системы.
+            if (++sinceCancelCheck_ >= cancelCheckPeriod(options_)) {
+                if (cancelled()) {
+                    return false;
+                }
+            }
+
+            // Буфер берётся заново на каждом кадре: visitChild мог расширить
+            // внешний вектор (через спуск в подкаталог), и сохранённая до
+            // спуска ссылка на внутренний вектор уже указывала бы в освобождённую
+            // память. Здесь она берётся ПОСЛЕ того, как спуск уже вернулся.
+            const std::vector<std::byte>& buffer = enumBuffers_[depth];
+            if (offset + kHeaderBytes > buffer.size()) {
                 noteError(dirPath, ERROR_BAD_LENGTH);
                 return true;
             }
-            const auto* raw = reinterpret_cast<const FILE_FULL_DIR_INFO*>(enumBuffer_.data() + offset);
+            const auto* raw = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(buffer.data() + offset);
 
-            // Копия записи: после рекурсивного спуска буфер перечисления уже
-            // перезаписан, и raw больше нельзя ни читать, ни использовать.
-            Record record;
-            record.attributes = raw->FileAttributes;
-            record.fileIndex = raw->FileIndex;
-            record.logicalBytes = static_cast<std::uint64_t>(raw->EndOfFile.QuadPart);
-            record.creationTime = toUInt64(raw->CreationTime);
-            record.lastAccessTime = toUInt64(raw->LastAccessTime);
-            record.lastWriteTime = toUInt64(raw->LastWriteTime);
-            const std::size_t nameOffset = offsetof(FILE_FULL_DIR_INFO, FileName);
-            if (raw->FileNameLength > returned - offset - nameOffset) {
+            // Пустой каталог: API может ответить успехом и не записать ни
+            // одной записи. Отличить это от «прочитан хвост чужого вызова»
+            // можно только потому, что буфер обнулён: запись с пустым именем
+            // файловая система не отдаёт.
+            if (raw->FileNameLength == 0 && raw->FileAttributes == 0 && raw->FileId.QuadPart == 0 &&
+                raw->NextEntryOffset == 0) {
+                return true;
+            }
+
+            // Имя — это FileNameLength БАЙТ UTF-16, то есть ровно
+            // FileNameLength / sizeof(wchar_t) символов. Нечётная длина и выход
+            // имени за буфер означают, что ответа мы не понимаем.
+            const std::size_t nameLength = static_cast<std::size_t>(raw->FileNameLength) / sizeof(wchar_t);
+            if ((raw->FileNameLength % sizeof(wchar_t)) != 0 ||
+                offset + kHeaderBytes + static_cast<std::size_t>(raw->FileNameLength) > buffer.size()) {
                 noteError(dirPath, ERROR_BAD_LENGTH);
                 return true;
             }
-            record.name.assign(raw->FileName, static_cast<std::size_t>(raw->FileNameLength) / sizeof(wchar_t));
-            const std::size_t nextOffset = raw->NextEntryOffset;
+            const std::wstring_view name(raw->FileName, nameLength);
+            const std::size_t nextOffset = static_cast<std::size_t>(raw->NextEntryOffset);
 
-            if (!visitChild(record, dirPath, depth, info.dwVolumeSerialNumber)) {
-                return false;
+            // «.» и «..» приходят (проверено прямым вызовом) и посетителю не
+            // предъявляются: элемент с именем каталога — это «сам каталог
+            // посещён», а не «в каталоге есть кое-что». Спуск в «..» вдобавок
+            // увел бы обход за пределы корня, а в «.» — вернулся бы в этот же
+            // каталог вторым проходом.
+            if (name != L"." && name != L"..") {
+                // Запись копируется, а не обрабатывается на месте: имя элемента
+                // идёт посетителю в std::wstring, и держать между итерациями
+                // указатель в буфер перечисления проще не делать. Буфер теперь
+                // свой на уровень глубины (см. enumBuffers_), так что «указатель
+                // указывает в ответ чужого вызова» больше не грозит — но
+                // правило «копия вместо ссылки» остаётся.
+                Record record;
+                record.attributes = raw->FileAttributes;
+                record.fileId = toUInt64(raw->FileId);
+                record.logicalBytes = static_cast<std::uint64_t>(raw->EndOfFile.QuadPart);
+                record.creationTime = toUInt64(raw->CreationTime);
+                record.lastAccessTime = toUInt64(raw->LastAccessTime);
+                record.lastWriteTime = toUInt64(raw->LastWriteTime);
+                record.name.assign(name);
+
+                if (!visitChild(record, dirPath, depth, info.dwVolumeSerialNumber)) {
+                    return false;
+                }
             }
 
             if (nextOffset == 0) {
-                break;
+                break;  // цепочка в этом буфере кончилась; следующий вызов дочитает остаток каталога
             }
-            const std::size_t advanced = offset + nextOffset;
-            if (advanced <= offset || advanced >= returned) {
-                // Смещение не сходится: буфер повреждён или вернулось не то, что
-                // мы запросили. Дальше идти опасно — прекращаем каталог.
+            // Смещение обязано уводить вперёд и оставаться внутри буфера: иначе
+            // следующий кадр пришлось бы читать из чужой памяти.
+            if (nextOffset < kHeaderBytes || nextOffset >= buffer.size() - offset) {
                 noteError(dirPath, ERROR_BAD_LENGTH);
                 return true;
             }
-            offset = advanced;
+            offset += nextOffset;
         }
     }
 }

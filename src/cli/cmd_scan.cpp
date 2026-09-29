@@ -9,17 +9,20 @@
 // Чего в этом файле нет и кто это должен сделать
 // ---------------------------------------------------------------------------
 //
-// 1) Адаптера engine::FileSystemProbe над platform::vfs. Его нет в
-//    репозитории: engine объявляет интерфейс (engine/candidate_collector.hpp),
-//    platform умеет обход (platform::vfs::walk, vfs::measureFindData,
-//    vfs_paths::toExtendedPath), а мост между ними не принадлежит ни одной
-//    задаче волны. Мост тонкий и однозначный: UTF-8 пути правил → UTF-16,
-//    FILETIME → unix-секунды, аллоцированный размер из vfs::measureFindData,
-//    обход через vfs::walk с переводом WalkStep в VisitStep. Пока моста нет,
-//    команда без ScanServices::createProbe печатает в stderr точное требование
-//    и возвращает ScanFailed — вместо того чтобы «сканировать» выдуманные
-//    нули. Зависимостью, а не вызовом platform внутри CLI, он сделаен ещё и
-//    потому, что только так команда тестируется без диска (§11.1).
+// 1) Адаптера engine::FileSystemProbe над platform::vfs как такового: он живёт
+//    в engine (engine/file_system_probe.{hpp,cpp}), а отсюда подключается двумя
+//    строками — makePlatformScanProbe() как значение по умолчанию поля
+//    ScanServices::createProbe и platformScanProbeDiagnostics() для пометки
+//    «degraded». Мост тонкий и однозначный: UTF-8 пути правил → UTF-16,
+//    FILETIME → unix-секунды, аллоцированный размер из vfs::queryAllocatedSize,
+//    обход через vfs::walk с переводом WalkStep в VisitStep. Обход не
+//    переписывается и логика правил не дублируется — это требования §4 FR-6
+//    (reparse points, длинные пути, нормализация) и FR-4 (аллоцированный
+//    размер), и обе они адресуются одним файлом в слое platform.
+//
+//    Код 4 (ScanFailed) остался только для честной ошибки: адаптер не задан,
+//    прогон не дал отчёта, ни одна задача не выполнена. Код 3 — только за
+//    набором правил, как и объявлено в cmd_scan.hpp.
 //
 // 2) Карты разделов: её добывает platform::devices, а `scan` по §6.2 занимается
 //    кандидатами. Карта попадает в отчёт только с --with-disks и только если
@@ -69,6 +72,7 @@
 #include "core/rulesync.hpp"
 #include "core/units.hpp"
 #include "engine/candidate_collector.hpp"
+#include "engine/file_system_probe.hpp"
 #include "engine/scan_coordinator.hpp"
 #include "engine/scoring_bridge.hpp"
 
@@ -104,6 +108,7 @@ constexpr std::uint64_t kMaxDurationMilliseconds = 24ull * 60 * 60 * 1000;
 // прогон CLI, не читая сообщений.
 constexpr std::string_view kEventStart = "cli.scan.start";
 constexpr std::string_view kEventFinish = "cli.scan.finish";
+constexpr std::string_view kEventDegraded = "cli.scan.degraded";
 
 // Переменные окружения, которые подставляются в локаторы правил
 // (docs/rules-authoring.md §4). Список закрытый и повторяет имена из набора
@@ -606,16 +611,18 @@ void sortCandidates(std::vector<core::CleanupCandidate>& candidates) {
     return total;
 }
 
-// notes отчёта: сводка прогона, заметки сборщика («правило X: …») и то, что
-// человек попросил через --note. Порядок фиксирован, лишнее считается.
+// notes отчёта: сводка прогона, заметки сборщика («правило X: …»), состояние
+// адаптера обхода и то, что человек попросил через --note. Порядок фиксирован,
+// лишнее считается.
 [[nodiscard]] std::string buildNotes(const ScanOptions& options, const std::vector<std::string>& sinkNotes,
                                     std::uint64_t notesDropped, const engine::ScanRunReport& report,
-                                    std::size_t candidates) {
+                                    std::size_t candidates, const std::string& degraded) {
     std::ostringstream text;
     text << "кандидатов: " << candidates << "; задач: " << report.tasks.size() << "; выполнено: " << report.completed
          << "; прервано: " << report.cancelledTasks << "; пропущено: " << report.skipped << "; ошибок: " << report.failed;
     if (report.cancelled) text << "; прогон прерван";
     if (notesDropped != 0) text << "; замечаний сборщика опущено: " << notesDropped;
+    if (!degraded.empty()) text << "\ndegraded: " << degraded;
     for (const std::string& note : sinkNotes) text << '\n' << note;
     if (!options.note.empty()) text << '\n' << options.note;
     return text.str();
@@ -642,6 +649,15 @@ const char* toString(ScanExit code) noexcept {
     }
     return "unknown";
 }
+
+// Мост обхода ФС, которым команда сканирует по умолчанию. Определение здесь, а
+// не в args.cpp — потому что слой cli не должен включать заголовки platform
+// напрямую (см. шапку файла): мост принадлежит engine, а команда получает его
+// через ScanServices::createProbe. Так разбор аргументов, сбор отчёта и печать
+// прогресса по-прежнему проверяются без диска (§11.1).
+std::unique_ptr<engine::FileSystemProbe> makePlatformScanProbe() { return engine::makeVfsFileSystemProbe(); }
+
+std::string platformScanProbeDiagnostics() { return engine::describeVfsProbeStats(); }
 
 std::string scanUsageText() {
     return "Использование: mrproper-cli scan [опции]\n"
@@ -800,8 +816,10 @@ int runScan(const std::vector<std::string>& args, const ScanServices& services, 
         return static_cast<int>(ScanExit::Ok);
     }
     if (!services.createProbe) {
-        err << "[scan] не передан адаптер обхода ФС (ScanServices::createProbe): моста engine::FileSystemProbe над\n"
-               "[scan] platform::vfs в репозитории пока нет, сканировать нечем. Требования — в cmd_scan.cpp.\n";
+        // Это не «моста нет в репозитории» (он есть: engine/file_system_probe),
+        // а вызывающий, который явно его снял (`createProbe = nullptr`).
+        err << "[scan] не передан адаптер обхода ФС (ScanServices::createProbe пуст): сканировать нечем.\n"
+               "[scan] По умолчанию адаптер подставляет команда (engine::FileSystemProbe над platform::vfs).\n";
         return static_cast<int>(ScanExit::ScanFailed);
     }
 
@@ -992,6 +1010,19 @@ int runScan(const std::vector<std::string>& args, const ScanServices& services, 
         err << "[scan] отказов чтения каталогов: " << sink.probeErrors() << " — см. errors отчёта\n";
     }
 
+    // «degraded» — прогон состоялся, но читалось не всё: сессия без прав админа,
+    // исчезнувший элемент, том, не отдавший аллоцированный размер (§4 FR-1
+    // «приложение не падает»). Код возврата при этом прежний: неполнота чтения —
+    // повод сказать о ней в stderr и в notes отчёта, а не повод объявить скан
+    // неудачным (тогда «мусора нет» и «прочитали не всё» стали бы неразличимы).
+    const std::string degraded = services.probeDiagnostics ? services.probeDiagnostics() : std::string{};
+    if (!degraded.empty()) {
+        err << "[scan] " << degraded << "\n";
+        core::LogFields degradedFields;
+        degradedFields.push_back(core::logField("degraded", std::string_view(degraded)));
+        core::logWarn(kEventDegraded, "скан прошёл в неполных условиях", std::move(degradedFields));
+    }
+
     // ---- Сборка отчёта. Дальше в stdout уходит только JSON. ----
     const std::int64_t finishedAtUnix = nowUnix();
 
@@ -1044,7 +1075,7 @@ int runScan(const std::vector<std::string>& args, const ScanServices& services, 
         cancelError.atUnix = finishedAtUnix;
         report.errors.push_back(std::move(cancelError));
     }
-    report.notes = buildNotes(options, sink.notes(), sink.notesDropped(), *runReport, report.candidates.size());
+    report.notes = buildNotes(options, sink.notes(), sink.notesDropped(), *runReport, report.candidates.size(), degraded);
 
     for (const std::string& problem : core::validateReport(report)) {
         err << "[scan] отчёт не согласован: " << problem << '\n';

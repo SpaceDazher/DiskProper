@@ -1,0 +1,93 @@
+name: Предложение / Feature request
+description: >
+  Новая возможность, улучшение существующей или изменение поведения — с обоснованием
+  и ссылкой на раздел спецификации. Для ошибок есть отдельный шаблон.
+title: "[FEATURE] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо. MrProper — утилита, которая удаляет файлы, поэтому предложение
+        оценивается прежде всего по безопасности: что именно станет удаляться,
+        кто это подтверждает и что происходит, если пользователь ошибся.
+
+        Если в предложении затрагивается приватность (телеметрия, содержимое
+        отчёта, пути, серийники), это предмет [SECURITY.md](https://github.com/OWNER/MrProper/blob/master/SECURITY.md),
+        и обсуждать такое стоит приватно.
+
+        Thank you for the suggestion. A proposal for a tool that deletes files is
+        judged first by safety: what gets deleted, who confirms it, and what
+        happens when the user is wrong.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую задачу это решает / What problem does it solve
+      description: >
+        Не «хочу кнопку X», а ситуация: что человек не может сделать сегодня и
+        чем это плохо. Ответ «добавить флаг» без описания ситуации — не
+        предложение.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Предлагаемое поведение / Proposed behaviour
+      description: >
+        Что должно происходить, по шагам. Отдельно: что делает приложение, если
+        условие не выполнено (нет прав, файл занят, набор правил недоступен).
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Безопасность и обратимость / Safety and reversibility
+      description: >
+        Обязательный раздел для всего, что касается удаления: какие категории
+        затрагиваются, каков уровень риска (Review/Risky по SPEC §4 FR-3),
+        требуется ли --allow-risky, возможен ли откат (FR-7), что попадает в
+        отчёт (FR-8). Если ничего не удаляется — так и напишите.
+    validations:
+      required: true
+  - type: textarea
+    id: spec
+    attributes:
+      label: Связь со спецификацией / Relation to the spec
+      description: >
+        Раздел и пункт SPEC.md, который это меняет или достраивает, либо «нет,
+        это новое» — с указанием места, где ему жить.
+      placeholder: "SPEC §4 FR-3 «Каталог категорий», новый пункт"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Рассмотренные варианты / Alternatives
+      description: Что ещё решает задачу и почему предложенный способ лучше
+    validations:
+      required: false
+  - type: textarea
+    id: localization
+    attributes:
+      label: Локализация / Localization
+      description: >
+        Продукт двуязычный (SPEC §5 «Локализация»). Появится ли новый текст
+        интерфейса или вывод CLI, и каким он будет по-русски и по-английски?
+    validations:
+      required: false
+  - type: checkboxes
+    id: readiness
+    attributes:
+      label: Готовность / Readiness
+      options:
+        - label: >
+            Я понимаю, что ворота (build, e2e, clang-tidy, SBOM) должны остаться
+            зелёными, и готов их прогнать или приложить вывод
+          required: true
+        - label: >
+            Сценарий будет покрыт e2e-тестом в tests/e2e (SPEC §11 п.3, §12.3)
+          required: false
+        - label: >
+            Мой текст не содержит приватных данных, а отчёты и дампы я замаскировал
+            (SECURITY.md)
+          required: true

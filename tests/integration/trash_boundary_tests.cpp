@@ -165,7 +165,12 @@ void skip(const char* name, const std::string& why) {
     };
     const DWORD tag = static_cast<DWORD>(kIoReparseTagMountPoint);
     std::memcpy(buffer.data(), &tag, sizeof(tag));                    // ReparseTag
-    put16(4u, static_cast<WORD>(payloadBytes));                        // ReparseDataLength
+    // ReparseDataLength = остаток буфера после восьмибайтовой шапки, то есть
+    // 8 + PathBuffer. Раньше здесь стоял payloadBytes без этих восьми, и система
+    // отвечала ERROR_INVALID_REPARSE_DATA (4392) — тест объявлял, что «точка
+    // монтирования на этом хосте не создаётся», хотя отдавал сам тест. Рецепт
+    // проверен перебором в tests/integration/vfs_edge_tests.cpp.
+    put16(4u, static_cast<WORD>(8u + payloadBytes));                  // ReparseDataLength
     put16(6u, static_cast<WORD>(0));                                   // Reserved
     put16(8u, static_cast<WORD>(0));                                   // SubstituteNameOffset
     put16(10u, static_cast<WORD>(substituteBytes));                   // SubstituteNameLength

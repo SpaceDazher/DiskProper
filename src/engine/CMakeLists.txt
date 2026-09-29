@@ -5,9 +5,16 @@
 #
 # Слой лежит НАД platform и core: scan_coordinator (пул потоков, std::stop_token,
 # прогресс, отмена), locks (Restart Manager), candidate_collector, scan_result,
-# scoring_bridge. Поэтому единственная строка «вниз» — это core и platform;
+# scoring_bridge, file_system_probe (мост FileSystemProbe → platform::vfs,
+# задача F5). Поэтому единственная строка «вниз» — это core и platform;
 # обратных зависимостей (windows.h в engine не нужен, оркестрация переносима)
 # файл не вводит.
+#
+# file_system_probe — единственный модуль слоя, который знает про Win32, и ровно
+# настолько: он переводит элементы platform::vfs в форму, которую понимает
+# engine::collectCandidates, и ничего не решает про мусор. Именно он подключает
+# `mrproper-cli scan` к реальному диску: без него ScanServices::createProbe был
+# бы пуст и команда возвращала код 4.
 # ---------------------------------------------------------------------------
 
 # Исходники появляются волнами W11+ по одному .cpp на модуль: каждый агент

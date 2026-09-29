@@ -27,6 +27,19 @@ struct Rule {
     std::int64_t minAgeDays{};
     std::vector<std::string> requiresProcessesClosed;
     bool groupByProfile{};
+
+    // «Только оценка»: кандидат попадает в отчёт и агрегаты, но не удаляется
+    // НИ при каком профиле, подтверждении и уровне (SPEC §4 FR-3: «только в
+    // отчёте»). Пока флага не было, обещание «оценка без удаления» держалось
+    // на тексте заметки правила, а --allow-risky превращал его в удаление
+    // (docs/review-02.md F-04, обход подтверждён прогоном).
+    bool estimateOnly{false};
+
+    // Порог размера файла, байты. Категория user.bigfiles по FR-3 — «файлы
+    // > 1 ГБ», и без этого поля правило срабатывало на ВСЁ содержимое каталога
+    // (docs/review-02.md F-02). 0 — правило порога не объявляет, и тогда
+    // элемент пользовательских данных не выбирается вовсе (core::plan).
+    std::uint64_t minFileBytes{};
     std::string titleRu;
     std::string titleEn;
     std::string note;
@@ -40,6 +53,16 @@ struct Rule {
 
     bool matches(const std::string& normalizedPath) const;
     bool excluded(const std::string& normalizedPath) const;
+
+    // Правило может что-то отсечь внутри своего корня? min-age, исключения,
+    // фильтр листьев и порог размера — всё это уменьшает множество, которое
+    // удалит исполнитель. Пока ответ был «нет», корень удалялся целиком вместе
+    // со «свежими» и явно исключёнными файлами (docs/review-02.md F-01).
+    // Сборщик (engine::candidate_collector) спрашивает это ДО обхода: если
+    // «нет», список разрешённых файлов не нужен и кандидат остаётся каталогом.
+    [[nodiscard]] bool filtersInsideRoot() const {
+        return minAgeDays > 0 || minFileBytes > 0 || !locatorExcludes.empty();
+    }
     std::string title() const;  // по текущему языку
 };
 

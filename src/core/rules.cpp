@@ -14,7 +14,10 @@ const std::vector<std::string>& allowedFields() {
     static const std::vector<std::string> kFields = {
         "rules",     "id",           "category", "safety",          "locator", "locatorExcludes",
         "minAgeDays", "requiresProcessesClosed", "groupByProfile", "title", "note",
-        "schemaVersion", "version", "minAppVersion"};
+        "schemaVersion", "version", "minAppVersion",
+        // docs/review-02 F-02, F-04: обещания «только оценка» и «файлы > 1 ГБ»
+        // держались на тексте заметки. Теперь это поля правила.
+        "estimateOnly", "minFileBytes"};
     return kFields;
 }
 
@@ -113,6 +116,18 @@ Rule Rule::fromJson(const json::Value& value, const std::string& origin) {
 
     rule.requiresProcessesClosed = stringArray(value, "requiresProcessesClosed", origin);
     rule.groupByProfile = value.find("groupByProfile") != nullptr && value.find("groupByProfile")->asBool();
+
+    if (const json::Value* estimate = value.find("estimateOnly")) {
+        if (!estimate->isBool()) throw RuleError(origin + ": estimateOnly должно быть true или false");
+        rule.estimateOnly = estimate->asBool();
+    }
+
+    if (const json::Value* minSize = value.find("minFileBytes")) {
+        if (!minSize->isNumber()) throw RuleError(origin + ": minFileBytes должно быть числом");
+        const double raw = minSize->asNumber();
+        if (raw < 0) throw RuleError(origin + ": minFileBytes не может быть отрицательным");
+        rule.minFileBytes = static_cast<std::uint64_t>(raw);
+    }
 
     if (const json::Value* title = value.find("title")) {
         if (!title->isObject()) throw RuleError(origin + ": title должен быть объектом {ru,en}");

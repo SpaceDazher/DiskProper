@@ -70,7 +70,12 @@
 //     попали в кандидат, а не по всему каталогу: иначе «старше 30 дней» в отчёте
 //     означало бы возраст того файла, который по min-age отсечётся;
 //   * confidence == 0 и reasons не содержат оценки — их дописывает
-//     engine::scoring_bridge через CollectOptions::finalize.
+//     engine::scoring_bridge через CollectOptions::finalize;
+//   * каждому кандидату отвечает ровно один core::CandidateManifest, и в нём
+//     либо право удалить корень целиком (правило ничего не отсекло), либо
+//     перечисление того, что удалять можно. Отдельного «удалить каталог, а
+//     файлы отсечены» не существует: именно этим удалялся весь %TEMP% вместе
+//     со свежими файлами (docs/review-02.md F-01).
 #pragma once
 
 #include <cstddef>
@@ -82,6 +87,7 @@
 #include <vector>
 
 #include "core/model.hpp"
+#include "core/plan.hpp"
 #include "core/rules.hpp"
 
 namespace mrproper::engine {
@@ -242,6 +248,13 @@ struct CollectOptions {
     // заметка содержит путь, а путей может быть много.
     std::size_t maxNotes{64};
 
+    // Сколько путей максимум попадает в список «что разрешено удалять»
+    // (docs/review-02.md F-01). Список нужен для каждого кандидата, у которого
+    // правило хоть что-то отсекает, а каталог в 500 тысяч файлов в 150 МБ
+    // памяти (SPEC §5) не помещается. Переполнение — не «удалим часть»:
+    // список помечается неполным, и кандидат перестаёт быть удаляемым.
+    std::size_t maxAllowedPaths{200000};
+
     CandidateFinalizer finalize;
 };
 
@@ -269,6 +282,7 @@ struct CollectStats {
     std::uint64_t filesCounted{};
     std::uint64_t filesTooYoung{};      // не прошли min-age
     std::uint64_t filesUnknownAge{};    // ФС не отдала время записи, возраст не доказать
+    std::uint64_t filesTooSmall{};      // меньше порога размера из правила (F-02)
     std::uint64_t filesExcluded{};      // вырезаны locatorExcludes
     std::uint64_t directoriesPruned{};  // исключение вырезало каталог целиком
     std::uint64_t reparseSkipped{};     // ссылки, в которые не пошли (FR-6)
@@ -279,6 +293,12 @@ struct CollectStats {
     std::uint64_t canceled{};
     std::uint64_t notesDropped{};       // заметок сверх maxNotes
 
+    // Списки удаляемого (docs/review-02.md F-01): сколько путей перечислено и
+    // сколько кандидатов осталось без полного списка (предел maxAllowedPaths).
+    std::uint64_t pathsListed{};
+    std::uint64_t pathsOmitted{};
+    std::uint64_t candidatesUnlisted{};
+
     // Что пропущено и почему: «правило X: неразрешённая переменная %APPDATA%»,
     // «правило Y: сработал предел 256 корней». Для отчёта и экрана настроек.
     std::vector<std::string> notes;
@@ -286,6 +306,12 @@ struct CollectStats {
 
 struct CollectResult {
     std::vector<core::CleanupCandidate> candidates;
+    // Манифест каждого кандидата: что правило разрешило удалить и можно ли
+    // удалять корень целиком (docs/review-02.md F-01..F-04). Позиция в этом
+    // векторе — candidateIndex соответствующего кандидата, и он же ключ в
+    // core::PlanOptions/PlanBuilder. Без манифестов план не удаляет ничего:
+    // корень нельзя сносить, пока не доказано, что отбирать нечего.
+    std::vector<core::CandidateManifest> manifests;
     CollectStats stats;
     bool canceled{};  // прогон прерван по stop_token; кандидаты частичные и пригодны
 };

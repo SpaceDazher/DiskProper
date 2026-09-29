@@ -145,6 +145,12 @@ struct PlanItemView {
     bool selected{};  // чекбокс включён — элемент попадёт в операции
     bool visible{};   // строка показывается (Risky скрыт, пока не подтверждён показ)
     bool locked{};    // файлы держит приложение — чекбокс недоступен
+    // Что удалится на самом деле (docs/review-02.md F-01): rootDeleteOnly —
+    // удаляется каталог целиком (правило ничего не отсекло), иначе элемент
+    // удаляется по списку из allowedCount файлов. Чекбокс у такого элемента
+    // недоступен, пока список не получен (SkipReason::NeedsEnumeration).
+    std::size_t allowedCount{};
+    bool rootDeleteOnly{true};
     std::string reason;
 };
 
@@ -258,6 +264,15 @@ public:
     // список операций другой.
     void setCandidates(std::vector<core::CleanupCandidate> candidates);
 
+    // Манифесты скана: что каждому кандидату разрешено удалять
+    // (docs/review-02.md F-01..F-04). Без них план справедливо не выбирает
+    // ничего: корень удалять нельзя, пока не доказано, что отбирать нечего.
+    // Списки файлов разделяются указателем — копии не делается.
+    void setManifests(std::vector<core::CandidateManifest> manifests);
+    void setCandidates(std::vector<core::CleanupCandidate> candidates,
+                       std::vector<core::CandidateManifest> manifests);
+    [[nodiscard]] const core::CandidateManifest* manifestFor(std::size_t candidateIndex) const noexcept;
+
     [[nodiscard]] const std::vector<core::CleanupCandidate>& candidates() const noexcept { return candidates_; }
     [[nodiscard]] bool empty() const noexcept { return candidates_.empty(); }
 
@@ -336,10 +351,16 @@ public:
 
 private:
     void rebuild();
-    [[nodiscard]] core::SelectionDecision decideWithOverride(const core::CleanupCandidate& candidate,
+    [[nodiscard]] core::SelectionDecision decideWithOverride(std::size_t candidateIndex,
                                                              SelectionOverride selection) const;
+    // Запрещено ли правилом брать элемент: «только оценка», отсутствие порога
+    // размера у пользовательских данных, неполный список разрешённого
+    // (docs/review-02.md F-01..F-04). Ни «выбрать всё», ни галочка категории
+    // такой запрет не снимают.
+    [[nodiscard]] bool blockedByRule(std::size_t candidateIndex) const;
 
     std::vector<core::CleanupCandidate> candidates_;
+    std::vector<core::CandidateManifest> manifests_;  // параллелен candidates_ по candidateIndex
     std::vector<SelectionOverride> overrides_;  // параллелен candidates_; пусто = Auto
     core::PlanOptions options_;
     core::CleanupPlan plan_;

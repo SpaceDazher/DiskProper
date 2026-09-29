@@ -100,6 +100,7 @@ struct Labels {
     const char* colStatus;
     const char* colTime;
     const char* colError;
+    const char* colRisk;  // уровень риска операции (заполняет вызывающая сторона)
 
     const char* colStage;
     const char* colSubject;
@@ -198,6 +199,7 @@ const Labels kRu = {
     "Итог",
     "Время",
     "Ошибка",
+    "Уровень риска",
 
     "Этап",
     "Объект",
@@ -296,6 +298,7 @@ const Labels kEn = {
     "Status",
     "Time",
     "Error",
+    "Risk level",
 
     "Stage",
     "Subject",
@@ -346,6 +349,17 @@ const char* safetyLabel(SafetyLevel level, HtmlReportLanguage language) {
         case SafetyLevel::Risky: return l.safetyRisky;
     }
     return l.safetyReview;
+}
+
+// Класс фишки уровня риска: тот же, что у раздела кандидатов, чтобы «безопасно»
+// в обеих таблицах выглядело одинаково.
+const char* safetyClass(SafetyLevel level) {
+    switch (level) {
+        case SafetyLevel::Safe: return "ok";
+        case SafetyLevel::Review: return "warn";
+        case SafetyLevel::Risky: return "err";
+    }
+    return "warn";
 }
 
 const char* actionLabel(PlanAction action, HtmlReportLanguage language) {
@@ -994,10 +1008,6 @@ void renderCandidates(std::string& out, const HtmlReportInput& in, const HtmlRep
         }
         if (lockers.empty()) lockers = escapeHtml(kUnknown);
 
-        const char* safetyClass = "ok";
-        if (candidate.safety == SafetyLevel::Review) safetyClass = "warn";
-        if (candidate.safety == SafetyLevel::Risky) safetyClass = "err";
-
         std::vector<std::string> cells;
         cells.push_back("<td>" + cellText(candidate.category) + "</td>");
         cells.push_back("<td>" + cellText(candidate.displayName) + "<div class=\"path\">" +
@@ -1005,7 +1015,8 @@ void renderCandidates(std::string& out, const HtmlReportInput& in, const HtmlRep
                         "</div></td>");
         cells.push_back("<td class=\"num\">" + cellBytes(candidate.allocatedBytes, opt.binaryUnits) + "</td>");
         cells.push_back("<td class=\"num\">" + escapeHtml(std::to_string(candidate.fileCount)) + "</td>");
-        cells.push_back("<td>" + chip(safetyLabel(candidate.safety, opt.language), safetyClass) + "</td>");
+        cells.push_back("<td>" + chip(safetyLabel(candidate.safety, opt.language), safetyClass(candidate.safety)) +
+                        "</td>");
         cells.push_back("<td class=\"num\">" + escapeHtml(formatPercent(candidate.confidence / 100.0, 0)) + "</td>");
         cells.push_back("<td class=\"num\">" + ageCell + "</td>");
         if (opt.showReasons) cells.push_back("<td>" + reasons + "</td>");
@@ -1044,6 +1055,10 @@ void renderOperations(std::string& out, const HtmlReportInput& in, const HtmlRep
     appendHeaderCell(out, labels.colAction, false);
     appendHeaderCell(out, labels.colCandidate, false);
     appendHeaderCell(out, labels.colFreed, true);
+    // FR-4/§12: уровень риска операции — не украшение, а часть ответа на вопрос
+    // «что именно было удалено». Поле заполняет вызывающая сторона (cmd_report,
+    // view_report), а раньше оно молча терялось: колонки не было вовсе.
+    appendHeaderCell(out, labels.colRisk, false);
     appendHeaderCell(out, labels.colStatus, false);
     appendHeaderCell(out, labels.colTime, true);
     appendHeaderCell(out, labels.colError, false);
@@ -1068,6 +1083,7 @@ void renderOperations(std::string& out, const HtmlReportInput& in, const HtmlRep
                    "<td>" + cellText(op.name) + "<div class=\"path\">" +
                        (op.path.empty() ? std::string(escapeHtml(kUnknown)) : escapeHtml(op.path)) + "</div></td>",
                    "<td class=\"num\">" + cellBytes(op.bytes, opt.binaryUnits) + "</td>",
+                   "<td>" + chip(safetyLabel(op.safety, opt.language), safetyClass(op.safety)) + "</td>",
                    "<td>" + chip(statusText, statusClass) + "</td>",
                    "<td class=\"num\">" + cellDuration(op.durationMs, opt.language) + "</td>",
                    "<td>" + (op.error.empty() ? std::string(escapeHtml(kUnknown)) : escapeHtml(op.error)) + "</td>"});

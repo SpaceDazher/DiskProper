@@ -7,8 +7,12 @@
 # §8 Этап 0 — тулчейн это MSVC из состава Visual Studio.
 #
 # Три ворота, три отдельных статуса в статус-баре PR:
+# Четыре ворота, четыре отдельных статуса в статус-баре PR:
 #   build — матрица Debug, Debug+ASan/UBSan, Release: tools\build.bat, затем
 #           tools\test.bat;
+#   e2e   — сценарии tests\e2e на Pester: тот же tools\build.bat и тот же
+#           ctest, что и локально. Отдельный job, потому что сценариям нужна своя
+#           сборка, своя версия Pester и своё время;
 #   tidy  — clang-tidy по compile_commands.json, любое замечание = ошибка;
 #   sbom  — CycloneDX-SBOM собранного Release (нужен, чтобы «в чём собрано»
 #           читалось из артефакта, а не из догадок: репозиторий публичный).
@@ -24,11 +28,22 @@
 #     ровно один раз, и он ничего не производит — только базу компиляции для
 #     clang-tidy (job tidy).
 #
-# Про ctest: SPEC §11 перечисляет «ctest», но в проекте ту же роль играет
-# tools\test.bat (SPEC §8, Этап 0) — тот же исполняемый файл, что и
-# зарегистрирован в CTest. Прямой ctest в CI не зовём намеренно: иначе
-# расхождение между «проверено локально» и «проверено в CI» снова становится
-# возможным, а именно его ворота и должны исключать.
+# Про ctest: SPEC §11 перечисляет «ctest», и в проекте его играют две роли.
+# tools\test.bat (SPEC §8, Этап 0) запускает собранные исполняемые файлы
+# наборов — это быстрые юнит- и интеграционные проверки. CTest запускает то же
+# самое плюс e2e-сценарии: каждый tests\e2e\Test-*.ps1 зарегистрирован в
+# tests/CMakeLists.txt как отдельная проверка с меткой e2e, и локально, и здесь
+# гоняется ровно одна и та же команда:
+#
+#   ctest --test-dir build\main -C Debug -L e2e --output-on-failure
+#
+# Прямой ctest для быстрых наборов в CI не зовём намеренно: иначе расхождение
+# между «проверено локально» и «проверено в CI» снова становится возможным, а
+# именно его ворота и должны исключать.
+#
+# Про -Destructive у e2e-сценариев: ключ не передаётся ни здесь, ни локально.
+# Он разрешает apply --execute по кандидатам настоящего скана, а на раннере это
+# его настоящий кэш. На эталонной VM (§12) прогон с этим ключом делают руками.
 #
 # Никаких paths-фильтров: правки docs/ тоже проходят ворота, потому что DoD
 # из SPEC §12 проверяется человеком по итогам этого прогона.
@@ -164,6 +179,107 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
           path: test-${{ matrix.config }}.log
+
+  e2e:
+    name: e2e (Pester)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Своя сборка, артефакт соседнего job не переиспользуется. Причина не в
+      # экономии минут, а в проверяемости: сценарии зовут настоящий
+      # mrproper_cli.exe, а путь к нему даёт CTest
+      # (tests/CMakeLists.txt передаёт $<TARGET_FILE:mrproper_cli>), так что он
+      # указывает на ту же сборку, что собрана здесь. Слот по умолчанию — main,
+      # тот же, что у job build.
+      - name: Сборка — tools\build.bat Debug
+        shell: pwsh
+        run: |
+          & cmd /c "tools\build.bat Debug"
+          if ($LASTEXITCODE -ne 0) {
+            throw "tools\build.bat Debug завершился с кодом $LASTEXITCODE"
+          }
+
+      # Pester 4.10.1 ставится явно и вне профиля пользователя. Причины две, и
+      # обе проверяемые на машине разработчика:
+      #   * в Windows PowerShell 5.1 из коробки лежит 3.4.0, у Describe которого
+      #     нет ключа -Tag (параметр называется $Tags) — первый блок каждого
+      #     сценария падает с ArgumentTransformationMetadataException;
+      #   * Pester 5 не поддерживает Should Be без дефисов, а сценарии написаны
+      #     на этой форме («Legacy Should syntax is not supported in Pester 5»).
+      # 4.10.1 понимает и ключ -Tag, и Should Be, и Set-ItResult.
+      #
+      # Ставится именно так, без Install-Module/Save-Module: PowerShellGet на
+      # образе тянет за собой бутстрап провайдера NuGet, который на
+      # неинтерактивном раннере упирается в запрос подтверждения и падает.
+      # Файл пакета плюс Expand-Archive — четыре строки без внешних
+      # зависимостей; такой путь прогонялся на машине разработчика.
+      - name: Установить Pester 4.10.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+          $version = '4.10.1'
+          $root = Join-Path $env:RUNNER_TEMP 'pester'
+          $nupkg = Join-Path $root "Pester-$version.zip"
+          $module = Join-Path $root $version
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          # Расширение .zip обязательно: Expand-Archive отказывается разбирать
+          # пакет с другим расширением, а галерея отдаёт именно .nupkg.
+          Invoke-WebRequest -Uri "https://www.powershellgallery.com/api/v2/package/Pester/$version" `
+            -OutFile $nupkg -UseBasicParsing
+          Expand-Archive -LiteralPath $nupkg -DestinationPath $module -Force
+          $manifest = Join-Path $module 'Pester.psd1'
+          if (-not (Test-Path -LiteralPath $manifest)) {
+            throw "Pester $version не распакован: нет $manifest"
+          }
+          Import-Module -Name $manifest -Force
+          $loaded = (Get-Module -Name Pester).Version
+          if ($loaded.Major -ne 4) {
+            throw "Ожидался Pester 4.x, импортирован $($loaded.ToString())"
+          }
+          Write-Host ("Pester {0} готов: {1}" -f $loaded, $manifest)
+          # Переменная окружения — единственный способ сказать ctest, какой
+          # модуль брать: в образе может стоять и 3.4, и 5, а порядок выбора
+          # модулей тогда не наш. Проверку версии делает и сам тест.
+          #
+          # Запись в GITHUB_ENV идёт через .NET, а не через Out-File -Encoding
+          # utf8: в Windows PowerShell 5.1 такая запись начинает файл с BOM, и
+          # имя первой переменной приходит как "﻿MRPROPER_PESTER_MODULE" —
+          # следующий шаг её не видит, а ctest падает с «требуется Pester 4.x».
+          [IO.File]::AppendAllText(
+            $env:GITHUB_ENV,
+            "MRPROPER_PESTER_MODULE=$manifest`n",
+            (New-Object Text.UTF8Encoding $false))
+
+      # Windows PowerShell 5.1, а не pwsh: сценарии объявляют
+      # #Requires -Version 5.1 и рассчитаны на эту среду.
+      - name: e2e — ctest -L e2e
+        shell: powershell
+        run: |
+          & ctest --test-dir build\main -C Debug -L e2e --output-on-failure
+          if ($LASTEXITCODE -ne 0) {
+            throw "ctest -L e2e завершился с кодом $LASTEXITCODE"
+          }
+
+      # Журналы пропусков — обязательная часть результата, а не приложение к
+      # нему. Сценарий, который не может выполнить шаг, пишет «SKIPPED: <код> —
+      # <текст stderr>» в build\e2e-artifacts\*.log, и «зелёный Pester» без
+      # этих журналов не означает «сценарий проверен»: критерий §12 «все 20
+      # e2e-сценариев зелёные» закрывается на эталонной VM, а здесь мы
+      # публикуем доказательство того, что именно было выполнено. Файлы
+      # прикладываются всегда, и при падении тоже: читать их нужно в первую
+      # очередь.
+      - name: Журналы пропусков e2e
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+          path: build/e2e-artifacts
 
   tidy:
     name: clang-tidy

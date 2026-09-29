@@ -5,7 +5,7 @@
 // Почему файл в integration, а не в unit. Проверяется не арифметика, а договор
 // Win32-слоя на настоящей файловой системе: нормализация пути через
 // GetFinalPathNameByHandleW, перечисление через
-// GetFileInformationByHandleEx(FileFullDirectoryInfo), логический размер из
+// GetFileInformationByHandleEx(FileIdBothDirectoryInfo), логический размер из
 // записи каталога и аллоцированный из GetCompressedFileSizeW. На виртуальной
 // фикстуре всё это проверялось бы тем же кодом, который и выдаёт числа, —
 // то есть никак.
@@ -16,6 +16,14 @@
 //   1) описание фикстуры (массив kTree) — что именно мы создали;
 //   2) «голый» обход на FindFirstFileW/FindNextFileW в этом же файле — что
 //      видит файловая система, когда её не спрашивают у модуля обхода.
+//
+// Эталонный обход намеренно оставлен на FindFirstFileW: он идёт ДРУГИМ кодом,
+// чем модуль, и поэтому способен поймать ошибку, общую у обоих. Обратная
+// сторона: FindFirstFileW не понимает шаблон в пути с префиксом \\?\ (отвечает
+// ERROR_BAD_LENGTH на пути, который CreateFileW открывает без вопросов), поэ-
+// тому эталон работает с той же файловой системой в обычной форме пути —
+// toPlainPath ниже. Это не потеря независимости, а требование Win32: две формы
+// записи одного и того же каталога.
 //
 // Если обход потеряет элемент, посчитает его дважды или возьмёт логический
 // размер не оттуда, откуда надо, расхождение всплывёт на сумме и на множестве
@@ -81,6 +89,22 @@ constexpr std::size_t kMaxTempPath = 260;
     return std::wstring(L"\\\\?\\") + std::wstring(path);
 }
 
+// Та же запись пути без префикса \\?\: форма, в которой Win32 разбирает шаблоны
+// FindFirstFileW. С префиксом шаблоны выключены вместе с разбором пути, и
+// FindFirstFileW(L"\\\\?\\C:\\каталог\\*") отвечает ERROR_BAD_LENGTH (24) на
+// пути, который CreateFileW с тем же префиксом открывает без вопросов. Поэтому
+// всё, что в этом файле ходит по шаблону (уборка фикстуры, эталонный обход),
+// работает в обычной форме. Фикстура живёт в %TEMP%, так что пути короткие и
+// MAX_PATH тут не мешает; длинные пути — отдельный случай набора
+// (vfsEdge_longPath_*).
+[[nodiscard]] std::wstring toPlainPath(std::wstring_view path) {
+    constexpr std::wstring_view kExtended = L"\\\\?\\";
+    if (path.size() >= kExtended.size() && path.compare(0, kExtended.size(), kExtended) == 0) {
+        return std::wstring(path.substr(kExtended.size()));
+    }
+    return std::wstring(path);
+}
+
 [[nodiscard]] bool makeDirectory(const std::wstring& path) {
     if (::CreateDirectoryW(toExtended(path).c_str(), nullptr) != FALSE) {
         return true;
@@ -88,20 +112,32 @@ constexpr std::size_t kMaxTempPath = 260;
     return ::GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
+// Создать каталог, которого быть НЕ должно. Отличается от makeDirectory
+// именно этим: «уже существует» — отказ, а не успех. Фикстура проверок обязана
+// быть пустой в момент проверки, и каталог, оставшийся от прошлого прогона с
+// тем же pid (Windows регулярно переиспользует идентификаторы процессов), тихо
+// выдавался бы за «пустой каталог», который на самом деле полон.
+[[nodiscard]] bool createDirectoryFresh(const std::wstring& path) {
+    return ::CreateDirectoryW(toExtended(path).c_str(), nullptr) != FALSE;
+}
+
 [[nodiscard]] bool removeTree(const std::wstring& path) {
-    const std::wstring extended = toExtended(path);
+    // Обычная форма пути: FindFirstFileW с шаблоном на пути с префиксом \\?\
+    // не работает (см. toPlainPath), а с префиксом фикстура просто осталась бы
+    // лежать в %TEMP% после каждого прогона.
+    const std::wstring plain = toPlainPath(path);
     WIN32_FIND_DATAW data{};
     const auto find = mrproper::platform::adopt<mrproper::platform::FindHandlePolicy>(
-        ::FindFirstFileW((extended + L"\\*").c_str(), &data));
+        ::FindFirstFileW((plain + L"\\*").c_str(), &data));
     if (!find) {
-        return ::DeleteFileW(extended.c_str()) != FALSE || ::RemoveDirectoryW(extended.c_str()) != FALSE;
+        return ::DeleteFileW(plain.c_str()) != FALSE || ::RemoveDirectoryW(plain.c_str()) != FALSE;
     }
     do {
         const std::wstring name(data.cFileName);
         if (name == L"." || name == L"..") {
             continue;
         }
-        const std::wstring child = extended + L"\\" + name;
+        const std::wstring child = plain + L"\\" + name;
         if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
             (void)removeTree(child);
         } else {
@@ -113,7 +149,7 @@ constexpr std::size_t kMaxTempPath = 260;
             ::DeleteFileW(child.c_str());
         }
     } while (::FindNextFileW(find.get(), &data) != FALSE);
-    return ::RemoveDirectoryW(extended.c_str()) != FALSE;
+    return ::RemoveDirectoryW(plain.c_str()) != FALSE;
 }
 
 class TempDir {
@@ -129,12 +165,19 @@ public:
             base.pop_back();
         }
         static std::atomic<LONG> counter{0};
-        const std::wstring name = L"mrproper-it-" +
+        // Префикс «mrproper-walk-it-» выбран не случайно: соседние наборы
+        // интеграционных тестов называют свои фикстуры «MrProper-it-<pid>-<n>»,
+        // а NTFS не различает регистр, и «mrproper-it-…» — это ТОТ ЖЕ
+        // каталог. С общими нумераторами фикстур два набора попадали в один
+        // каталог: обход показывал чужое дерево (16 элементов вместо 9), а
+        // проверка пустого каталога видела непустой. Имя набора в префиксе —
+        // дешёвый и окончательный развод.
+        const std::wstring name = L"mrproper-walk-it-" +
                                   std::to_wstring(static_cast<unsigned long>(::GetCurrentProcessId())) + L"-" +
                                   std::to_wstring(static_cast<unsigned long>(counter.fetch_add(1)));
         for (int attempt = 0; attempt < 16 && root_.empty(); ++attempt) {
             const std::wstring candidate = base + L"\\" + name + (attempt == 0 ? L"" : L"-" + std::to_wstring(attempt));
-            if (makeDirectory(candidate)) {
+            if (createDirectoryFresh(candidate)) {
                 root_ = candidate;
             }
         }
@@ -280,16 +323,23 @@ void rawEnumerateInto(const std::wstring& path, std::vector<RawEntry>& out) {
     } while (::FindNextFileW(find.get(), &data) != FALSE);
 }
 
+// Канонический корень фикстуры В ОБЫЧНОЙ ФОРМЕ — та, в которой работает
+// эталонный обход (см. toPlainPath). Сравнивать его с путями модуля нельзя:
+// те в форме \\?\, это две записи одного пути.
+[[nodiscard]] std::wstring rawRoot(const TempDir& root) {
+    return toPlainPath(mrproper::platform::vfs::normalizePath(root.path()).path);
+}
+
 [[nodiscard]] std::vector<RawEntry> rawEnumerate(const TempDir& root) {
     std::vector<RawEntry> out;
-    rawEnumerateInto(mrproper::platform::vfs::normalizePath(root.path()).path, out);
+    rawEnumerateInto(rawRoot(root), out);
     return out;
 }
 
 // Относительный путь от канонического корня, которым пользовался rawEnumerate:
 // тот же разбор, что у путей обхода, иначе ключи не совпадут.
 [[nodiscard]] std::wstring relativeFromCanonicalRoot(const TempDir& root, const std::wstring& path) {
-    const std::wstring base = mrproper::platform::vfs::normalizePath(root.path()).path;
+    const std::wstring base = rawRoot(root);
     if (path.size() <= base.size()) {
         return path;
     }
@@ -456,15 +506,29 @@ TEST(walk_visits_created_tree) {
         }
     }
 
-    // Каталоги — поимённо, с ожидаемой глубиной: «sub» на 1, «sub\deep» на 2.
+    // Каталоги — поимённо, с ожидаемой глубиной. Глубина задана явно для каждого
+    // каталога, а не выведена из его номера в kTreeDirs: «empty_dir» стоит в
+    // фикстуре третьим, но лежит в корне, то есть на глубине 1. Таблица вида
+    // «index + 1» тихо требовала от обхода неверной глубины для любого
+    // каталога, который не лежит на одной линии с предыдущими, — проверка
+    // была написана под форму дерева, а не под его содержимое.
     // Пустой каталог виден, но его содержимого в дереве нет.
-    const wchar_t* kDirAtDepth[] = {L"sub", L"sub\\deep", L"empty_dir"};
-    for (std::size_t index = 0; index < kDirCount; ++index) {
+    struct DirAtDepth {
+        const wchar_t* relative;
+        u32 depth;
+    };
+    constexpr DirAtDepth kDirs[] = {
+        {L"sub", 1u},
+        {L"sub\\deep", 2u},
+        {L"empty_dir", 1u},
+    };
+    static_assert(std::size(kDirs) == kDirCount, "каждый каталог фикстуры должен быть проверен");
+    for (const auto& expected : kDirs) {
         bool seen = false;
         for (const auto& entry : scan.entries) {
-            if (entry.kind == EntryKind::Directory && relativeTo(scan.result, entry.path) == kDirAtDepth[index]) {
+            if (entry.kind == EntryKind::Directory && relativeTo(scan.result, entry.path) == expected.relative) {
                 seen = true;
-                CHECK_EQ(entry.depth, static_cast<u32>(index + 1));
+                CHECK_EQ(entry.depth, expected.depth);
             }
         }
         CHECK(seen);
@@ -474,6 +538,33 @@ TEST(walk_visits_created_tree) {
             CHECK_EQ(entry.depth, kDeepestLevel);
         }
     }
+}
+
+// Регрессия на дефект, который стоил обхода целиком. GetFileInformationByHandleEx
+// в ответе на FileIdBothDirectoryInfo ОТДАЁТ «.» и «..» (проверено прямым
+// вызовом: первая запись каталога — «.», FileNameLength == 2), хотя обход
+// считает их несуществующими. Пропущенные фильтром они дают: элемент с именем
+// «.», спуск в «..» (выход за пределы корня, SPEC §4 FR-6) и спуск в «.»
+// (второй визит в тот же каталог, то есть петля и лишние счётчики).
+TEST(walk_dot_and_dotdot_never_reach_the_visitor) {
+    const TempDir root;
+    CHECK(root.ready());
+    CHECK(buildTree(root));
+
+    const Scan scan = scanTree(root.path());
+    CHECK(scan.result.completed);
+    CHECK_WALK(scan.result.errors.empty(), scan.result);
+    CHECK_EQ(scan.result.stats.entries, u64{kEntryCount});
+
+    for (const auto& entry : scan.entries) {
+        CHECK(entry.name != L".");
+        CHECK(entry.name != L"..");
+        CHECK(entry.path != scan.result.root + L"\\.");
+        CHECK(entry.path != scan.result.root + L"\\..");
+        CHECK(entry.path.find(L"\\..\\") == std::wstring::npos);
+        CHECK(mrproper::platform::vfs::pathIsInsideRoot(entry.path, scan.result.root));
+    }
+    CHECK_EQ(scan.result.stats.loopsDetected, u64{0});
 }
 
 TEST(walk_logical_sum_matches_raw_listing) {

@@ -83,8 +83,39 @@ using ScopedHandle = mrproper::platform::unique_handle<mrproper::platform::Kerne
 // того, в каком виде его отдаёт SDK: значение зафиксировано архитектурой NTFS.
 constexpr std::uint32_t kIoReparseTagMountPoint = 0xA0000003u;
 
-// Смещение PathBuffer в REPARSE_DATA_BUFFER: DWORD тега + пять WORD.
-constexpr std::size_t kReparseHeaderBytes = 16u;
+// Раскладка буфера точки монтирования, которую принимает файловая система.
+// Зафиксирована сравнением с буфером, который пишет сам mklink /J: ссылка,
+// созданная им, прочитана обратно через FSCTL_GET_REPARSE_POINT, и буфер
+// повторён байт в байт.
+//
+//   0   ULONG  ReparseTag            IO_REPARSE_TAG_MOUNT_POINT
+//   4   USHORT ReparseDataLength     8 + длина PathBuffer (оба имени с нулём)
+//   6   USHORT Reserved              0
+//   8   USHORT SubstituteNameOffset  0, от начала PathBuffer
+//  10   USHORT SubstituteNameLength  длина имени БЕЗ завершающего нуля
+//  12   USHORT PrintNameOffset       SubstituteNameOffset + длина + 2 (через ноль)
+//  14   USHORT PrintNameLength       длина имени БЕЗ завершающего нуля
+//  16   WCHAR  PathBuffer            «\??\цель» NUL «цель» NUL
+//
+// Отступления от REPARSE_DATA_BUFFER в winioctl.h, из-за которых файловая
+// система отвечала ERROR_INVALID_REPARSE_DATA (4392), проверены перебором всех
+// сочетаний и записаны здесь намеренно:
+//
+//   * DWORD Flags между полями и PathBuffer НЕ пишется: система читает имена с
+//     байта 16, а поданные на 20 байт позже (ноль в Flags плюс смещение) она
+//     считает мусором;
+//   * объявленные длины имён не включают завершающий ноль, а сами имена в
+//     буфере ноль имеют;
+//   * PrintNameOffset идёт через ноль замещающего имени, иначе печатное имя
+//     начинается с нулевого символа и разбор обрывается;
+//   * ReparseDataLength = 8 + PathBuffer, то есть ровно остаток буфера после
+//     восьмибайтовой шапки: и +4, и +12 дают тот же 4392.
+//
+// Отсюда же практический вывод: «точка монтирования на этом хосте не создаётся»
+// было неверным — отказ давал сам тест, а не среда.
+constexpr std::size_t kReparseFixedBytes = 8u;     // тег + длина + резерв
+constexpr std::size_t kMountPointFieldsBytes = 8u; // четыре WORD
+constexpr std::size_t kPathBufferOffset = kReparseFixedBytes + kMountPointFieldsBytes;
 
 // Имя каталога, из которого гарантированно получается путь длиннее MAX_PATH:
 // кириллица здесь не украшение, а часть проверки (§5).
@@ -196,24 +227,27 @@ std::atomic<unsigned> g_fixtureCounter{0u};
 
     const auto substituteBytes = static_cast<std::size_t>(substitute.size() * sizeof(wchar_t));
     const auto printableBytes = static_cast<std::size_t>(printable.size() * sizeof(wchar_t));
-    // Две завершающие нули: конец SubstituteName и конец PrintName.
-    const std::size_t payloadBytes = substituteBytes + sizeof(wchar_t) + printableBytes + sizeof(wchar_t);
-    std::vector<char> buffer(kReparseHeaderBytes + payloadBytes, 0);
+    // Объявленные длины — без завершающего нуля, а в буфере имена нуль имеют.
+    const std::size_t pathBufferBytes = substituteBytes + sizeof(wchar_t) + printableBytes + sizeof(wchar_t);
+    std::vector<char> buffer(kPathBufferOffset + pathBufferBytes, 0);
 
     const auto put16 = [&buffer](std::size_t offset, WORD value) {
         std::memcpy(buffer.data() + offset, &value, sizeof(value));
     };
+    const auto put32 = [&buffer](std::size_t offset, DWORD value) {
+        std::memcpy(buffer.data() + offset, &value, sizeof(value));
+    };
     const DWORD tag = static_cast<DWORD>(kIoReparseTagMountPoint);
-    std::memcpy(buffer.data(), &tag, sizeof(tag));                                    // ReparseTag
-    put16(4u, static_cast<WORD>(payloadBytes));                                        // ReparseDataLength
-    put16(6u, static_cast<WORD>(0));                                                   // Reserved
-    put16(8u, static_cast<WORD>(0));                                                   // SubstituteNameOffset
-    put16(10u, static_cast<WORD>(substituteBytes));                                   // SubstituteNameLength
-    put16(12u, static_cast<WORD>(substituteBytes + sizeof(wchar_t)));                 // PrintNameOffset
-    put16(14u, static_cast<WORD>(printableBytes));                                    // PrintNameLength
+    put32(0u, tag);                                                          // ReparseTag
+    put16(4u, static_cast<WORD>(kMountPointFieldsBytes + pathBufferBytes));  // ReparseDataLength
+    put16(6u, 0u);                                                           // Reserved
+    put16(8u, 0u);                                                           // SubstituteNameOffset
+    put16(10u, static_cast<WORD>(substituteBytes));                         // SubstituteNameLength
+    put16(12u, static_cast<WORD>(substituteBytes + sizeof(wchar_t)));        // PrintNameOffset — через ноль
+    put16(14u, static_cast<WORD>(printableBytes));                          // PrintNameLength
 
-    std::memcpy(buffer.data() + kReparseHeaderBytes, substitute.c_str(), substituteBytes + sizeof(wchar_t));
-    std::memcpy(buffer.data() + kReparseHeaderBytes + substituteBytes + sizeof(wchar_t), printable.c_str(),
+    std::memcpy(buffer.data() + kPathBufferOffset, substitute.c_str(), substituteBytes + sizeof(wchar_t));
+    std::memcpy(buffer.data() + kPathBufferOffset + substituteBytes + sizeof(wchar_t), printable.c_str(),
                 printableBytes + sizeof(wchar_t));
 
     // FILE_FLAG_OPEN_REPARSE_POINT обязателен: без него CreateFileW идёт по ссылке
@@ -324,11 +358,23 @@ public:
         if (relative.empty()) {
             return root_;
         }
+        // Разделители приводятся к «\» здесь, а не в extended(): форма «\\?\»
+        // разбор точек и разделителей НЕ включает (её выключает именно префикс),
+        // поэтому «C:\T\a/b» в расширенной форме — это каталог «a» с
+        // буквальным символом «/» в имени, и CreateDirectoryW отвечает на него
+        // ERROR_INVALID_NAME (123). Пока путь не перерос MAX_PATH, Win32 такой
+        // путь проглатывает молча, и ошибка выглядит как «тест не смог создать
+        // фикстуру».
         std::wstring joined = root_;
         if (joined.back() != L'\\') {
             joined.push_back(L'\\');
         }
         joined.append(relative);
+        for (wchar_t& symbol : joined) {
+            if (symbol == L'/') {
+                symbol = L'\\';
+            }
+        }
         return joined;
     }
 
@@ -565,7 +611,12 @@ TEST(vfsEdge_longPath_delete_inside_root_and_refuses_outside) {
     // 5) Дерево длинных каталогов убирается целиком.
     const mrproper::platform::vfs::TreeDeleteSummary summary = mrproper::platform::vfs::deleteTree(tree.root(), options);
     CHECK(summary.complete());
-    CHECK_EQ(summary.dirsDeleted, levels);
+    // Каталогов на levels + 1: growBeyondMaxPath создаёт levels подкаталогов НИЖЕ
+    // корня, а deleteTree по контракту удаляет содержимое снизу вверх и затем сам
+    // каталог (vfs_delete.hpp:315) — корень тоже удаляется и тоже считается.
+    // Обход при этом считает только каталоги ниже корня (проверка levels выше),
+    // потому что стартовая точка обхода корнем не считается.
+    CHECK_EQ(summary.dirsDeleted, levels + 1);
     CHECK_EQ(summary.failed, static_cast<std::size_t>(0));
     CHECK(!exists(tree.root()));
     // Чужое дерево не тронуто ни одной операцией.
@@ -868,7 +919,10 @@ TEST(vfsEdge_walk_root_reparse_point_is_not_expanded) {
 // Имя 8.3 и длинное имя — один каталог. Проверяется ровно то, что требует
 // FR-6: нормализация обязана снять короткое имя, иначе корень правила
 // «C:\Program Files\X» не совпал бы с найденным «C:\PROGRA~1\X» и уборка
-// молча ничего бы не сделала.
+// молча ничего бы не сделала. Отдельно проверяется пара Win32
+// GetShortPathNameW/GetLongPathNameW на расширенном пути: обратное
+// преобразование обязано вернуть ровно то же расширенное длинное имя, иначе
+// «короткое имя» в отчёте пользователя нельзя развернуть обратно.
 TEST(vfsEdge_short_name_resolves_to_the_same_directory) {
     TempTree tree;
     if (!tree.ready()) {
@@ -897,6 +951,21 @@ TEST(vfsEdge_short_name_resolves_to_the_same_directory) {
                        std::to_string(shortLength) + ")");
         return;
     }
+
+    // Обратное преобразование Win32 — короткое имя обратно в длинное. Оба вызова
+    // идут на расширенном пути: на форме без «\\?\» длинное имя не вернётся,
+    // а короткое имя отрежется на MAX_PATH, и такой вызов молча отдал бы входную
+    // строку — тест прошёл бы, ничего не проверив.
+    std::vector<wchar_t> longBuffer(extendedLong.size() + 1u, L'\0');
+    const DWORD longLength = ::GetLongPathNameW(extended(shortName).c_str(), longBuffer.data(),
+                                                static_cast<DWORD>(longBuffer.size()));
+    const std::wstring longAgain(longBuffer.data());
+    CHECK(longLength != 0u);
+    // Возврат ожидается в расширенной форме — её же отдал GetShortPathNameW.
+    CHECK(longAgain == extendedLong);
+    // И разворот короткого имени обратно приводит к тому же объекту.
+    CHECK(pf::resolve(mrproper::platform::toUtf8(longAgain)).path ==
+          pf::resolve(mrproper::platform::toUtf8(longNamed)).path);
 
     // Порядок «сначала нормализация, потом сравнение» задан контрактом
     // vfs_paths: сырой короткий путь против длинного корня даёт ложный запрет.
@@ -986,85 +1055,4 @@ TEST(vfsEdge_long_unicode_tree_with_reparse_backlink) {
     CHECK_EQ(size.logicalBytes, static_cast<std::uint64_t>(data.size()));
     CHECK(size.allocatedKnown);
     CHECK_EQ(size.reclaimBytes(), size.allocatedBytes);
-}
-
-// ==== ВРЕМЕННЫЙ ДИАГНОСТИЧЕСКИЙ ТЕСТ (будет удалён) ====
-TEST(zz_diagnostics) {
-    TempTree tree;
-    std::printf("ACP=%u OEMCP=%u\n", ::GetACP(), ::GetOEMCP());
-    std::wstring deep;
-    std::string growError;
-    const std::size_t levels = growBeyondMaxPath(tree.root(), deep, growError);
-    std::printf("levels=%zu len=%zu\n", levels, deep.size());
-    const std::string utf8 = mrproper::platform::toUtf8(deep);
-    std::printf("utf8 len=%zu [%s]\n", utf8.size(), utf8.c_str());
-    const std::string ext8 = pf::toExtendedPath(utf8);
-    std::printf("toExtendedPath len=%zu [%s]\n", ext8.size(), ext8.c_str());
-    std::printf("isRootedFileSystemPath=%d isReparsePoint-ok\n", (int)pf::isRootedFileSystemPath(utf8));
-    const pf::Resolution res = pf::resolve(utf8);
-    std::printf("resolve: ok=%d strong=%d err=%u [%s]\n", (int)res.ok(), (int)res.strong, res.lastError,
-                res.path.c_str());
-    const pf::Resolution rootRes = pf::resolve(mrproper::platform::toUtf8(tree.root()));
-    std::printf("resolve(root): ok=%d strong=%d err=%u [%s]\n", (int)rootRes.ok(), (int)rootRes.strong,
-                rootRes.lastError, rootRes.path.c_str());
-
-    const std::wstring file = tree.path(L"проба.txt");
-    std::uint32_t we = 0;
-    std::printf("writeFile=%d\n", (int)writeFile(file, payload(100u, 'p'), we));
-    const vfs::WalkResult wr = vfs::walk(tree.root());
-    std::printf("walk: completed=%d entries=%llu errors=%llu root=[%s]\n", (int)wr.completed,
-                (unsigned long long)wr.stats.entries, (unsigned long long)wr.stats.errors,
-                mrproper::platform::toUtf8(wr.root).c_str());
-    for (const auto& e : wr.errors) {
-        std::printf("  err: %u [%s] [%s]\n", e.win32Code, mrproper::platform::toUtf8(e.message).c_str(),
-                    mrproper::platform::toUtf8(e.path).c_str());
-    }
-
-    mrproper::platform::vfs::DeleteOptions opts;
-    opts.allowedRoot = tree.root();
-    mrproper::platform::vfs::DeleteRequest req;
-    req.path = file;
-    req.kind = mrproper::platform::vfs::DeleteKind::File;
-    const auto dr = mrproper::platform::vfs::deleteEntry(req, opts);
-    std::printf("deleteEntry status=%s hr=%d detail=[%s]\n", mrproper::platform::vfs::toString(dr.status),
-                (int)dr.hr, mrproper::platform::toUtf8(dr.detail).c_str());
-    const auto ts = mrproper::platform::vfs::deleteTree(tree.root(), opts);
-    std::printf("deleteTree files=%zu dirs=%zu failed=%zu problems=%zu\n", ts.filesDeleted, ts.dirsDeleted,
-                ts.failed, ts.problems.size());
-    for (const auto& p : ts.problems) {
-        std::printf("  prob: %s hr=%d [%s]\n", mrproper::platform::vfs::toString(p.status), (int)p.hr,
-                    mrproper::platform::toUtf8(p.path).c_str());
-    }
-    std::printf("exists(root)=%d\n", (int)exists(tree.root()));
-
-    // Прямой вызов Win32: где именно ломается перечисление.
-    {
-        ScopedHandle h(::CreateFileW(extended(tree.root()).c_str(), FILE_LIST_DIRECTORY,
-                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                                     OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                                     nullptr));
-        std::printf("enum handle valid=%d\n", (int)(bool)h);
-        std::vector<char> buf(64u * 1024u, 0);
-        const BOOL okDir = ::GetFileInformationByHandleEx(h.get(), FileFullDirectoryRestartInfo, buf.data(),
-                                                          (DWORD)buf.size());
-        // У API четыре аргумента: отдельного «сколько записано» нет. Признак того,
-        // что запись получена, — успех вызова плюс последующая проверка буфера.
-        const DWORD ret = okDir ? 1u : 0u;
-        std::printf("GetFileInformationByHandleEx ok=%d err=%u ret=%u\n", (int)okDir, ::GetLastError(), ret);
-        if (okDir && ret > 0) {
-            const auto* raw = reinterpret_cast<const FILE_FULL_DIR_INFO*>(buf.data());
-            std::printf("  first entry: nameLen=%u name=[%ls] next=%u sizeof=%u\n", raw->FileNameLength,
-                        (const wchar_t*)(buf.data() + offsetof(FILE_FULL_DIR_INFO, FileName)),
-                        (unsigned)raw->NextEntryOffset, (unsigned)sizeof(FILE_FULL_DIR_INFO));
-        }
-    }
-    // Короткое имя 8.3 — отдельная проверка, resolve() падает на toExtendedPath.
-    {
-        const std::wstring longNamed = tree.path(L"каталог-со-столь-длинным-именем-чтобы-получить-короткое");
-        std::uint32_t weLong = 0;  // не we: внешний we уже объявлен, а /WX превращает C4456 в ошибку
-        std::printf("mkdir(long)=%d\n", (int)makeDirectory(longNamed, weLong));
-        std::vector<wchar_t> sb(extended(longNamed).size() + 2u, 0);
-        const DWORD n = ::GetShortPathNameW(extended(longNamed).c_str(), sb.data(), (DWORD)sb.size());
-        std::printf("GetShortPathNameW n=%u err=%u [%ls]\n", n, ::GetLastError(), n ? sb.data() : L"");
-    }
 }

@@ -40,6 +40,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -280,12 +281,14 @@ struct RootTally {
     std::int64_t lastAccess{};
     std::uint64_t tooYoung{};
     std::uint64_t unknownAge{};
+    std::uint64_t tooSmall{};
     std::uint64_t excludedFiles{};
     std::uint64_t prunedDirs{};
     std::uint64_t reparse{};
     std::uint64_t allocatedEstimated{};
     std::uint64_t sizeUnknown{};
     std::uint64_t outsideRoot{};
+    std::uint64_t leafFiltered{};
 };
 
 // Контекст обхода одного корня: правило (исключения), корень (граница), фильтр
@@ -299,9 +302,17 @@ struct RootScan {
     std::string leafPattern;
     std::int64_t oldestAllowed{};  // время записи не новее этого значения
     bool ageFilter{};
+    std::uint64_t minFileBytes{};  // порог размера файла из правила (0 — не объявлен)
     bool includeReparse{};
     CollectStats* stats{};
     RootTally tally;
+
+    // Список файлов, которые правило разрешило удалить (docs/review-02.md F-01).
+    // Заполняется только когда правило хоть что-то отсекает: если отсекать
+    // нечего, удалять можно корень целиком и список не нужен.
+    std::vector<core::AllowedEntry> allowed;
+    std::size_t allowedCap{0};  // 0 — не собираем
+    bool allowedTruncated{};
 
     // Фильтр листьев действует на верхнем уровне корня. Это ровно то, что
     // обещает glob: «*» не пересекает разделитель (docs/rules-authoring.md §4),
@@ -325,6 +336,28 @@ struct RootScan {
     void countFile(const ProbeEntry& entry) {
         ++stats->filesSeen;
         ++tally.files;
+        if (allowedCap != 0) {
+            // Список разрешённого к удалению. Обрезанный список бесполезен для
+            // удаления (неполнота и «снести всё» несовместимы), поэтому при
+            // переполнении список помечается неполным, а кандидат перестаёт
+            // быть удаляемым — см. CandidateManifest::deletable.
+            if (allowed.size() < allowedCap) {
+                // Аллоцированный размер неизвестен (сжатый/sparse) — берём
+                // логический, как и в счётчике объёма ниже; факт попадает в
+                // allocatedEstimated, поэтому занижения молча не происходит.
+                // Если размер не прочитать не удалось вовсе, в списке путь
+                // остаётся (файл-то разрешён), а байты нулевые — иначе сумма
+                // списка разошлась бы с объёмом кандидата, а validatePlan
+                // справедливо отверг бы план.
+                const std::uint64_t bytes =
+                    entry.sizeKnown ? (entry.allocatedKnown ? entry.allocatedBytes : entry.logicalBytes) : 0;
+                allowed.push_back(core::AllowedEntry{normalizePath(entry.path), bytes});
+                ++stats->pathsListed;
+            } else {
+                allowedTruncated = true;
+                ++stats->pathsOmitted;
+            }
+        }
         if (!entry.sizeKnown) {
             ++stats->sizeUnknown;
             ++tally.sizeUnknown;
@@ -378,7 +411,10 @@ struct RootScan {
             return VisitStep::Continue;
         }
         if (entry.isDirectory) return VisitStep::Continue;
-        if (!leafAllows(entry)) return VisitStep::Continue;
+        if (!leafAllows(entry)) {
+            ++tally.leafFiltered;
+            return VisitStep::Continue;
+        }
         if (ageFilter) {
             if (entry.writeTime == 0) {
                 ++stats->filesUnknownAge;
@@ -391,8 +427,27 @@ struct RootScan {
                 return VisitStep::Continue;
             }
         }
+        if (minFileBytes != 0) {
+            // Порог размера из правила (F-02: категория user.bigfiles — «файлы
+            // > 1 ГБ»). Файл меньше порога не входит ни в объём кандидата, ни в
+            // список удаляемого: иначе «крупные файлы» — это весь каталог.
+            const std::uint64_t bytes = entry.allocatedKnown ? entry.allocatedBytes : entry.logicalBytes;
+            if (bytes < minFileBytes) {
+                ++stats->filesTooSmall;
+                ++tally.tooSmall;
+                return VisitStep::Continue;
+            }
+        }
         countFile(entry);
         return VisitStep::Continue;
+    }
+
+    // Пропустил ли обход хоть что-то, что осталось на диске? Да — значит, корень
+    // удалять нельзя: внутри него есть содержимое, которое правило не брало.
+    [[nodiscard]] bool filteredAnything() const {
+        return tally.tooYoung != 0 || tally.unknownAge != 0 || tally.tooSmall != 0 || tally.excludedFiles != 0 ||
+               tally.prunedDirs != 0 || tally.reparse != 0 || tally.outsideRoot != 0 || tally.leafFiltered != 0 ||
+               allowedTruncated;
     }
 };
 
@@ -788,8 +843,18 @@ CollectResult collectCandidates(const core::RuleSet& rules, FileSystemProbe& pro
             scan.leafPattern = root.leafPattern;
             scan.ageFilter = minAgeDays > 0;
             scan.oldestAllowed = options.now - minAgeDays * kSecondsPerDay;
+            scan.minFileBytes = rule.minFileBytes;
             scan.includeReparse = options.includeReparsePoints;
             scan.stats = &stats;
+            // Список разрешённого нужен только там, где правило может что-то
+            // отсечь (docs/review-02.md F-01). Иначе удаление корня равносильно
+            // удалению всего содержимого, и список был бы копией того же самого.
+            // Фильтр листьев — тоже отсечение, поэтому с ним список обязателен.
+            const bool needsList = rule.filtersInsideRoot() || !root.leafPattern.empty();
+            if (needsList) {
+                scan.allowedCap = options.maxAllowedPaths;
+                scan.allowed.reserve(std::min<std::size_t>(options.maxAllowedPaths, 4096));
+            }
 
             if (rootEntry.isDirectory) {
                 const bool completed =
@@ -808,6 +873,35 @@ CollectResult collectCandidates(const core::RuleSet& rules, FileSystemProbe& pro
                 ++stats.candidatesEmpty;
                 if (options.skipEmpty) continue;
             }
+
+            // Манифест удаления: что именно эта операция имеет право удалить
+            // (docs/review-02.md F-01..F-04). Право удалить корень целиком
+            // появляется только тогда, когда множество, которое вернул обход,
+            // совпадает со всем содержимым корня.
+            core::CandidateManifest manifest;
+            manifest.candidateIndex = result.candidates.size();
+            manifest.ruleId = rule.id;
+            manifest.rootPath = rootPath;
+            manifest.estimateOnly = rule.estimateOnly;
+            manifest.minFileBytes = rule.minFileBytes;
+            manifest.userData = core::isUserDataCategory(rule.category);
+            const bool nothingSkipped = !scan.filteredAnything() && !result.canceled;
+            if (needsList) {
+                auto allowed = std::make_shared<core::AllowedSet>();
+                allowed->bytes = scan.tally.allocated;
+                allowed->entries = std::move(scan.allowed);
+                allowed->omitted = scan.allowedTruncated ? options.maxAllowedPaths - allowed->entries.size() : 0;
+                allowed->complete = !scan.allowedTruncated;
+                manifest.allowed = allowed;
+                if (!allowed->complete) {
+                    ++stats.candidatesUnlisted;
+                    addNote(stats, options.maxNotes,
+                            "правило " + rule.id + ": список удаляемого обрезан пределом " +
+                                std::to_string(options.maxAllowedPaths) + " путей — кандидат не удаляется");
+                }
+            }
+            manifest.rootDeleteAllowed = !needsList || nothingSkipped;
+            if (manifest.rootDeleteAllowed) manifest.allowed.reset();  // список не нужен
 
             core::CleanupCandidate candidate;
             candidate.ruleId = rule.id;
@@ -829,19 +923,39 @@ CollectResult collectCandidates(const core::RuleSet& rules, FileSystemProbe& pro
                 candidate.reasons.push_back("профиль «" + root.profile + "»");
             }
             candidate.reasons.push_back("корень правила: " + rootPath);
+            // Формулировки ниже — про ОПЕРАЦИЮ, а не про арифметику объёма.
+            // Раньше здесь было «отсечено», и человек читал это как «эти файлы
+            // оставлены в покое», хотя удалялся корень целиком (F-01).
             if (scan.tally.tooYoung > 0) {
-                candidate.reasons.push_back("по возрасту отсечено файлов: " + std::to_string(scan.tally.tooYoung));
+                candidate.reasons.push_back("моложе порога правила — в удаление не входят файлов: " +
+                                            std::to_string(scan.tally.tooYoung));
             }
             if (scan.tally.unknownAge > 0) {
                 candidate.reasons.push_back("нет времени записи у файлов: " + std::to_string(scan.tally.unknownAge) +
-                                            " (в кандидат не вошли)");
+                                            " (в удаление не входят)");
+            }
+            if (scan.tally.tooSmall > 0) {
+                candidate.reasons.push_back("меньше порога размера правила — в удаление не входят файлов: " +
+                                            std::to_string(scan.tally.tooSmall));
             }
             if (scan.tally.excludedFiles + scan.tally.prunedDirs > 0) {
-                candidate.reasons.push_back("исключено правилом элементов: " +
+                candidate.reasons.push_back("исключено правилом и в удаление не входит элементов: " +
                                             std::to_string(scan.tally.excludedFiles + scan.tally.prunedDirs));
             }
+            if (scan.tally.leafFiltered > 0) {
+                candidate.reasons.push_back("не подошло под фильтр листьев и в удаление не входит файлов: " +
+                                            std::to_string(scan.tally.leafFiltered));
+            }
             if (scan.tally.reparse > 0) {
-                candidate.reasons.push_back("пропущено ссылок: " + std::to_string(scan.tally.reparse));
+                candidate.reasons.push_back("пропущено ссылок: " + std::to_string(scan.tally.reparse) +
+                                            " (в удаление не входят)");
+            }
+            if (scan.allowedTruncated) {
+                candidate.reasons.push_back("список удаляемого обрезан пределом — элемент не удаляется");
+            } else if (manifest.rootDeleteAllowed) {
+                candidate.reasons.push_back("правило ничего не отсекает: удаляется каталог целиком");
+            } else {
+                candidate.reasons.push_back("удаляется по списку файлов, а не каталог целиком");
             }
             if (scan.tally.allocatedEstimated > 0) {
                 candidate.reasons.push_back("у части файлов аллоцированный размер неизвестен, учтён логический");
@@ -859,6 +973,7 @@ CollectResult collectCandidates(const core::RuleSet& rules, FileSystemProbe& pro
 
             ++stats.candidatesEmitted;
             result.candidates.push_back(std::move(candidate));
+            result.manifests.push_back(std::move(manifest));
         }
 
         if (result.canceled) break;
@@ -870,6 +985,8 @@ CollectResult collectCandidates(const core::RuleSet& rules, FileSystemProbe& pro
     fields.push_back(core::logField("candidates", stats.candidatesEmitted));
     fields.push_back(core::logField("files", stats.filesSeen));
     fields.push_back(core::logField("tooYoung", stats.filesTooYoung));
+    fields.push_back(core::logField("listed", stats.pathsListed));
+    fields.push_back(core::logField("unlisted", stats.candidatesUnlisted));
     fields.push_back(core::logField("inactiveRules", stats.rulesSkippedUnresolved + stats.rulesSkippedRelative +
                                                      stats.rulesSkippedEmptyLocator + stats.rulesSkippedNoClock));
     fields.push_back(core::logField("canceled", result.canceled));

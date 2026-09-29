@@ -105,11 +105,15 @@ std::string skipPhrase(core::SkipReason skip) {
         case core::SkipReason::BelowConfidence: return "уверенность ниже порога отбора";
         case core::SkipReason::ProfileFiltered: return "не проходит уровень безопасности профиля";
         case core::SkipReason::TooSmall: return "объём ниже минимального порога";
+        case core::SkipReason::ReviewOffByDefault: return "уровень Review выключен по умолчанию";
+        case core::SkipReason::EstimateOnly: return "правило объявлено «только оценка»";
+        case core::SkipReason::NoSizeThreshold: return "нет порога размера для пользовательских данных";
+        case core::SkipReason::NeedsEnumeration: return "нет списка разрешённых файлов";
     }
     return {};
 }
 
-core::PlanOperation makeOperation(const PlanItemView& row) {
+core::PlanOperation makeOperation(const PlanItemView& row, const core::CandidateManifest* manifest) {
     core::PlanOperation op;
     op.candidateIndex = row.candidateIndex;
     op.action = row.action;
@@ -121,6 +125,17 @@ core::PlanOperation makeOperation(const PlanItemView& row) {
     op.safety = row.safety;
     op.confidence = row.confidence;
     op.reason = row.reason;
+    op.rootDeleteOnly = row.rootDeleteOnly;
+    op.allowedCount = row.allowedCount;
+    // Список удаляемого едет вместе с операцией (F-01): сухой прогон должен
+    // показывать ФАЙЛЫ, а не имя каталога. Полный список — в манифесте, здесь
+    // начало, чтобы отчёт оставался читаемым.
+    if (manifest != nullptr && manifest->allowed != nullptr && !row.rootDeleteOnly) {
+        for (const core::AllowedEntry& entry : manifest->allowed->entries) {
+            if (op.allowedPaths.size() >= core::kMaxOperationPaths) break;
+            op.allowedPaths.push_back(entry.path);
+        }
+    }
     return op;
 }
 
@@ -131,6 +146,9 @@ std::string operationLine(std::size_t number, const core::PlanOperation& op) {
     line += " · " + std::string(safetyToken(op.safety));
     line += " · уверенность " + std::to_string(op.confidence);
     if (!op.path.empty() && op.path != op.displayName) line += " · " + op.path;
+    if (!op.rootDeleteOnly && op.allowedCount > 0) {
+        line += " · удаляется по списку: " + std::to_string(op.allowedCount) + " " + itemWord(op.allowedCount);
+    }
     return line;
 }
 
@@ -184,6 +202,40 @@ void PlanBuilder::setCandidates(std::vector<core::CleanupCandidate> candidates) 
     riskyRevealPending_ = false;
     gate_.beginSession();
     rebuild();
+}
+
+void PlanBuilder::setManifests(std::vector<core::CandidateManifest> manifests) {
+    manifests_ = std::move(manifests);
+    std::stable_sort(manifests_.begin(), manifests_.end(),
+                     [](const core::CandidateManifest& a, const core::CandidateManifest& b) {
+                         return a.candidateIndex < b.candidateIndex;
+                     });
+    gate_.beginSession();
+    rebuild();
+}
+
+void PlanBuilder::setCandidates(std::vector<core::CleanupCandidate> candidates,
+                                std::vector<core::CandidateManifest> manifests) {
+    // Сначала манифесты, потом кандидаты: пересборка внутри setCandidates уже
+    // должна видеть список разрешённого, иначе первый кадр плана был бы «всё
+    // запрещено» и мигнул бы на экране (F-01).
+    manifests_ = std::move(manifests);
+    std::stable_sort(manifests_.begin(), manifests_.end(),
+                     [](const core::CandidateManifest& a, const core::CandidateManifest& b) {
+                         return a.candidateIndex < b.candidateIndex;
+                     });
+    setCandidates(std::move(candidates));
+}
+
+const core::CandidateManifest* PlanBuilder::manifestFor(std::size_t candidateIndex) const noexcept {
+    // manifests_ отсортированы по индексу — тот же поиск, что и в
+    // core::CleanupPlan::manifestFor, только без плана.
+    const auto found = std::lower_bound(manifests_.begin(), manifests_.end(), candidateIndex,
+                                        [](const core::CandidateManifest& manifest, std::size_t index) {
+                                            return manifest.candidateIndex < index;
+                                        });
+    if (found == manifests_.end() || found->candidateIndex != candidateIndex) return nullptr;
+    return &*found;
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +320,7 @@ bool PlanBuilder::setSelected(std::size_t candidateIndex, bool selected) {
 
     if (!candidate.lockedBy.empty()) return false;  // FR-5: Skip (locked) выбором не отменяется
     if (selected && candidate.safety == core::SafetyLevel::Risky && !options_.allowRisky) return false;
+    if (selected && blockedByRule(candidateIndex)) return false;  // запрет задало правило, а не профиль
 
     const SelectionOverride wanted = selected ? SelectionOverride::SelectedByUser : SelectionOverride::KeptByUser;
     if (overrides_[candidateIndex] == wanted) return true;
@@ -297,6 +350,7 @@ void PlanBuilder::selectAllVisible() {
         const core::CleanupCandidate& candidate = candidates_[index];
         if (!candidate.lockedBy.empty()) continue;
         if (candidate.safety == core::SafetyLevel::Risky && !options_.allowRisky) continue;
+        if (blockedByRule(index)) continue;  // «выбрать всё» не отменяет запрет правила
         overrides_[index] = SelectionOverride::SelectedByUser;
     }
     rebuild();
@@ -309,6 +363,7 @@ void PlanBuilder::selectSafeOnly() {
     for (std::size_t index = 0; index < candidates_.size(); ++index) {
         const core::CleanupCandidate& candidate = candidates_[index];
         if (!candidate.lockedBy.empty()) continue;
+        if (blockedByRule(index)) continue;
         if (candidate.safety == core::SafetyLevel::Safe) {
             overrides_[index] = SelectionOverride::SelectedByUser;
         } else if (candidate.safety == core::SafetyLevel::Risky && !options_.allowRisky) {
@@ -338,6 +393,7 @@ bool PlanBuilder::setCategorySelected(std::string_view category, bool selected) 
         found = true;
         if (!candidate.lockedBy.empty()) continue;
         if (candidate.safety == core::SafetyLevel::Risky && !options_.allowRisky) continue;
+        if (selected && blockedByRule(index)) continue;  // запрет правила переживает и категорию
         overrides_[index] = selected ? SelectionOverride::SelectedByUser : SelectionOverride::KeptByUser;
     }
     if (found) rebuild();
@@ -362,9 +418,16 @@ void PlanBuilder::clearOverrides() {
 // Решение по кандидату с учётом выбора пользователя
 // ---------------------------------------------------------------------------
 
-core::SelectionDecision PlanBuilder::decideWithOverride(const core::CleanupCandidate& candidate,
-                                                       SelectionOverride selection) const {
-    const core::SelectionDecision profileDecision = core::decideCandidate(candidate, options_);
+bool PlanBuilder::blockedByRule(std::size_t candidateIndex) const {
+    if (candidateIndex >= candidates_.size()) return true;
+    return core::isRuleBlock(
+        core::decideCandidate(candidates_[candidateIndex], options_, manifestFor(candidateIndex)).skip);
+}
+
+core::SelectionDecision PlanBuilder::decideWithOverride(std::size_t candidateIndex, SelectionOverride selection) const {
+    const core::CleanupCandidate& candidate = candidates_[candidateIndex];
+    const core::CandidateManifest* manifest = manifestFor(candidateIndex);
+    const core::SelectionDecision profileDecision = core::decideCandidate(candidate, options_, manifest);
 
     if (selection == SelectionOverride::Auto) return profileDecision;
 
@@ -393,6 +456,15 @@ core::SelectionDecision PlanBuilder::decideWithOverride(const core::CleanupCandi
         decision.reason += "; сначала подтвердите «показать всё» — Risky выбирается только с ним (SPEC §12)";
         return decision;
     }
+    if (core::isRuleBlock(profileDecision.skip)) {
+        // Запрет задало правило, а не профиль: «только оценка», отсутствие
+        // порога размера у пользовательских данных, неполный список
+        // разрешённого. Галочка человека их не отменяет — иначе тот же P0,
+        // только в два клика (docs/review-02.md F-01..F-04).
+        core::SelectionDecision decision = profileDecision;
+        decision.reason += "; ручной выбор проигнорирован: ограничение задано правилом, а не профилем";
+        return decision;
+    }
 
     // Действие (корзина или прямое удаление) по-прежнему решает ядро: снимаем
     // только те ограничения, из-за которых элемент не попал в профиль
@@ -400,8 +472,9 @@ core::SelectionDecision PlanBuilder::decideWithOverride(const core::CleanupCandi
     core::PlanOptions permissive = options_;
     permissive.profile = core::SelectionProfile::Everything;
     permissive.minReclaimBytes = 0;
-    const core::SelectionDecision forced = core::decideCandidate(candidate, permissive);
+    const core::SelectionDecision forced = core::decideCandidate(candidate, permissive, manifest);
     if (forced.action == core::PlanAction::SkipLocked) return profileDecision;  // страховка
+    if (core::isRuleBlock(forced.skip)) return profileDecision;  // запрет правила пережил профиль
 
     core::SelectionDecision decision = forced;
     decision.reason = "выбрано пользователем вручную: " + std::string(actionLabel(decision.action));
@@ -428,6 +501,10 @@ void PlanBuilder::rebuild() {
     plan_ = core::CleanupPlan{};
     plan_.options = options_;
     plan_.dryRun = options_.dryRun;  // FR-5: dry-run обязателен и включён по умолчанию
+    // Манифесты едут вместе с планом: исполнитель получает из плана и решение,
+    // и то, что удалять по списку (docs/review-02.md F-01). Списки файлов
+    // разделяются указателем, копии тут нет.
+    plan_.manifests = manifests_;
     plan_.items.reserve(candidates_.size());
     plan_.totals.candidateCount = candidates_.size();
 
@@ -449,7 +526,8 @@ void PlanBuilder::rebuild() {
     for (std::size_t index = 0; index < candidates_.size(); ++index) {
         const core::CleanupCandidate& candidate = candidates_[index];
         const SelectionOverride selection = overrideFor(index);
-        const core::SelectionDecision decision = decideWithOverride(candidate, selection);
+        const core::SelectionDecision decision = decideWithOverride(index, selection);
+        const core::CandidateManifest* manifest = manifestFor(index);
         const bool removable = core::isRemovableAction(decision.action);
         const bool locked = !candidate.lockedBy.empty();
         const bool visible = candidate.safety != core::SafetyLevel::Risky || options_.allowRisky;
@@ -491,8 +569,15 @@ void PlanBuilder::rebuild() {
                     ++view_.totals.tooSmallCount;
                     break;
                 case core::SkipReason::ProfileFiltered:
+                case core::SkipReason::ReviewOffByDefault:
                     ++plan_.totals.profileFilteredCount;
                     ++view_.totals.profileFilteredCount;
+                    break;
+                // Запреты правила и «нет списка разрешённого» считаются
+                // отдельно от профиля: это не «мало набралось», а «нельзя».
+                case core::SkipReason::EstimateOnly:
+                case core::SkipReason::NoSizeThreshold:
+                case core::SkipReason::NeedsEnumeration:
                     break;
                 case core::SkipReason::Locked:
                     ++view_.totals.lockedCount;
@@ -540,6 +625,13 @@ void PlanBuilder::rebuild() {
         row.selected = removable;
         row.visible = visible;
         row.locked = locked;
+        // Что удалится: корень целиком или перечисленные файлы (F-01).
+        if (manifest != nullptr) {
+            row.rootDeleteOnly = manifest->rootDeleteAllowed || manifest->allowed == nullptr;
+            row.allowedCount = manifest->allowed == nullptr
+                                   ? std::size_t{1}
+                                   : manifest->allowed->entries.size();
+        }
         row.reason = decision.reason;
         view_.items.push_back(std::move(row));
 
@@ -657,7 +749,7 @@ std::vector<core::PlanOperation> PlanBuilder::operations() const {
     result.reserve(plan_.operationCount());
     for (const PlanItemView& row : view_.items) {
         if (!row.selected) continue;
-        result.push_back(makeOperation(row));
+        result.push_back(makeOperation(row, manifestFor(row.candidateIndex)));
     }
     return result;
 }
@@ -673,7 +765,7 @@ core::DryRunReport PlanBuilder::dryRun() const {
     report.operations.reserve(plan_.operationCount());
     report.untouched.reserve(view_.items.size());
     for (const PlanItemView& row : view_.items) {
-        core::PlanOperation op = makeOperation(row);
+        core::PlanOperation op = makeOperation(row, manifestFor(row.candidateIndex));
         if (row.selected) {
             report.operations.push_back(std::move(op));
         } else {
@@ -731,7 +823,7 @@ std::string PlanBuilder::toText() const {
     for (const PlanItemView& row : view_.items) {
         if (row.selected) continue;
         ++line;
-        const core::PlanOperation op = makeOperation(row);
+        const core::PlanOperation op = makeOperation(row, manifestFor(row.candidateIndex));
         text += operationLine(line, op);
         text += "\n    причина: " + op.reason + "\n";
     }
@@ -780,6 +872,8 @@ std::string PlanBuilder::toJson() const {
             {"selected", Value(row.selected)},
             {"visible", Value(row.visible)},
             {"locked", Value(row.locked)},
+            {"rootDeleteOnly", Value(row.rootDeleteOnly)},
+            {"allowedCount", Value(static_cast<double>(row.allowedCount))},
             {"reason", Value(row.reason)},
         }));
     }
@@ -788,6 +882,9 @@ std::string PlanBuilder::toJson() const {
     const std::vector<core::PlanOperation> operationsList = operations();
     operationItems.reserve(operationsList.size());
     for (const core::PlanOperation& op : operationsList) {
+        std::vector<Value> allowed;
+        allowed.reserve(op.allowedPaths.size());
+        for (const std::string& path : op.allowedPaths) allowed.push_back(Value(path));
         operationItems.push_back(Value::object({
             {"index", Value(static_cast<double>(op.candidateIndex))},
             {"action", Value(actionToken(op.action))},
@@ -797,6 +894,9 @@ std::string PlanBuilder::toJson() const {
             {"bytes", number(op.bytes)},
             {"safety", Value(safetyToken(op.safety))},
             {"confidence", Value(op.confidence)},
+            {"rootDeleteOnly", Value(op.rootDeleteOnly)},
+            {"allowedCount", Value(static_cast<double>(op.allowedCount))},
+            {"allowedPaths", Value::array(std::move(allowed))},
             {"reason", Value(op.reason)},
         }));
     }
@@ -811,6 +911,7 @@ std::string PlanBuilder::toJson() const {
         {"options",
          Value::object({
              {"confidenceThreshold", Value(options_.confidenceThreshold)},
+             {"maxDefaultSafety", Value(safetyToken(options_.maxDefaultSafety))},
              {"allowRisky", Value(options_.allowRisky)},
              {"useTrash", Value(options_.useTrash)},
              {"trashDirectDeleteAboveBytes", number(options_.trashDirectDeleteAboveBytes)},
@@ -955,10 +1056,10 @@ std::vector<std::string> PlanBuilder::validate() const {
                                    " выбран к удалению, но файлы заблокированы");
             }
         } else if (row.selection == SelectionOverride::SelectedByUser && !row.locked &&
-                   row.skip != core::SkipReason::RiskyHidden) {
-            // Единственный допустимый повод не выполнить ручной выбор — занятые
-            // файлы и скрытый Risky; они проверяются выше. Всё остальное —
-            // расхождение представления с планом.
+                   row.skip != core::SkipReason::RiskyHidden && !core::isRuleBlock(row.skip)) {
+            // Единственные допустимые поводы не выполнить ручной выбор —
+            // занятые файлы, скрытый Risky и запрет, заданный правилом; они
+            // проверяются выше. Всё остальное — расхождение представления с планом.
             problems.push_back("элемент " + std::to_string(row.candidateIndex) +
                                " выбран пользователем, но план его не взял");
         }

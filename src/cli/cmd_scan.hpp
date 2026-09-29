@@ -37,6 +37,21 @@
 //     engine::collectCandidates, оценивает engine::scoring_bridge, отчёт пишет
 //     core::report_json. Здесь только оркестрация команды и разделение каналов.
 //
+// Значение по умолчанию у ScanServices::createProbe — makePlatformScanProbe(),
+// то есть мост из engine (engine/file_system_probe). Это единственное, что
+// слой cli знает про платформу: функция объявлена здесь, определена в .cpp и не
+// тащит за собой ни одного заголовка platform.
+//
+// Почему engine::FileSystemProbe не объявлен вперёд, а включён
+// engine/candidate_collector.hpp: поле createProbe — это
+// std::function<std::unique_ptr<FileSystemProbe>()> со значением по умолчанию,
+// и std::function проверяет вызываемость возвращаемого значения при объявлении
+// поля. Для std::unique_ptr это означает требование ПОЛНОГО типа в каждой
+// единице трансляции, которая видит ScanServices (args.cpp в том числе):
+// с объявлением вперёд такая единица не собирается («can't delete an
+// incomplete type»). Заголовок при этом остаётся переносимым — сам
+// candidate_collector.hpp не включает windows.h (ADR-004).
+//
 // Свойства вывода, на которые опирается e2e (SPEC §8 Этап 2, §11.4):
 //
 //   * JSON детерминирован: тот же вход — тот же байт в байт. Порядок
@@ -60,9 +75,9 @@
 #include <vector>
 
 #include "core/model.hpp"
+#include "engine/candidate_collector.hpp"
 
 namespace mrproper::engine {
-class FileSystemProbe;
 struct ProgressSnapshot;
 struct ScanRunReport;
 class ScanCoordinator;
@@ -85,15 +100,36 @@ enum class ScanExit : int {
 // Имя кода для текста в stderr и для журнала.
 const char* toString(ScanExit code) noexcept;
 
-// Что нужно от окружения машины. Ни одно поле не обязано быть задано, кроме
-// createProbe: без него сканировать нечем, и команда об этом скажет в stderr и
-// вернёт ScanFailed, а не упадёт.
+// Адаптер обхода ФС по умолчанию: engine::FileSystemProbe над platform::vfs
+// (engine/file_system_probe.hpp). Объявлен здесь, а определён в .cpp, чтобы слой
+// cli не включал заголовки platform напрямую: команда остаётся переносимой и
+// проверяется без диска, а мост — один на всю программу и живёт в engine.
+[[nodiscard]] std::unique_ptr<engine::FileSystemProbe> makePlatformScanProbe();
+
+// Строка «degraded» по накопленным счётчикам адаптера; пустая — условия полные.
+[[nodiscard]] std::string platformScanProbeDiagnostics();
+
+// Что нужно от окружения машины. Все поля необязательны, и у каждого есть
+// осмысленный default: адаптер обхода ФС и диагностика его работы берутся из
+// engine (file_system_probe), карта разделов — только по --with-disks, часы —
+// системные. Явно присвоенное поле всегда сильнее default: вызывающий, который
+// хочет прогнать команду без адаптера (тест «нет адаптера → ScanFailed»), пишет
+// `services.createProbe = nullptr;`.
 struct ScanServices {
     // Адаптер engine::FileSystemProbe над platform::vfs (обход, размеры,
     // нормализация путей). Вызывается по одному разу на задачу пула: обход
     // идёт в нескольких потоках, и адаптер не обязан быть потокобезопасным.
-    // В репозитории такого адаптера пока нет — см. комментарий в .cpp.
-    std::function<std::unique_ptr<engine::FileSystemProbe>()> createProbe;
+    // По умолчанию — makePlatformScanProbe: мост живёт в engine, а команда
+    // остаётся переносимой и проверяемой без диска (§11.1). Пусто — сканировать
+    // нечем, и команда скажет об этом в stderr и вернёт ScanFailed, а не упадёт.
+    std::function<std::unique_ptr<engine::FileSystemProbe>()> createProbe = &makePlatformScanProbe;
+
+    // Состояние адаптера обхода одной строкой: «degraded» с причиной (не
+    // читаются корни, элемент исчез, аллоцированный размер не отдался) или
+    // пустая строка, когда условия полные. Скан без прав админа читает не всё —
+    // это повод сказать об этом в stderr и в notes отчёта, а не повод упасть
+    // (§4 FR-1 «приложение не падает»). Не задана — строки не будет.
+    std::function<std::string()> probeDiagnostics = &platformScanProbeDiagnostics;
 
     // Карта разделов для раздела «disks» отчёта (FR-2/FR-8). Не задана —
     // раздел остаётся пустым, структура отчёта не меняется. Запрашивается

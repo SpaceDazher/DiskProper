@@ -300,6 +300,25 @@ HtmlReportOperation makeHtmlOperation(PlanAction action, std::string name, std::
     return op;
 }
 
+// Текст одного раздела <section aria-labelledby="id"> отчёта. Нужен, чтобы
+// проверять таблицу операций по её собственным строкам: слово «безопасно» есть и
+// в разделе кандидатов, поэтому поиск по всему документу ничего не доказывает.
+std::string htmlSection(std::string_view html, std::string_view id) {
+    const std::string opening = "<section aria-labelledby=\"" + std::string(id) + "\">";
+    const std::size_t begin = html.find(opening);
+    if (begin == std::string::npos) return std::string();
+    const std::size_t end = html.find("</section>", begin);
+    if (end == std::string::npos) return std::string();
+    return std::string(html.substr(begin, end - begin));
+}
+
+// Число строк данных в таблице раздела: одна «<tr>» принадлежит <thead>,
+// остальные — строки данных.
+std::size_t dataRowCount(const std::string& section) {
+    const std::size_t rows = occurrences(section, "<tr>");
+    return rows == 0 ? std::size_t{0} : rows - 1;
+}
+
 }  // namespace
 
 // =====================================================================
@@ -1183,4 +1202,96 @@ TEST(reportHtml_minimalInputStillRendersAWholeDocument) {
     // Неизвестные значения печатаются прочерком, а не пустой ячейкой.
     CHECK(has(html, "\xE2\x80\x94"));
     CHECK_EQ(renderHtmlReport(in), html);
+}
+
+// =====================================================================
+// core::report_html: уровень риска операции (review-05 F-02)
+// =====================================================================
+//
+// Поле HtmlReportOperation::safety заполняли оба сборщика (cmd_report.cpp,
+// view_report.cpp), а рендерер таблицы операций его не читал: уровень риска
+// молча терялся, и отчёт отвечал на вопрос «что удалили», но не «насколько это
+// было опасно». Проверки смотрят САМ раздел операций и требуют, чтобы строк
+// было ровно столько же, сколько операций: колонка не должна ни съехать на
+// кандидатов, ни выкинуть строку.
+
+namespace {
+
+// Три операции — по одной на каждый уровень риска — плюс разный исход, чтобы
+// фишки «Итог» и «Уровень риска» нельзя было спутать между собой.
+HtmlReportInput riskLevelInput() {
+    HtmlReportInput in = makeHtmlInput();
+    in.operations.clear();
+
+    HtmlReportOperation safe = makeHtmlOperation(PlanAction::Delete, "Временные файлы", "C:\\Temp\\a.tmp", 4000000ULL,
+                                                 true, false, "", 2100);
+    safe.safety = SafetyLevel::Safe;
+    in.operations.push_back(safe);
+
+    HtmlReportOperation review = makeHtmlOperation(PlanAction::Trash, "Кэш браузера", "C:\\Chrome\\Cache", 1000000ULL,
+                                                   true, false, "", 840);
+    review.safety = SafetyLevel::Review;
+    in.operations.push_back(review);
+
+    HtmlReportOperation risky = makeHtmlOperation(PlanAction::Delete, "Крупные файлы", "C:\\Users\\Daniil\\movie.mp4",
+                                                  500000ULL, false, false, "0x80070005", 120);
+    risky.safety = SafetyLevel::Risky;
+    in.operations.push_back(risky);
+
+    return in;
+}
+
+}  // namespace
+
+TEST(report_operationsTableShowsRiskLevelOfEveryOperation) {
+    const HtmlReportInput in = riskLevelInput();
+    const std::string html = renderHtmlReport(in);
+    const std::string operations = htmlSection(html, "operations");
+    CHECK(!operations.empty());
+
+    // Колонка риска есть в самой таблице операций, а не где-то в документе.
+    CHECK(has(operations, "Уровень риска"));
+    // Каждый уровень напечатан фишкой своего цвета — все три, ровно по одному.
+    CHECK_EQ(occurrences(operations, "class=\"chip ok\">безопасно</span>"), std::size_t{1});
+    CHECK_EQ(occurrences(operations, "class=\"chip warn\">проверить</span>"), std::size_t{1});
+    CHECK_EQ(occurrences(operations, "class=\"chip err\">риск</span>"), std::size_t{1});
+    // Прежние столбцы на месте: новая колонка не вытеснила действие и итог.
+    CHECK(has(operations, "Действие"));
+    CHECK(has(operations, "Итог"));
+    // Строк столько же, сколько операций, — молчаливого обреза тут нет.
+    CHECK_EQ(dataRowCount(operations), in.operations.size());
+    CHECK_EQ(dataRowCount(operations), std::size_t{3});
+    CHECK(isStandaloneHtml(html));
+}
+
+TEST(report_operationsRiskColumnFollowsReportLanguage) {
+    // Тот же отчёт по-английски: подпись колонки и фишки риска переключаются
+    // вместе с языком, русские слова не протекают в английский отчёт (§5).
+    HtmlReportOptions options;
+    options.language = HtmlReportLanguage::English;
+    const std::string html = renderHtmlReport(riskLevelInput(), options);
+    const std::string operations = htmlSection(html, "operations");
+    CHECK(!operations.empty());
+    CHECK(has(operations, "Risk level"));
+    CHECK_EQ(occurrences(operations, "class=\"chip ok\">safe</span>"), std::size_t{1});
+    CHECK_EQ(occurrences(operations, "class=\"chip warn\">review</span>"), std::size_t{1});
+    CHECK_EQ(occurrences(operations, "class=\"chip err\">risky</span>"), std::size_t{1});
+    CHECK(!has(operations, "безопасно"));
+    CHECK(!has(operations, "Уровень риска"));
+    CHECK_EQ(dataRowCount(operations), std::size_t{3});
+}
+
+TEST(report_operationsRiskLevelSurvivesMissingCandidatesSection) {
+    // Отчёт без раздела кандидатов (showCandidates = false) — обычный случай
+    // выгрузки по одной очистке. Уровень риска операций от этого не исчезает:
+    // колонка принадлежит таблице операций, а не разделу кандидатов.
+    const HtmlReportInput in = riskLevelInput();
+    HtmlReportOptions options;
+    options.showCandidates = false;
+    const std::string html = renderHtmlReport(in, options);
+    CHECK(!has(html, "id=\"candidates\""));
+    const std::string operations = htmlSection(html, "operations");
+    CHECK(has(operations, "Уровень риска"));
+    CHECK_EQ(occurrences(operations, "class=\"chip err\">риск</span>"), std::size_t{1});
+    CHECK_EQ(dataRowCount(operations), in.operations.size());
 }

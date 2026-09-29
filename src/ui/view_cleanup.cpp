@@ -154,6 +154,31 @@ std::string safetyText(SafetyLevel level) {
     return tr(StringId::kCommonUnknown);
 }
 
+// Уровень риска целиком: слово уровня плюс подсказка для Risky. Одного слова
+// «Рискованно» мало — человек должен понимать, что будет с элементом по
+// умолчанию (FR-4, §12). Общая функция для подписи узла и для строки dry-run:
+// уровень риска в двух местах обязан звучать одинаково.
+std::string riskText(SafetyLevel level) {
+    std::string text = safetyText(level);
+    if (level == SafetyLevel::Risky) {
+        text += " — ";
+        text += tr(StringId::kSafetyRiskyHint);
+    }
+    return text;
+}
+
+// «Почему это мусор» одной строкой: правило может дать несколько причин, а в
+// строке dry-run они читаются как один список, а не как три отдельных куска.
+std::string joinReasons(const std::vector<std::string>& reasons) {
+    std::string text;
+    for (const std::string& reason : reasons) {
+        if (reason.empty()) continue;
+        if (!text.empty()) text += "; ";
+        text += reason;
+    }
+    return text;
+}
+
 // Текст действия для таблицы dry-run. Отдельных строк «удалить»/«в корзину» в
 // каталоге нет, но ключи с точным смыслом есть, а FR-5 различает Delete и
 // Trash: человек должен видеть, куда денется файл.
@@ -979,11 +1004,17 @@ std::string CleanupViewModel::nodeText(std::string_view key) const {
 }
 
 std::string CleanupViewModel::nodeDetails(std::string_view key) const {
+    // Уровень риска идёт первым: он отвечает на вопрос «можно ли это вообще
+    // удалять», а объяснение — на вопрос «почему». Подпись уровня считалась и
+    // раньше, но на экран не попадала ни разу (review-05 F-04).
+    const std::string risk = nodeRiskLabel(key);
     if (const ItemNode* item = findItem(key)) {
         // FR-4: почему это мусор. Пустые причины — дефект правила, и молча
         // показать пустоту хуже, чем сказать «нет данных»: G4 обещает ноль
         // кандидатов «без объяснения».
-        std::string text = tr(StringId::kCleanupWhyJunk);
+        std::string text = risk;
+        if (!text.empty()) text += "\r\n";
+        text += tr(StringId::kCleanupWhyJunk);
         text += ": ";
         text += item->reason.empty() ? tr(StringId::kCommonNone) : item->reason;
         if (!item->path.empty()) {
@@ -1002,7 +1033,9 @@ std::string CleanupViewModel::nodeDetails(std::string_view key) const {
         return text;
     }
     if (const CategoryNode* category = findCategory(key)) {
-        std::string text = selectedText();
+        std::string text = risk;
+        if (!text.empty()) text += "\r\n";
+        text += selectedText();
         text += " · ";
         text += safeOnlyText();
         if (category->selectableCount == 0) {
@@ -1023,12 +1056,7 @@ std::string CleanupViewModel::nodeRiskLabel(std::string_view key) const {
     } else {
         return std::string();
     }
-    std::string text = safetyText(level);
-    if (level == SafetyLevel::Risky) {
-        text += " — ";
-        text += tr(StringId::kSafetyRiskyHint);
-    }
-    return text;
+    return riskText(level);
 }
 
 std::string CleanupViewModel::summaryText() const {
@@ -1161,6 +1189,10 @@ std::vector<CleanupViewModel::DryRunRow> CleanupViewModel::dryRunRows() const {
         row.item = operation.displayName;
         row.action = actionText(operation.action);
         row.bytes = sizeText(operation.bytes);
+        // Уровень риска и «почему это мусор» едут из плана: решение о действии
+        // принимает core::plan, и экран не имеет права придумывать второе (FR-4).
+        row.safety = riskText(operation.safety);
+        row.why = joinReasons(operation.evidence);
         row.reason = operation.reason;
         rows.push_back(std::move(row));
     }
@@ -1587,9 +1619,23 @@ struct ViewState {
         const std::vector<CleanupViewModel::DryRunRow> rows = model.dryRunRows();
         ListView_SetItemCount(dryRunList, static_cast<int>(rows.size()));
         for (std::size_t i = 0; i < rows.size(); ++i) {
-            const std::string line = rows[i].category + " · " + rows[i].item + " — " + rows[i].bytes +
-                                     " — " + rows[i].action +
-                                     (rows[i].reason.empty() ? std::string() : " — " + rows[i].reason);
+            // Строка подтверждения: категория, элемент, объём, действие, УРОВЕНЬ
+            // РИСКА и причина (FR-4/FR-5/§12). Уровень и объяснение не
+            // выбрасываются, даже если строка не влезет по ширине: это
+            // последнее, что человек видит перед удалением.
+            std::string line = rows[i].category + " · " + rows[i].item + " — " + rows[i].bytes + " — " + rows[i].action;
+            line += " · ";
+            line += rows[i].safety;
+            if (!rows[i].why.empty()) {
+                line += " · ";
+                line += tr(StringId::kCleanupWhyJunk);
+                line += ": ";
+                line += rows[i].why;
+            }
+            if (!rows[i].reason.empty()) {
+                line += " · ";
+                line += rows[i].reason;
+            }
             const std::wstring wide = toWide(line);
             LVITEMW entry{};
             entry.mask = LVIF_TEXT;

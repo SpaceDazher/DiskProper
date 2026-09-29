@@ -1,0 +1,134 @@
+name: Ошибка / Bug report
+description: >
+  Ошибка в работе MrProper: неверный отчёт, не удаётся удалить, программа
+  завершилась с недокументированным кодом, неожиданное поведение. Не подходит
+  для сообщений об уязвимостях — см. SECURITY.md.
+title: "[BUG] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо, что сообщаете об ошибке. Пожалуйста, заполните как можно больше
+        полей: чем полнее отчёт, тем меньше уточняющих вопросов.
+
+        ⚠️ **Не прикладывайте отчёт или дамп «как есть».** Даже случайный отчёт
+        содержит приватные данные: серийники дисков и модели, личные каталоги
+        (`Downloads`, профили, сетевые пути), а в отчёте есть пути. Перед отправкой
+        замаскируйте серийники, если для разбора они не нужны, и вычистите пути,
+        которые не нужны для понимания ошибки. Подробности — в
+        [SECURITY.md](https://github.com/OWNER/MrProper/blob/master/SECURITY.md).
+
+        🔒 Если дефект позволяет удалить пользовательские данные, обойти проверки
+        или утечь сведения за пределы машины — **не заводите публичный issue**.
+        Напишите владельцу приватно, как описано в SECURITY.md.
+
+        Thank you for reporting a bug. Please fill in as much as you can — the more
+        complete the report, the fewer follow-up questions.
+        ⚠️ Do **not** attach raw reports or dumps: they contain disk serials,
+        personal folders and paths. Mask what is not needed. See SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Версия / Version
+      description: Вывод `mrproper-cli --version` (строка «Конфигурация сборки» тоже нужна)
+      placeholder: "mrproper-cli 0.1.0, сборка Debug, x64"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Windows
+      description: Версия и сборка ОС, разрядность
+      placeholder: "Windows 11 23H2 (22631), x64"
+    validations:
+      required: true
+  - type: dropdown
+    id: command
+    attributes:
+      label: Команда / Command
+      description: Какая команда или экран был запущен
+      options:
+        - mrproper-cli scan
+        - mrproper-cli plan
+        - mrproper-cli apply
+        - mrproper-cli report
+        - mrproper-cli rules validate
+        - mrproper-cli rules verify
+        - Графическое приложение (список дисков)
+        - Графическое приложение (очистка)
+        - Другое / Other
+    validations:
+      required: true
+  - type: input
+    id: invocation
+    attributes:
+      label: Как запускали / How it was run
+      description: >
+        Точная команда целиком (для CLI) или шаги до окна ошибки (для приложения).
+        Ключи с путями замаскируйте.
+      placeholder: "mrproper-cli scan --json > report.json"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Ожидалось / Expected
+      description: Что должно было произойти, со ссылкой на пункт спецификации, если он есть
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Произошло / Actual
+      description: Что произошло на самом деле
+    validations:
+      required: true
+  - type: textarea
+    id: code
+    attributes:
+      label: Код возврата и сообщения / Exit code and messages
+      description: >
+        Код возврата команды и текст stderr. Полный лог прикладывайте только после
+        очистки: уберите пути с личными каталогами и любые серийники.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: steps
+    attributes:
+      label: Шаги воспроизведения / Steps to reproduce
+      description: Пронумерованный минимальный список шагов
+      placeholder: |
+        1. Создать каталог C:\Temp\test с файлом test.tmp
+        2. mrproper-cli scan --json
+        3. Увидеть 0 кандидатов
+    validations:
+      required: true
+  - type: textarea
+    id: rules
+    attributes:
+      label: Набор правил / Rule set
+      description: >
+        Каким набором проверяли (в репозитории, из сети, встроенный) и что ответил
+        `rules validate` / `rules verify`. Не прикладывайте содержимое набора, если
+        это не нужно для разбора.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checked
+    attributes:
+      label: Проверки перед отправкой / Before submitting
+      options:
+        - label: >
+            Я проверил, что в прикреплённом отчёте нет серийников дисков, моделей и
+            моих личных каталогов (SECURITY.md)
+          required: true
+        - label: >
+            Проблема воспроизводится на чистой машине без моего мусора (песочница
+            в %TEMP%), либо я это проверил
+          required: false
+        - label: >
+            Это не уязвимость и не дефект удаления чужих данных — такие случаи
+            сообщаются приватно
+          required: true
