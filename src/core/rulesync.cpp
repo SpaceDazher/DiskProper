@@ -413,10 +413,10 @@ Manifest parseRuleSetManifest(std::string_view text, std::string_view origin) {
                                 hash + "\"");
         }
         file.sha256 = toHex(digest);
-        if (const json::Value* size = item.find("size")) {
-            // requireCount ждёт родительский объект и ключ в нём, поэтому
-            // передаём элемент files, а не сам узел "size": иначе любой файл
-            // с объявленным размером падал с «нет обязательного поля size».
+        // requireCount ждёт родительский объект и ключ в нём, поэтому передаём
+        // элемент files, а не сам узел "size": иначе любой файл с объявленным
+        // размером падал с «нет обязательного поля size».
+        if (item.find("size") != nullptr) {
             file.size = requireCount(item, "size", source);
             file.sizeDeclared = true;
         }

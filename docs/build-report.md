@@ -1,5 +1,10 @@
 # Отчёт о сборке и прогоне тестов MrProper
 
+**Прогон задачи H5, 2026-09-29, слоты `a5`/`a4`: сборка не состоялась (§1a), тесты
+`tools\test.bat Debug a5` → 319/0 и 31/4 код 1 (§3a), e2e → код 9009 (§3a), проверка CLI
+на песочнице — 11 замеров (§3b). Числа ниже, помеченные «прогон G5», относятся к прошлому
+проходу и сохранены для сравнения; смешивать их с числами H5 нельзя.**
+
 **Свежий прогон: задача G5, 2026-09-29, конфигурация `Debug`, слот `a5`.**
 Предыдущий прогон: задача F7, 2026-09-28, слот `a7` — его числа сохранены в §6
 как история и **не смешаны со свежими**: база тогда была `90d5032` плюс незакоммиченные
@@ -72,6 +77,54 @@
   твоему.
 
 ---
+
+## 1a. Сборка Debug, прогон задачи H5 (2026-09-29): сборка не состоялась
+
+Этот раздел стоит первым, потому что он отменяет смысл всех чисел ниже: **свежая сборка
+`HEAD` в этом проходе невозможна**, и потому числа разделов 3.x этого прогона описывают
+бинарники слотов, а не дерево.
+
+```
+> tools\build.bat Debug a5
+[build] КРИТИЧНО: не найден vcvars64.bat — C++ тулчейн не установлен. SPEC.md раздел 8, Этап 0.0
+EXIT=9009
+```
+
+**Почему, по фактам.** В `tools\build.bat` ровно две пробы `vcvars64.bat`, и обе провалились:
+
+| Проба | Ожидаемое | Фактическое |
+|---|---|---|
+| `D:\BuildTools\VC\Auxiliary\Build\vcvars64.bat` (строка 30) | каталог `VC` экземпляра BuildTools | **каталога нет.** У экземпляра `2cbeafe3` (`installationPath: D:\BuildTools`, BuildTools 17.14.41) в `state.json` нет пакета `Microsoft.VisualStudio.Component.VC.Tools.x86.x64`; на диске только `Common7`, `Licenses`, `MSBuild` |
+| `vswhere.exe -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath` (строки 32-38) | путь к установке с VC | **ноль строк.** `vswhere` версии 3.1.7 (query 3.12) возвращает `[]` даже на голый `-products *` и на `-all -prerelease`, при том что в `C:\ProgramData\Microsoft\VisualStudio\Packages\_Instances` лежат **три** `state.json` — `21e8ff57` (2022 Community), `2cbeafe3` (`D:\BuildTools`), `9638185a` (**2019 BuildTools, пакет `VC.Tools.x86.x64` в списке есть**) |
+
+**Тулчейн при этом жив.** 2019-й экземпляр — тот самый, которым собран весь проект:
+`build/a5/CMakeCache.txt` содержит `CMAKE_GENERATOR:INTERNAL=Visual Studio 16 2019` и
+`CMAKE_LINKER:...\\VC\\Tools\\MSVC\\14.29.30133\\bin\\Hostx64\\x64\\link.exe`. Проверка
+окружения вручную даёт `cl.exe`, `cmake.exe` и `ctest.exe` по этим путям. То есть сломано
+**обнаружение**, а не компилятор.
+
+**Починить из задачи H5 нельзя.** `mkdir D:\BuildTools\VC\Auxiliary\Build` из Windows
+возвращает «Не удается создать файл или папку» (прав на запись в установку VS нет), а
+`tools\build.bat` не входит в четыре файла этой задачи. Это заведено как **D-54**
+(`tools\build.bat:29-42` и `tools\test.bat:83-95` — ветка e2e зовёт vcvars так же и падает
+тем же кодом 9009).
+
+**Следствие для чисел.** Последняя успешная сборка в дереве — слот `a4` в **03:29:44**,
+то есть за 2 ч 31 мин до этого прохода. Относящиеся к ней отметки времени:
+
+| Файл | Время | HEAD менялся после? |
+|---|---|---|
+| `build/a4/Debug/mrproper_cli.exe` | 03:29:44 | нет — `src/engine/executor.cpp` в 03:29:31 |
+| `build/a4/Debug/mrproper_integration_tests.exe` | 03:28:15 | **да** — `executor_manifest_tests.cpp` в 03:27:08 попадает, но файл менялся и в 06:10:12 |
+| `build/a5/Debug/mrproper_unit_tests.exe` | 01:43:56 | **да** — старее `src/engine/executor.cpp` (03:29:31) |
+| `build/a5/Debug/mrproper_integration_tests.exe` | 03:22:01 | **да** — старее и `executor_manifest_tests.cpp` (03:27:08), и `executor.cpp` |
+
+**Про дерево, которое двигалось.** `tests/integration/executor_manifest_tests.cpp` изменён
+в **06:10:12** — за секунды до контрольного `date` этого прохода, а
+`tests/integration/tmp_h4_probe.cpp` снят с индекса параллельной задачей (волна H4). Все
+замеры этого отчёта относятся к окну **06:00–06:12**; после него числа интеграционного
+набора меняются.
+
 
 ## 2. Сборка Debug (свежий прогон)
 
@@ -330,6 +383,94 @@ EXIT=0
 Стало: 343 C++-проверки, 0 провалов, код возврата 0, e2e — 4 из 4.
 
 ---
+
+## 3a. Прогон тестов Debug, задача H5 (2026-09-29): фактический вывод
+
+Это единственный прогон, который можно было выполнить, и он выполнен через штатную точку
+входа. Ниже — вывод как есть; разбору «кому какое число принадлежит» посвящён абзац после
+таблицы, потому что без него числа вводят в заблуждение.
+
+```
+> tools\test.bat Debug a5
+== MrProper core ==
+  [ ok ] i18n_processWideLocalizerServesFreeFunctions
+  ...
+ALL PASS: 319 проверок, провалов 0
+
+== MrProper integration ==
+  [DIAG] item idx=0 outcome=failed code=failed hr=-2147024891 ... причина отказа:
+         путь не разрешён (allowedRoot не совпал с корнем правила)
+  [FAIL] executor_manifest_listedFileIsDeletedAndNothingElse
+         tests\integration\executor_manifest_tests.cpp:559  outcome.report->done != 1
+  [FAIL] executor_manifest_unlistedNeighbourSurvives
+         tests\integration\executor_manifest_tests.cpp:621  outcome.report->done != 1
+  [FAIL] executor_manifest_partialDirectoryRemovesOnlyListedFiles
+         tests\integration\executor_manifest_tests.cpp:693  outcome.report->done != 1
+  [ ok  ] executor_manifest_listEntryOutsideRuleRootIsRefused
+  [FAIL] executor_manifest_candidateOutsideRuleRootIsRefused
+         tests\integration\executor_manifest_tests.cpp:840  code != "SkippedOutsideRoot"
+  [ ok  ] executor_manifest_trashTransactionIsRestorable
+  [ ok  ] trashBoundary_refusesPurgeOutsideRuleRoot
+  [ ok  ] trashBoundary_allowsPurgeInsideRuleRoot
+  [ ok  ] trashBoundary_junctionInsideRootLeavesOutsideDataIntact
+  [ ok  ] trashBoundary_emptyRootKeepsServiceBehaviour
+  [ ok  ] trashBoundary_unresolvableRootFailsClosed
+  [ ok  ] vfsEdge_* (7 проверок)
+  [ ok  ] walk_* (13 проверок)
+FAIL: 31 проверок, провалов 4
+EXIT=1
+```
+
+| Набор | Пройдено | Провалов | Код набора | Кому принадлежит число |
+|---|---|---|---|---|
+| Юнит (`mrproper_unit_tests.exe`, слот `a5`, 01:43:56) | **319** | **0** | 0 | **верится.** В дереве ровно 319 `TEST(` в `tests/unit` (32+27+63+43+9+13+28+44+60) — источники совпадают с числом |
+| Интеграция (`mrproper_integration_tests.exe`, слот `a5`, 03:22:01) | 31 | **4** | 1 | **не верится как характеристика `HEAD`.** На момент прогона в дереве было 32 `TEST(` в `tests/integration` (6 + 1 + 5 + 7 + 13), выполнял бинарник 31 — то есть он старше текущих исходников. После прогона `tmp_h4_probe.cpp` снят параллельной задачей, сейчас в дереве 31 |
+| e2e (`tools\test.bat Debug a5 e2e`) | — | — | **9009** | не запускался: `[test] КРИТИЧНО: не найден vcvars64.bat`. Модуль `D:\Tools\Pester\4.10.1\Pester.psd1` на диске есть, виноват только вызов vcvars (D-54) |
+
+**Про четыре провала — важно, чтобы их не записали в дефекты тестов.** Все четыре одного
+класса: `hr=-2147024891` = `0x80070005`, и причина отказа дословно одна и та же — «путь не
+разрешён (allowedRoot не совпал с корнем правила)». Это **не** ошибка проверок, а отказ
+движка, попавший в прогон раньше, чем его починили: на актуальном бинарнике `a4` тот же
+класс воспроизводится как `OutsideRoot` (§3b). Отсюда: **после пересборки эти четыре
+должны уйти, и одна пересборка это проверяет** — но в этом проходе её не было.
+
+**Счёт `TEST(` в дереве на момент прогона** (проверено, что и почему числа не совпадают
+с выполненными):
+
+```
+tests/unit/            319   ->  выполнено 319
+tests/integration/      32   ->  выполнено 31   (на момент прогона 32: шесть executor_manifest_*, один
+                                    tmp_h4_probe.cpp из e96b0c4 и ещё 25; tmp_h4_probe.cpp снят
+                                    параллельной задачей в 06:10, после прогона, и сейчас 31)
+tests/e2e/               4 сценария Pester -> не запускались (код 9009)
+```
+
+## 3b. Проверка CLI на песочнице, задача H5 (2026-09-29)
+
+Все измерения — на бинарнике `build/a4/Debug/mrproper_cli.exe` (03:29:44, новее последнего
+изменения `src/engine/executor.cpp`), в песочнице `%TEMP%\mrproper-h5-fixture` с отдельным
+каталогом правил. Настоящий `%TEMP%` пользователя, AppData, кэши браузеров и ProgramData не
+трогались; удалялось только внутри песочницы.
+
+| # | Что меряем | Команда | Код | Результат |
+|---|---|---|---|---|
+| 1 | Версия бинаря | `mrproper_cli.exe --version` | 0 | `mrproper-cli 0.1.0` |
+| 2 | D-48, манифест в отчёте | `scan --rules rules --json` | 0 | 268 кандидатов, `manifest` у **268/268**, `skipReason` = `{None: 268}`, отчёт **1 152 717 Б**; stderr: «элементов 102524, найдено 9,8 ГБ, задач 20/20» |
+| 3 | D-49, запрет FR-5 | `apply --candidates {"candidates":[]} --execute --yes` | **3** | «`--candidates` читает готовый список: удалять по нему нельзя, план мог устареть» + снимок FR-5 (было 0) |
+| 4 | D-50, исполнитель удаляет | `apply --rules <r2> --execute --trash-root <trash2> --yes`, локатор **без** подстановки | **0** | `[1] Trashed`, освобождено **66 КБ из 66 КБ**, ошибок 0; файл физически в `trash2\20260929T110601Z-000001-9e3779b9\item-000000\only.bin`; каталога `r2` в песочнице нет |
+| 5 | D-52, локатор с `*` | то же, локатор `…\r3\*` | **6** | `[1] OutsideRoot`, 0 Б; `r3\one.bin` на месте |
+| 6 | D-52, локатор с `**` | то же, локатор `…\rule\**` (4 файла) | **6** | `[1] OutsideRoot`, 0 Б; все 4 файла на месте |
+| 7 | `plan --include-review` | `plan --include-review --rules rules --json` | **0** | документ плана **733 223 Б** — утверждение «неизвестный ключ» **не воспроизводится** |
+| 8 | План по поставляемому набору (только чтение) | `plan --rules rules --json` | 0 | 268 кандидатов → **234 операции**, `750708238` Б (**716,1 МиБ**), 34 не взято, `trash` 232 / `delete` 2 |
+| 9 | Петля reparse (свой junction) | `mklink /J …\loop\up …\loop`; `scan --json` ×3; `apply --execute --yes` ×2 | 0 / 0 / 0 / 6 / 6 | **0 крашей.** Скан 0,0 с, junction не разворачивается; `apply` падает кодом 6 — это D-52, не краш |
+| 10 | Сколько правил уязвимо к D-52 | разбор `rules/*.json` | — | **113 из 138** правил имеют локатор, кончающийся подстановочным знаком (81,9 %) |
+| 11 | Сколько операций уязвимо к D-52 | сопоставление операций плана с корнями правил | — | **69 из 234** операций (29,5 %) |
+
+**Песочница убрана после замеров:** `rmdir` для junction, каталог
+`%TEMP%\mrproper-h5-fixture` удалён целиком. Корзины приложения из замеров 4-6 лежали
+внутри песочницы (`trash2`, `trash3`, `trash4`), то есть вне `%ProgramData%` ничего не
+создавалось.
+
 
 ## 4. Прогон `rules validate` (справка)
 

@@ -1153,11 +1153,17 @@ const core::CandidateManifest* CleanupExecutor::manifestForItem(const ItemReport
 }
 
 void CleanupExecutor::deleteAllowedList(ItemReport& item, const core::AllowedSet& allowed) {
-    // ВРЕМЕННО H4 (будет откачено): печатаем item.ruleRoot ДО создания view.
-    std::printf("[H4DIAG] deleteAllowedList item.ruleRoot=[%s] len=%zu entries=%zu\n", item.ruleRoot.c_str(),
-                item.ruleRoot.size(), allowed.entries.size());
+    // Время жизни: DeleteOptions::allowedRoot — это std::wstring_view, поэтому он
+    // обязан смотреть на живую строку. Раньше здесь стояло
+    // deleteOptions.allowedRoot = wide(item.ruleRoot), то есть view указывал на
+    // временный объект, уничтоженный в конце инициализации: граница превращалась в
+    // мусор, rootValid=false, и КАЖДАЯ операция удаления по списку заканчивалась
+    // отказом OutsideRuleRoot (HRESULT 0x80070005). Нашёл задача H4.
+    const std::wstring rootWide = wide(item.ruleRoot);
+
     vfs::DeleteOptions deleteOptions;
-    deleteOptions.allowedRoot = wide(item.ruleRoot);
+    // View живёт до конца вызова: rootWide объявлен выше и не перемещается.
+    deleteOptions.allowedRoot = rootWide;
     deleteOptions.maxAttempts = options_.deleteAttempts;
     deleteOptions.backoff = options_.deleteBackoff;
     deleteOptions.maxBackoff = options_.maxDeleteBackoff;

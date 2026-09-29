@@ -71,8 +71,34 @@ bool inClass(const std::string& cls, char c) {
     return negate ? !found : found;
 }
 
+
+// Хвост шаблона, который законно соответствует пустому остатку пути: только
+// разделители и не более одной группы «**». Именно из-за отсутствия такой
+// проверки «C:\x\rule\**» не совпадал с «C:\x\rule», и повторная сверка с
+// локатором на фазе C отвергала корень СВОЕГО ЖЕ правила — 69 из 234 операций
+// плана (29,5 %) не могли выполниться, потому что почти все локаторы кончаются
+// на «**». Правило «a/**/b == a/b» работало, а «a/** == a» — нет.
+[[nodiscard]] bool matchesEmptyTail(std::string_view pat) {
+    bool starStarSeen = false;
+    for (std::size_t i = 0; i < pat.size();) {
+        if (isSep(pat[i])) {
+            ++i;
+            continue;
+        }
+        if (pat[i] == '*' && i + 1 < pat.size() && pat[i + 1] == '*') {
+            if (starStarSeen) return false;  // две группы «**» подряд — это уже «что-то»
+            starStarSeen = true;
+            i += 2;
+            continue;
+        }
+        return false;  // любой другой символ требует непустого пути
+    }
+    return true;
+}
+
 bool matchHere(std::string_view pat, std::string_view str, CaseMode mode) {
     if (pat.empty()) return str.empty();
+    if (str.empty()) return matchesEmptyTail(pat);
     const char pc = pat[0];
 
     if (pc == '*') {

@@ -78,6 +78,26 @@ TEST(glob_starDoesNotCrossSeparator) {
     CHECK(matchPath("C:/Temp/**", "C:/Temp/sub/deep/file.tmp"));
 }
 
+// Регрессия D-52: почти все локаторы правил кончаются на «**», а повторная
+// сверка с локатором на фазе C отвергала корень СВОЕГО ЖЕ правила. Причина —
+// «C:\x\rule\**» не совпадал с «C:\x\rule»: остаток пути пуст, а хвост
+// шаблона состоял из разделителя и «**». Цена была не косметическая: 69 из 234
+// операций плана (29,5 %) не могли выполниться.
+TEST(glob_doubleStarMatchesEmptyRemainder) {
+    CHECK(matchPath("C:/x/rule/**", "C:/x/rule"));
+    CHECK(matchPath("C:/x/rule/**", "C:/x/rule/a"));
+    CHECK(matchPath("C:/x/rule/**", "C:/x/rule/a/b"));
+    // Одиночный «*» по-прежнему НЕ совпадает с пустым остатком: это разные вещи.
+    CHECK(!matchPath("C:/x/rule/*", "C:/x/rule"));
+    // Соседний каталог не должен подхватываться.
+    CHECK(!matchPath("C:/x/rule/**", "C:/x/other"));
+    // Две группы «**» подряд в хвосте — уже «что-то», а не пустота.
+    CHECK(!matchPath("C:/x/**/**", "C:/x"));
+    // Обычные случаи не сломались.
+    CHECK(matchPath("C:/x/rule/*", "C:/x/rule/a"));
+    CHECK(matchPath("C:/x/rule", "C:/x/rule"));
+}
+
 TEST(glob_doubleStarMatchesZeroSegments) {
     CHECK(matchPath("C:/a/**/b", "C:/a/b"));
     CHECK(matchPath("C:/a/**/b", "C:/a/x/b"));

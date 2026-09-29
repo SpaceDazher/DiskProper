@@ -15,14 +15,31 @@ set "SLOT=%~2"
 if "%SLOT%"=="" set "SLOT=main"
 set "BUILDDIR=build\%SLOT%"
 
+REM --- поиск vcvars64.bat: сперва D:\BuildTools, затем vswhere, затем известные
+REM --- пути. vswhere отдаёт пустоту, если каталог экземпляров Visual Studio
+REM --- повреждён, а компилятор при этом жив, поэтому последний шаг не зависит
+REM --- ни от того, ни от другого.
 set "VSWHERE=C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VARS="
 if exist "D:\BuildTools\VC\Auxiliary\Build\vcvars64.bat" set "VARS=D:\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-if not defined VARS (
-  for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+if not defined VARS if exist "%VSWHERE%" (
+  for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul`) do (
     if exist "%%i\VC\Auxiliary\Build\vcvars64.bat" (
       set "VARS=%%i\VC\Auxiliary\Build\vcvars64.bat"
       goto :gotvars
+    )
+  )
+)
+if not defined VARS for %%P in (
+  "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools"
+  "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+  "C:\Program Files\Microsoft Visual Studio\2022\Community"
+  "C:\Program Files\Microsoft Visual Studio\2022\Professional"
+  "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+) do (
+  if not defined VARS if exist "%%~P\VC\Auxiliary\Build\vcvars64.bat" set "VARS=%%~P\VC\Auxiliary\Build\vcvars64.bat"
+)
+:gotvars
     )
   )
 )

@@ -36,11 +36,16 @@
 //      непустой — нет.
 //   4. executor_manifest_listEntryOutsideRuleRootIsRefused
 //      Путь в списке, оказавшийся за пределами корня правила, даёт отказ с
-//      кодом HRESULT, и файл на месте. Это проверка границы FR-6 на уровне
-//      элемента списка: корень защищает каталог, а не «любой путь из плана».
+//      кодом HRESULT, и файл на месте, — а СВОЙ файл из того же списка
+//      удаляется. Это проверка границы FR-6 на уровне элемента списка:
+//      корень защищает каталог, а не «любой путь из плана». Свой файл в
+//      списке обязателен: при отказе всего подряд проверка «отказ с кодом»
+//      осталась бы зелёной и не доказывала бы ничего.
 //   5. executor_manifest_candidateOutsideRuleRootIsRefused
-//      Сам кандидат вне корня правила: SkippedOutsideRoot до единого обращения к
-//      файловой системе (фаза A), файл цел.
+//      Тот же приём на кандидате: он вне корня правила, поэтому
+//      SkippedOutsideRoot до единого обращения к файловой системе (фаза A),
+//      файл цел — а второй кандидат, внутри границы, в этом же прогоне
+//      удаляется.
 //   6. executor_manifest_trashTransactionIsRestorable
 //      Транзакция корзины появляется на диске (каталог + manifest.json +
 //      committed), перенесён только перечисленный файл, а восстановление
@@ -526,25 +531,23 @@ TEST(executor_manifest_listedFileIsDeletedAndNothingElse) {
     planOptions.dryRun = true;  // FR-5: план сначала показывается
     const core::CleanupPlan plan = core::buildPlan(candidates, planOptions, &manifests);
 
-    // ВРЕМЕННО: тот же вызов платформы с теми же аргументами, что у исполнителя,
-    // — чтобы отделить «платформа отказала» от «исполнитель передал не то».
     {
+        // Кто отвечает за отказ. Тот же вызов платформы с теми же аргументами,
+        // что и у исполнителя, и ЖИВОЙ корень: view переживает блок, в отличие от
+        // deleteAllowedList, где корень берётся из временного объекта. Пока граница
+        // считает этот путь разрешённым, отказ deleteAllowedList — его, а не
+        // фикстуры. Без этой строки красный прогон читался бы как «тест неверно
+        // выбрал путь», и причину пришлось бы искать заново: сейчас она находится
+        // за одной строкой CHECK, а не за перебором гипотез.
         const core::CandidateManifest* probeManifest = plan.manifestFor(0);
-        std::printf("  [probe] candidate.path=[%s] manifest.rootPath=[%s]\n", box.ruleRootUtf8().c_str(),
-                    probeManifest != nullptr ? probeManifest->rootPath.c_str() : "<нет манифеста>");
+        CHECK(probeManifest != nullptr);
         if (probeManifest != nullptr && probeManifest->allowed != nullptr) {
+            const std::wstring rootWide = trash::toUtf16(probeManifest->rootPath);
+            vfs::DeleteOptions probeOptions;
+            probeOptions.allowedRoot = rootWide;
             for (const core::AllowedEntry& entry : probeManifest->allowed->entries) {
-                std::printf("  [probe]   entry.path=[%s]\n", entry.path.c_str());
-                for (int which = 0; which < 2; ++which) {
-                    const std::wstring rootWide =
-                        which == 0 ? trash::toUtf16(box.ruleRootUtf8()) : trash::toUtf16(probeManifest->rootPath);
-                    vfs::DeleteOptions probeOptions;
-                    probeOptions.allowedRoot = rootWide;
-                    const vfs::ProtectionCheck check = vfs::checkProtected(trash::toUtf16(entry.path), probeOptions);
-                    std::printf("  [probe]   checkProtected root=%s allowed=%d verdict=%d root=[%s]\n",
-                                which == 0 ? "ruleRoot" : "manifest", check.allowed() ? 1 : 0,
-                                static_cast<int>(check.verdict), trash::toUtf8(check.root).c_str());
-                }
+                CHECK_EQ(static_cast<int>(vfs::checkProtected(trash::toUtf16(entry.path), probeOptions).verdict),
+                         static_cast<int>(vfs::ProtectionVerdict::Allowed));
             }
         }
     }
@@ -752,8 +755,9 @@ TEST(executor_manifest_partialDirectoryRemovesOnlyListedFiles) {
 // 4) Элемент списка за пределами корня правила — отказ с кодом
 // ---------------------------------------------------------------------------
 
-// Граница FR-6 действует на КАЖДЫЙ путь списка, а не только на верхний каталог:
-// корень защищает каталог, а «путь, не совпавший ни с одним известным
+// Здесь корень кандидата ВНУТРИ границы (иначе отказ пришёл бы ещё в фазе A, как
+// в следующей проверке), а в списке — чужой путь ЗА границей и свой, внутри её:
+// оба проходят один и тот же deleteEntry, и отказ обязан быть адресным.
 // правилом, никогда не удаляется» (§10). Список, в который просочился чужой путь,
 // обязан дать отказ с кодом, а файл — остаться на месте.
 //
@@ -767,9 +771,12 @@ TEST(executor_manifest_listEntryOutsideRuleRootIsRefused) {
         return;
     }
 
-    // Список состоит ИЗ ОДНОГО чужого пути: внутри границы не удаляется ничего,
-    // и «удалённое» здесь может быть только ошибкой.
-    const std::vector<core::AllowedEntry> allowed = {entryFor(box.outside())};
+    // Список из двух путей: чужой, за границей, и СВОЙ разрешённый. Второй —
+    // контроль против «молчаливого отказа всего подряд»: пока исполнитель
+    // отказывает в обоих, проверка «отказ с кодом» остаётся зелёной и не
+    // доказывает ничего. С удалением своего файла в том же прогоне отказ
+    // становится выборочным, а не тотальным.
+    const std::vector<core::AllowedEntry> allowed = {entryFor(box.outside()), entryFor(box.listedTop())};
     const std::vector<core::CleanupCandidate> candidates = {candidateFor(box.ruleRootUtf8(), "песочница H4", allowed)};
     const std::vector<core::CandidateManifest> manifests = {
         manifestFor(0, "h4.sandbox", box.ruleRootUtf8(), allowed)};
@@ -785,6 +792,9 @@ TEST(executor_manifest_listEntryOutsideRuleRootIsRefused) {
     CHECK(outcome.report != nullptr);
     if (outcome.report == nullptr) return;
 
+    // Итог строки — Failed, а не Done: deleteAllowedList ставит Failed, когда
+    // пропущен хоть один элемент (src/engine/executor.cpp), поэтому «удалил своё
+    // и отказал чужому» — это одна отказавшая строка, а не две строки по одной.
     CHECK_EQ(outcome.report->done, std::size_t{0});
     CHECK_EQ(outcome.report->failed, std::size_t{1});
     CHECK(!outcome.report->complete());
@@ -804,7 +814,9 @@ TEST(executor_manifest_listEntryOutsideRuleRootIsRefused) {
         CHECK(item->failed());
         // Код в строке отчёта: без него «пропущено» и «отказано» неразличимы.
         CHECK(!item->code.empty());
-        CHECK_EQ(item->filesDone, std::uint32_t{0});
+        // Контроль против тотального отказа: свой файл из списка УДАЛЁН (1), чужой
+        // пропущен (1). Отказ всего подряд дал бы filesDone == 0.
+        CHECK_EQ(item->filesDone, std::uint32_t{1});
         CHECK_EQ(item->problems, std::uint32_t{1});
         // HRESULT из политики границы (ERROR_ACCESS_DENIED), а не 0: «отказали»
         // должно отличаться от «нечего было делать».
@@ -817,10 +829,12 @@ TEST(executor_manifest_listEntryOutsideRuleRootIsRefused) {
     std::string content;
     CHECK(readFile(box.outside(), content, why));
     CHECK(content == payloadFor('X'));
-    // Собственный каталог правила тоже не тронут: в списке его файлов не было.
+    // Свой файл из того же списка УДАЛЁН: отказ был выборочным, а не тотальным.
+    CHECK(!exists(box.listedTop()));
+    // Каталог правила не тронут, и сосед, которого в списке не было, тоже: список
+    // разрешённого не превращается в «удалить всё в корне».
     CHECK(exists(box.ruleRoot()));
     CHECK(exists(box.unlistedTop()));
-    CHECK(exists(box.listedTop()));
 }
 
 // ---------------------------------------------------------------------------
@@ -839,24 +853,33 @@ TEST(executor_manifest_candidateOutsideRuleRootIsRefused) {
         return;
     }
 
-    // Кандидат — каталог ЗА пределами корня правила, корень правила — rule\.
-    const std::vector<core::AllowedEntry> allowed = {entryFor(box.outside())};
-    const std::vector<core::CleanupCandidate> candidates = {candidateFor(box.foreignDirUtf8(), "чужая папка", allowed)};
+    // Два кандидата в одном прогоне: первый — каталог ЗА пределами корня правила,
+    // второй — ВНУТРИ него. Второй контролирует «молчаливый отказ всего подряд»:
+    // отказ первого сам по себе не доказывает ничего, пока второй кандидат в том
+    // же прогоне не удалён.
+    const std::vector<core::AllowedEntry> allowedForeign = {entryFor(box.outside())};
+    const std::vector<core::AllowedEntry> allowedOwn = {entryFor(box.listedTop())};
+    const std::vector<core::CleanupCandidate> candidates = {
+        candidateFor(box.foreignDirUtf8(), "чужая папка", allowedForeign),
+        candidateFor(box.ruleRootUtf8(), "своя папка", allowedOwn)};
     const std::vector<core::CandidateManifest> manifests = {
-        manifestFor(0, "h4.sandbox", box.ruleRootUtf8(), allowed)};
+        manifestFor(0, "h4.sandbox", box.ruleRootUtf8(), allowedForeign),
+        manifestFor(1, "h4.sandbox", box.ruleRootUtf8(), allowedOwn)};
 
     core::PlanOptions planOptions;
     planOptions.profile = core::SelectionProfile::Everything;
     planOptions.useTrash = false;
     const core::CleanupPlan plan = core::buildPlan(candidates, planOptions, &manifests);
-    CHECK_EQ(plan.operationCount(), std::size_t{1});
+    CHECK_EQ(plan.operationCount(), std::size_t{2});
 
     const RunOutcome outcome = runExecutor(candidates, plan, box.ruleRootUtf8(), box.trashRootUtf8());
     CHECK(outcome.refusal == engine::ExecutionRefusal::Completed);
     CHECK(outcome.report != nullptr);
     if (outcome.report == nullptr) return;
 
-    CHECK_EQ(outcome.report->done, std::size_t{0});
+    // Ровно одна строка отказана фазой A и ровно одна выполнена: тотальный отказ
+    // дал бы skipped == 2, и проверка перестала бы что-либо доказывать.
+    CHECK_EQ(outcome.report->done, std::size_t{1});
     CHECK_EQ(outcome.report->skipped, std::size_t{1});
     CHECK_EQ(outcome.report->failed, std::size_t{0});
     CHECK_EQ(outcome.report->count(engine::ItemOutcome::SkippedOutsideRoot), std::size_t{1});
@@ -882,8 +905,9 @@ TEST(executor_manifest_candidateOutsideRuleRootIsRefused) {
     std::string content;
     CHECK(readFile(box.outside(), content, why));
     CHECK(content == payloadFor('X'));
-    // Собственная песочница правила не тронута.
-    CHECK(exists(box.listedTop()));
+    // Свой кандидат удалён: отказ был адресным, а не тотальным. Сосед, которого
+    // в списке не было, при этом остался — граница списка действует и здесь.
+    CHECK(!exists(box.listedTop()));
     CHECK(exists(box.unlistedTop()));
 }
 
