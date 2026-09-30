@@ -483,6 +483,32 @@ struct RunOutcome {
     // CHECK сообщает только номер строки.
     if (outcome.report != nullptr && !reportIsClean(*outcome.report)) {
         for (const engine::ItemReport& it : outcome.report->items) {
+            // Прямой замер: с корнем ИЗ ЧЕК-ЛИСТА (тот, которым пользуется исполнитель)
+            // против корня ИЗ МАНИФЕСТА. Расхождение этих двух строк и есть причина
+            // отказа: платформа права, а граница пришла не оттуда.
+            if (!it.ruleRoot.empty()) {
+                vfs::DeleteOptions fromChecklist;
+                const std::wstring checklistRoot = trash::toUtf16(it.ruleRoot);
+                fromChecklist.allowedRoot = checklistRoot;
+                if (const core::CandidateManifest* m = plan.manifestFor(it.candidateIndex)) {
+                    if (m->allowed != nullptr && !m->allowed->entries.empty()) {
+                        const auto verdictWith = vfs::checkProtected(trash::toUtf16(m->allowed->entries.front().path),
+                                                                     fromChecklist).verdict;
+                        const auto verdictManifest =
+                            vfs::checkProtected(trash::toUtf16(m->allowed->entries.front().path),
+                                               [&] {
+                                                   vfs::DeleteOptions o;
+                                                   o.allowedRoot = trash::toUtf16(m->rootPath);
+                                                   return o;
+                                               }()).verdict;
+                        std::printf("  [корень] checklist=[%s] manifest=[%s] entry=[%s] "
+                                    "verdict(с корнем чек-листа)=%d verdict(с корнем манифеста)=%d\n",
+                                    it.ruleRoot.c_str(), m->rootPath.c_str(),
+                                    m->allowed->entries.front().path.c_str(), static_cast<int>(verdictWith),
+                                    static_cast<int>(verdictManifest));
+                    }
+                }
+            }
             std::printf("  [состояние] item idx=%zu outcome=%s code=%s hr=%d files=%u dirs=%u probs=%u root=[%s] %s\n",
                         it.candidateIndex, engine::toString(it.outcome), it.code.c_str(), it.hr, it.filesDone,
                         it.dirsDone, it.problems, it.ruleRoot.c_str(), it.detail.c_str());
