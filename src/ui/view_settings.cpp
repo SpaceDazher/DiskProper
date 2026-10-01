@@ -1318,6 +1318,8 @@ struct ViewState {
     bool syncing{false};
     bool controlsReady{false};
     bool columnsReady{false};
+    std::uint64_t columnsLanguageRevision{0};  // ревизия языка, на которой созданы столбцы
+    std::uint64_t combosLanguageRevision{0};   // и на которой заполнены комбинаторы
     bool languageReady{false};
     bool safetyReady{false};
     bool filterSyncing{false};
@@ -1642,6 +1644,22 @@ struct ViewState {
     }
 
     void syncCombos() {
+        // Пункты обоих комбинаторов заполняются один раз — и остаются на
+        // прежнем языке: безопасность в комбинаторе переводится, а список
+        // уровней риска нет. При смене языка списки пересоздаются, иначе
+        // английский экран сохранял бы русское «Безопасно» (тот же отказ, что и
+        // с заголовками столбцов, только в другом контроле).
+        const std::uint64_t languageRevision = revision();
+        if (languageReady && languageRevision != combosLanguageRevision) {
+            if (languageCombo != nullptr) {
+                (void)::SendMessageW(languageCombo, CB_RESETCONTENT, 0, 0);
+            }
+            if (safetyCombo != nullptr) {
+                (void)::SendMessageW(safetyCombo, CB_RESETCONTENT, 0, 0);
+            }
+            languageReady = false;
+            safetyReady = false;
+        }
         if (!languageReady && languageCombo != nullptr) {
             for (const std::string& name : SettingsViewModel::languageNames()) {
                 const std::wstring wide = toWide(name);
@@ -1656,6 +1674,7 @@ struct ViewState {
             }
             safetyReady = true;
         }
+        if (languageReady && safetyReady) combosLanguageRevision = languageRevision;
         setComboSelection(languageCombo, model.language() == Language::English ? 1 : 0);
         setCheck(autoUpdate, model.autoUpdate());
 
@@ -1672,9 +1691,23 @@ struct ViewState {
     void syncColumns() {
         if (list == nullptr) return;
         const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
+        // Заголовки столбцов — из каталога строк, иначе при смене языка
+        // таблица осталась бы с русскими заголовками.
+        //
+        // LVCOLUMN не умеет менять текст УЖЕ созданного столбца, поэтому при
+        // смене языка столбцы пересоздаются. Без этого английская таблица
+        // осталась бы с русскими заголовками — тот самый «переключилось не всё»,
+        // который ловит сравнение снимков.
+        const std::uint64_t languageRevision = revision();
+        if (columnsReady && languageRevision != columnsLanguageRevision) {
+            // LVM_DELETECOLUMN по одному, а не ListView_DeleteAllColumns: макрос
+            // есть не во всех сборках commctrl.h, а сообщение есть всегда.
+            for (int column = kColumnCount - 1; column >= 0; --column) {
+                (void)::SendMessageW(list, LVM_DELETECOLUMN, static_cast<WPARAM>(column), 0);
+            }
+            columnsReady = false;
+        }
         if (!columnsReady) {
-            // Заголовки столбцов — из каталога строк, иначе при смене языка
-            // таблица осталась бы с русскими заголовками.
             const std::array<std::string_view, kColumnCount> titles{"settings.ruleColumn",
                                                                    "settings.categoryColumn",
                                                                    "settings.safetyColumn"};
@@ -1689,6 +1722,7 @@ struct ViewState {
                     return;
                 }
             }
+            columnsLanguageRevision = languageRevision;
             columnsReady = true;
         }
         RECT client{};

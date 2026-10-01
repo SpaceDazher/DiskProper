@@ -99,6 +99,7 @@
 
 #include <windows.h> // NOLINT(bugprone-suspicious-include) — слой ui, по SPEC §7 это законное место
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -382,6 +383,122 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+// ---------------------------------------------------------------------------
+// Раскладка (чистая арифметика, DIP)
+// ---------------------------------------------------------------------------
+//
+// Тот же приём, что на экране «Очистка» (view_cleanup.hpp, CleanupLayout):
+// раскладка — чистая функция от метрик, DPI, размеров клиента и ШИРИН ПОДПИСЕЙ,
+// без единого HWND. Поэтому её можно посчитать и проверить без окна, а WM_SIZE
+// зовёт только её и раздаёт готовые прямоугольники контролам.
+//
+// Почему ширины подписей приходят аргументом, а не считаются внутри: подпись
+// измеряется шрифтом нативного контрола (GetTextExtent), и это единственное
+// место, где нужен HWND. Всё остальное — арифметика, которая обязана
+// переживать и DPI, и язык, и смену темы без окна.
+
+// Сколько контролов стоит в нижнем ряду: пять кнопок экспорта и две галочки.
+// Одна строка не помещается в узкое окно, поэтому ряд переносится (см.
+// ReportLayout::compute), и число нужно и в раскладке, и в вызывающем коде.
+inline constexpr std::size_t kReportBottomControls = 7;
+
+// Метрики экрана в DIP (1/96 дюйма). Per-monitor v2 (§5) меняет pixelsPerDip,
+// но не размеры элементов, поэтому вёрстка не знает про DPI.
+struct ReportMetrics {
+    double paddingDip{8.0};         // отступ содержимого от края клиента
+    double gapDip{6.0};             // зазор между списком, карточкой, строкой и рядом кнопок
+    double statusHeightDip{20.0};   // строка состояния под списком
+    double buttonHeightDip{28.0};   // высота кнопок и галочек нижнего ряда
+    double buttonTextPadDip{20.0};  // запас вокруг подписи кнопки (рамка + воздух)
+    // Нижняя граница ширины кнопки: сжатие подписи не имеет права сделать
+    // цель нажатия меньше, чем её можно попасть мышью. 56 DIP — ширина
+    // «Обновить» вместе с рамкой и полями; ниже Windows кнопку уже не
+    // нарисовать читаемой.
+    double minButtonWidthDip{56.0};
+    double minCardHeightDip{72.0};  // карточка деталей не схлопывается в строку
+    double minListHeightDip{48.0};  // и журнал остаётся виден, даже если места мало
+    double minWidthDip{520.0};      // ниже этого окно считается тесным (§7.2)
+    double minHeightDip{320.0};
+};
+
+// Высота кнопки, ниже которой нажимать нельзя. Системная кнопка в Windows имеет
+// высоту 23 px при 96 DPI; 24 DIP — тот же пол с запасом на рамку. Пока в клиенте
+// есть место, раскладка держит кнопку не ниже этой отметки и жертвует высотой
+// списка, а не целью нажатия.
+inline constexpr double kMinButtonHeightDip = 24.0;
+
+// Прямоугольник в пикселях клиентской области. Правая и нижняя границы не
+// включаются (то же соглашение, что в CleanupRect).
+struct ReportRect {
+    int x{0};
+    int y{0};
+    int width{0};
+    int height{0};
+
+    [[nodiscard]] bool empty() const noexcept;
+    [[nodiscard]] int right() const noexcept { return x + width; }
+    [[nodiscard]] int bottom() const noexcept { return y + height; }
+};
+
+// Раскладка экрана «Отчёт». Ничего не владеет и копируется по значению.
+class ReportLayout {
+public:
+    ReportLayout() = default;
+
+    // natural — ширина каждого из семи нижних контролов по его подписи, в
+    // пикселях (её снимает окно через GetTextExtent). Ноль или меньше нуля
+    // означает «подпись ещё не измерена» и берётся как минимум.
+    static ReportLayout compute(const ReportMetrics& metrics, int dpi, int clientWidthPx, int clientHeightPx,
+                                int cardHeightDip, const std::array<int, kReportBottomControls>& natural);
+
+    [[nodiscard]] ReportRect listRect() const noexcept;    // SysListView32 с журналом
+    [[nodiscard]] ReportRect statusRect() const noexcept;  // строка состояния
+    [[nodiscard]] ReportRect cardRect() const noexcept;    // карточка выделенной строки
+    // Прямоугольник нижнего контрола: 0…4 — кнопки экспорта, 5…6 — галочки.
+    [[nodiscard]] ReportRect childRect(int index) const noexcept;
+    // Сколько строк занял нижний ряд: 1 — поместился, 2 — перенёсся.
+    [[nodiscard]] int rows() const noexcept;
+    // Подписи не поместились даже в две строки: ширины ужаты до минимума, часть
+    // текста обрезана. Окно всё равно остаётся в своих границах.
+    [[nodiscard]] bool squeezed() const noexcept;
+    // Окно меньше минимума: рисуем то, что помещается, остальное скрыто.
+    [[nodiscard]] bool cramped() const noexcept;
+    [[nodiscard]] int paddingPx() const noexcept;
+    [[nodiscard]] int clientWidthPx() const noexcept;
+    [[nodiscard]] int clientHeightPx() const noexcept;
+
+private:
+    int width_{0};
+    int height_{0};
+    int padding_{0};
+    int gap_{0};
+    int buttonHeight_{0};
+    int rows_{0};
+    int split_{0};  // индекс первого контрола второй строки
+    bool squeezed_{false};
+    bool cramped_{false};
+    ReportRect list_{};
+    ReportRect status_{};
+    ReportRect card_{};
+    std::array<ReportRect, kReportBottomControls> children_{};
+
+    // Сколько строк нужно семи контролам при данных ширинах (перебор разреза).
+    // 0 — не помещается ни одна: ширина контрола больше всей строки.
+    [[nodiscard]] static int packRows(const std::array<int, kReportBottomControls>& widths, int gap, int available,
+                                      int& split) noexcept;
+    // Раскладка одной строки: сумма ширин и зазоров не превышает available.
+    [[nodiscard]] static bool rowFits(const std::array<int, kReportBottomControls>& widths, int gap, int available,
+                                      int from, int to) noexcept;
+    // Ширина строки после раскладки: сумма ширин плюс зазоры между ними.
+    [[nodiscard]] static int rowWidth(const std::array<int, kReportBottomControls>& widths, int gap, int from,
+                                      int to) noexcept;
+    // Последний проход: равномерно ужать набор до суммы, которая помещается в
+    // строку. Деление по остатку, а не int(w*k/total): сумма сходится точно, и
+    // последняя кнопка не вылезает за край на единицу.
+    static void clampRow(std::array<int, kReportBottomControls>& widths, int count, int from, int gap,
+                         int available);
 };
 
 // ---------------------------------------------------------------------------

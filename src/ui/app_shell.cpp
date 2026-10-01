@@ -9,10 +9,12 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "core/log.hpp"
 #include "locale.hpp" // каталог строк: подписи рельса лежат прямо в mrproper::ui
@@ -116,6 +118,159 @@ private:
     return RECT{rect.x, rect.y, rect.x + rect.width, rect.y + rect.height};
 }
 
+// --- Хранилище настроек интерфейса (SPEC §4 FR-9) ---------------------------
+//
+// Плоское «ключ → значение», каким пользуются Navigator::exportState и
+// SettingsViewModel::exportSettings (NavStateStore), лежит в ветке
+// HKCU\Software\MrProper\UI рядом с ThemeMode и FontScalePercent (theme.cpp):
+// это узел того же пользователя, а второй файл настроек у одного человека был
+// бы двумя правдами об одном и том же.
+//
+// Реестр, а не файл: настройки маленькие, писать их должен UI-поток (SPEC §6.1
+// запрещает I/O в нём), а реестр — это память ядра, а не диск. Тот же выбор
+// уже сделан theme.cpp ради темы.
+//
+// Ключи при записи НЕ удаляются. В этой же ветке лежит ThemeMode, и выборочное
+// удаление «своих» ключей рано или поздно съело бы чужую настройку; вместо
+// этого каждое значение перезаписывается целиком, а формат защищён номером
+// версии в самом хранилище (nav.version, settings.version).
+constexpr wchar_t kUiSettingsSubkey[] = L"Software\\MrProper\\UI";
+
+// Имя значения реестра длиннее быть не может (winreg.h не задаёт, но 255
+// символов — предел, который не переживает ни один читатель).
+constexpr DWORD kMaxValueName = 256;
+
+// Ключ положения окна. Имена настроек пишутся точками (nav.current,
+// settings.language) — ограничение реестра на имя значения это допускает, и
+// читать их удобнее, чем подчёркивания.
+constexpr std::string_view kPlacementKey = "window.placement";
+
+// Прочитать все строковые значения ветки. Отсутствие ветки — не ошибка, а
+// первый запуск: возвращается false, store остаётся пустым, и приложение
+// стартует с настроек по умолчанию.
+bool readUiSettings(NavStateStore& store) noexcept {
+    try {
+        HKEY key = nullptr;
+        if (::RegOpenKeyExW(HKEY_CURRENT_USER, kUiSettingsSubkey, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+            return false;
+        }
+        bool clean = true;
+        for (DWORD index = 0;; ++index) {
+            wchar_t name[kMaxValueName]{};
+            DWORD nameChars = static_cast<DWORD>(std::size(name));
+            DWORD type = 0;
+            DWORD dataBytes = 0;
+            // Два вызова на значение: первый спрашивает размер, второй читает.
+            // Второй начинается с ПОЛНОГО размера буфера имени: lpcchValueName —
+            // параметр в обе стороны, и после первого вызова в нём лежит длина
+            // найденного имени. Если отдать её как «размер буфера», RegEnumValue
+            // потребует места под имя плюс завершающий нуль и вернёт
+            // ERROR_MORE_DATA (234) на значении, которое читается без единой ошибки.
+            const LSTATUS listed = ::RegEnumValueW(key, index, name, &nameChars, nullptr, &type, nullptr, &dataBytes);
+            if (listed == ERROR_NO_MORE_ITEMS) break;
+            if (listed != ERROR_SUCCESS) {
+                clean = false;
+                break;
+            }
+            // Чужие значения (DWORD, двоичные данные) — не настройки интерфейса:
+            // их не читаем и не переписываем.
+            if (type != REG_SZ || dataBytes == 0 || dataBytes > (1U << 20)) continue;
+            const std::wstring wideName(name, nameChars);
+            std::wstring value(dataBytes / sizeof(wchar_t) + 1U, L'\0');
+            DWORD actual = static_cast<DWORD>(value.size() * sizeof(wchar_t));
+            nameChars = static_cast<DWORD>(std::size(name));
+            const LSTATUS read = ::RegEnumValueW(key, index, name, &nameChars, nullptr, &type,
+                                                 reinterpret_cast<LPBYTE>(value.data()), &actual);
+            if (read != ERROR_SUCCESS) {
+                clean = false;
+                break;
+            }
+            // Хвостовой нуль (или нули, если буфер был с запасом) снимаем, а
+            // строку обрезаем по фактически прочитанному объёму: иначе в
+            // настройку уехал бы мусор из непрочитанного буфера.
+            value.resize(actual / sizeof(wchar_t));
+            while (!value.empty() && value.back() == L'\0') value.pop_back();
+            const int needed = ::WideCharToMultiByte(CP_UTF8, 0, wideName.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            const int size = ::WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            if (needed <= 1 || size <= 1) continue;
+            std::string keyText(static_cast<std::size_t>(needed), '\0');
+            std::string valueText(static_cast<std::size_t>(size), '\0');
+            (void)::WideCharToMultiByte(CP_UTF8, 0, wideName.c_str(), -1, keyText.data(), needed, nullptr, nullptr);
+            (void)::WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, valueText.data(), size, nullptr, nullptr);
+            keyText.resize(static_cast<std::size_t>(needed - 1));
+            valueText.resize(static_cast<std::size_t>(size - 1));
+            store[keyText] = std::move(valueText);
+        }
+        ::RegCloseKey(key);
+        return clean;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Записать все значения. Ничего не удаляет — см. комментарий выше про ThemeMode.
+bool writeUiSettings(const NavStateStore& store) noexcept {
+    try {
+        HKEY key = nullptr;
+        if (::RegCreateKeyExW(HKEY_CURRENT_USER, kUiSettingsSubkey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key,
+                              nullptr) != ERROR_SUCCESS) {
+            return false;
+        }
+        bool clean = true;
+        for (const auto& [name, value] : store) {
+            const std::wstring wideName = toWide(name);
+            const std::wstring wideValue = toWide(value);
+            const DWORD bytes = static_cast<DWORD>((wideValue.size() + 1U) * sizeof(wchar_t));
+            if (::RegSetValueExW(key, wideName.c_str(), 0, REG_SZ,
+                                 reinterpret_cast<const BYTE*>(wideValue.c_str()), bytes) != ERROR_SUCCESS) {
+                clean = false;
+            }
+        }
+        ::RegCloseKey(key);
+        return clean;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Положение окна — пять чисел через «|», без заголовков: формат читается
+// глазами в отладчике реестра, а разбирать его должна только эта пара функций.
+std::string encodePlacement(const WINDOWPLACEMENT& placement) {
+    const RECT& rect = placement.rcNormalPosition;
+    return std::to_string(placement.showCmd) + "|" + std::to_string(rect.left) + "|" +
+           std::to_string(rect.top) + "|" + std::to_string(rect.right) + "|" + std::to_string(rect.bottom);
+}
+
+bool decodePlacement(std::string_view text, WINDOWPLACEMENT& out) noexcept {
+    long long numbers[5] = {0, 0, 0, 0, 0};
+    std::size_t field = 0;
+    std::size_t index = 0;
+    while (index <= text.size() && field < std::size(numbers)) {
+        const std::size_t separator = text.find('|', index);
+        const std::size_t end = (separator == std::string_view::npos) ? text.size() : separator;
+        if (end == index) return false;  // пустое поле — запись битая, не «ноль»
+        // strtoll требует char*, а разбирать постоянную строку из реестра
+        // дешевле, чем городить ручный перевод цифр.
+        std::string fieldText(text.substr(index, end - index));
+        char* tail = nullptr;
+        const long long value = ::_strtoi64(fieldText.c_str(), &tail, 10);
+        if (tail == nullptr || *tail != '\0') return false;
+        numbers[field++] = value;
+        if (separator == std::string_view::npos) break;
+        index = separator + 1;
+    }
+    if (field != std::size(numbers)) return false;
+    if (numbers[0] < 0 || numbers[0] > SW_SHOWMAXIMIZED) return false;
+    // Прямоугольник нужен непустым: нулевой размер означал бы окно без окна.
+    if (numbers[3] - numbers[1] < 100 || numbers[4] - numbers[2] < 100) return false;
+    out = WINDOWPLACEMENT{};
+    out.length = sizeof(WINDOWPLACEMENT);
+    out.showCmd = static_cast<UINT>(numbers[0]);
+    out.rcNormalPosition = RECT{static_cast<LONG>(numbers[1]), static_cast<LONG>(numbers[2]),
+                                static_cast<LONG>(numbers[3]), static_cast<LONG>(numbers[4])};
+    return true;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -150,13 +305,28 @@ HWND AppShell::screenWindow(PageId page) const noexcept {
 void AppShell::mountScreens() {
     if (screensReady_ || contentHost_ == nullptr) return;
     const int dpi = static_cast<int>(dpi_.x);
+    // До создания экранов: их create() сам зовёт locale::initialize(), а тот
+    // применяет язык локали ОС и затёр бы сохранённый выбор пользователя.
+    restoreUiState();
     // Порядок важен только для читаемости журнала: все пять создаются сразу, чтобы
     // переключение страницы не ждало создания окна (переключение должно быть мгновенным).
     disksScreen_ = std::make_unique<disks::DisksScreen>();
     cleanupScreen_ = std::make_unique<cleanup::CleanupScreen>();
     overviewScreen_ = std::make_unique<overview::OverviewScreen>();
     reportScreen_ = std::make_unique<report::ReportScreen>();
-    settingsScreen_ = std::make_unique<settings::SettingsScreen>();
+
+    // Язык — единственный хук экрана настроек, который до сих пор был мёртвым:
+    // комбобокс шлёт CBN_SELCHANGE, модель запоминает намерение, а применить его
+    // мог только вызывающий. Модель настроек и каталог строк живут в разных
+    // слоях, поэтому подписка вешается здесь, а не внутри экрана.
+    settings::SettingsScreen::Callbacks settingsCallbacks;
+    settingsCallbacks.onLanguageChanged = [this](core::Language language) {
+        applyInterfaceLanguage(language);
+        // Сразу, а не «при следующем выходе»: язык, выбранный и потерянный при
+        // аварийном закрытии, читался бы как «настройка не работает».
+        saveUiState();
+    };
+    settingsScreen_ = std::make_unique<settings::SettingsScreen>(std::move(settingsCallbacks));
 
     struct Slot {
         PageId page;
@@ -174,6 +344,21 @@ void AppShell::mountScreens() {
             logEvent(core::LogLevel::Error, "ui.screen.create_failed",
                      "экран не создался в хосте содержимого", "page", pageKey(slot.page));
         }
+    }
+    // Правила, фильтр и выбранное правило — после create(): модель наполняется
+    // при создании экрана, и импорт поверх неё затирал бы то, что уже загрузил
+    // сам экран (пустой список правил, например).
+    if (settingsScreen_ != nullptr) {
+        std::vector<std::string> problems;
+        const std::size_t applied = settingsScreen_->model().importSettings(savedState_, &problems);
+        for (const std::string& problem : problems) {
+            logEvent(core::LogLevel::Warn, "ui.settings.restore_problem", problem);
+        }
+        if (applied > 0) {
+            logEvent(core::LogLevel::Info, "ui.settings.restored",
+                     "настройки правил восстановлены", "keys", static_cast<long long>(applied));
+        }
+        settingsScreen_->refresh();
     }
     screensReady_ = true;
     showActiveScreen(navigator_.current());
@@ -215,6 +400,143 @@ void AppShell::refreshActiveScreen() {
             if (settingsScreen_) settingsScreen_->refresh();
             break;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Настройки между запусками (SPEC §4 FR-9)
+// ---------------------------------------------------------------------------
+
+void AppShell::restoreUiState() noexcept {
+    try {
+        // Каталог строк и язык локали ОС — ДО сохранённого языка: initialize()
+        // применяет язык локали, и вызов после него затёр бы выбор пользователя
+        // ровно тем, ради чего он восстанавливается.
+        if (!isInitialized()) (void)initialize();
+
+        std::vector<std::string> problems;
+        const std::size_t applied = navigator_.importState(savedState_, &problems);
+        for (const std::string& problem : problems) {
+            logEvent(core::LogLevel::Warn, "ui.nav.restore_problem", problem);
+        }
+
+        // Язык. Ключ settings.language пишет модель настроек (exportSettings),
+        // и читать его надо здесь же: иначе выбор языка жил бы в реестре, но
+        // никто бы его не применял — ровно тот отказ, что и был.
+        const auto language = savedState_.find(std::string("settings.language"));
+        if (language != savedState_.end()) {
+            if (const std::optional<core::Language> parsed = core::parseLanguage(language->second)) {
+                applyInterfaceLanguage(*parsed);
+            } else {
+                logEvent(core::LogLevel::Warn, "ui.settings.language_unparsed",
+                         "сохранённый язык не разобран, взят язык локали",
+                         "value", language->second);
+            }
+        }
+
+        // Положение окна тоже часть хранилища; модель настроек его держит для
+        // моста (SettingsScreen::setWindowPlacement), и без этого поля
+        // сохранённый прямоугольник просто некуда положить.
+        const auto placement = savedState_.find(std::string(kPlacementKey));
+        if (placement != savedState_.end()) {
+            WINDOWPLACEMENT restored{};
+            if (decodePlacement(placement->second, restored)) {
+                settingsPlacement_ = restored;
+            } else {
+                logEvent(core::LogLevel::Warn, "ui.window.placement_unparsed",
+                         "сохранённое положение окна не разобрано");
+            }
+        }
+
+        layoutRail();
+        logEvent(core::LogLevel::Info, "ui.state.restored", "состояние интерфейса восстановлено", "navKeys",
+                 static_cast<long long>(applied), "language", std::string(core::languageTag(currentLanguage())));
+    } catch (...) {
+        MRP_LOG_ERROR("ui.state.restore_failed", "состояние интерфейса не восстановлено");
+    }
+}
+
+void AppShell::applyInterfaceLanguage(core::Language language) noexcept {
+    try {
+        if (!isInitialized()) (void)initialize();
+        // Три вещи, и по отдельности они расходятся: каталог строк (tr), язык
+        // Win32-контролов (SetThreadUILanguage) и запасные подписи рельса,
+        // которые берутся из встроенного набора по navigator_.language().
+        const Language applied = mrproper::ui::setLanguage(language);
+        navigator_.setLanguage(applied);
+        if (settingsScreen_ != nullptr) settingsScreen_->model().setLanguage(applied);
+        layoutRail();
+        layoutContentHost();
+        // Только активный экран: скрытые перерисуются при показе, а обновлять
+        // все пять означало бы работу впустую на каждом переключении языка.
+        refreshActiveScreen();
+        invalidateChrome();
+        logEvent(core::LogLevel::Info, "ui.language.applied", "язык интерфейса применён", "language",
+                 std::string(core::languageTag(applied)), "revision", static_cast<long long>(revision()));
+    } catch (...) {
+        MRP_LOG_ERROR("ui.language.apply_failed", "язык интерфейса не применён");
+    }
+}
+
+void AppShell::saveUiState() noexcept {
+    try {
+        // Положение снимается здесь, а не берётся из lastPlacement_: закрытие
+        // могло прийти не через WM_CLOSE (завершение сеанса), и тогда память о
+        // нём ещё пустая.
+        if (lastPlacement_.length != sizeof(WINDOWPLACEMENT) && mainWindow_ != nullptr) {
+            rememberPlacement(mainWindow_);
+        }
+        NavStateStore store;
+        navigator_.exportState(store);
+        if (settingsScreen_ != nullptr) settingsScreen_->model().exportSettings(store);
+        if (lastPlacement_.length == sizeof(WINDOWPLACEMENT)) {
+            store[std::string(kPlacementKey)] = encodePlacement(lastPlacement_);
+        }
+        const bool clean = writeUiSettings(store);
+        logEvent(clean ? core::LogLevel::Info : core::LogLevel::Warn, "ui.state.saved",
+                 clean ? "состояние интерфейса сохранено" : "состояние интерфейса не сохранено", "keys",
+                 static_cast<long long>(store.size()));
+    } catch (...) {
+        MRP_LOG_ERROR("ui.state.save_failed", "состояние интерфейса не сохранено");
+    }
+}
+
+void AppShell::restoreSavedPlacement(HWND window) noexcept {
+    if (window == nullptr) return;
+    if (settingsPlacement_.length != sizeof(WINDOWPLACEMENT)) return;
+    WINDOWPLACEMENT placement = settingsPlacement_;
+    if (options_.showCommand == SW_SHOWMINIMIZED) {
+        // Запуск из ярлыка «Свёрнутым» не должен разворачивать окно.
+        placement.showCmd = SW_SHOWMINIMIZED;
+    }
+    // Прямоугольник из прошлого запуска мог остаться на мониторе, которого
+    // больше нет: такое окно не показать, а не показать за краем экрана.
+    const HMONITOR monitor = ::MonitorFromRect(&placement.rcNormalPosition, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{};
+    info.cbSize = sizeof(MONITORINFO);
+    if (::GetMonitorInfoW(monitor, &info) != 0) {
+        const RECT& work = info.rcWork;
+        RECT& rect = placement.rcNormalPosition;
+        const int width = rect.right - rect.left;
+        const int height = rect.bottom - rect.top;
+        if (width > work.right - work.left || height > work.bottom - work.top ||
+            rect.right <= work.left || rect.left >= work.right || rect.bottom <= work.top || rect.top >= work.bottom) {
+            logEvent(core::LogLevel::Warn, "ui.window.placement_offscreen",
+                     "сохранённое положение не помещается на экране, окно открыто по умолчанию");
+            return;
+        }
+        rect.left = std::clamp(rect.left, work.left, std::max(work.left, work.right - width));
+        rect.top = std::clamp(rect.top, work.top, std::max(work.top, work.bottom - height));
+        rect.right = rect.left + width;
+        rect.bottom = rect.top + height;
+    }
+    restoreFrom(placement);
+}
+
+void AppShell::onShutdown() noexcept {
+    // SPEC §4 FR-9: настройки переживают перезапуск. Сохраняем здесь, а не в
+    // деструкторе: к этому моменту экраны ещё живы, и их модели ещё можно
+    // спросить (деструктор AppShell разрушает окна, и модель уже пуста).
+    saveUiState();
 }
 
 
@@ -311,6 +633,10 @@ DpiScale AppShell::dpiFor(HWND window) noexcept {
 
 AppShell::AppShell(Options options) : options_(std::move(options)) {
     dpi_ = DpiScale{dpiForSystem(), dpiForSystem()};
+    // Настройки предыдущего запуска читаются здесь, до первого окна: язык нужен
+    // до первого нарисованного контрола, а положение — до первого ShowWindow.
+    // Читается один раз и живёт в savedState_ до конца сеанса.
+    (void)readUiSettings(savedState_);
     // Тема читается один раз здесь, до первого окна: первый же WM_PAINT уже
     // должен знать цвета иначе кадр мигнёт системным белым.
     theme_.setDpi(dpi_.x);
@@ -461,6 +787,9 @@ HWND AppShell::createMainWindow() noexcept {
     }
 
     if (options_.showImmediately) {
+        // Положение из прошлого запуска — до ShowWindow: показанное окно уже не
+        // двигает SetWindowPlacement так же незаметно, как скрытое.
+        restoreSavedPlacement(window);
         // Возвращаемое значение ShowWindow — предыдущее состояние видимости, а не
         // «успех»: FALSE на первом показе это норма, поэтому проверять нечего.
         ::ShowWindow(window, options_.showCommand);
@@ -1008,7 +1337,9 @@ void AppShell::handleEndSession(HWND window, bool sessionEnding) noexcept {
     rememberPlacement(window);
     // Последнее сообщение перед тем, как система нас убьёт. Цикл сообщений
     // закрываем сами: иначе WM_QUIT не будет обработан, а onShutdown не
-    // вызовется — а он освобождает то, что живёт дольше окна.
+    // вызовется — а он сохраняет состояние интерфейса (§4 FR-9) и освобождает
+    // то, что живёт дольше окна.
+    saveUiState();
     logEvent(core::LogLevel::Info, "ui.session.ending", "система завершает сеанс, окно закрывается штатно");
     ::PostQuitMessage(exitcode::ok);
 }
@@ -1380,11 +1711,21 @@ void AppShell::paintRail(HDC dc, const RECT& client, int clientWidth, int client
         // Рамка фокуса — только когда фокус действительно на рельсе. Без
         // клавиатуры выделение и так читается по фону, а с клавиатуры рамка
         // обязательна: иначе человек не видит, куда уедут стрелки (§5).
+        //
+        // NULL_BRUSH здесь обязателен, а не украшение: Rectangle заливает контур
+        // ТЕКУЩЕЙ кистью DC, а текущей является системная белая — ни одна
+        // наша кисть в DC не выбрана (fillWithColor передаёт её прямо в FillRect).
+        // Белая заливка стирала акцент активного пункта, а подпись на нём рисуется
+        // цветом textOnAccent, который в светлой схеме тоже белый: полоса из двух
+        // цветов и ноль пикселей текста (D-61). С NULL_BRUSH рисуется только
+        // контур, заливка остаётся акцентной, и контраст подписи решает палитра.
         if (railFocused_ && selected) {
             const ScopedGdi pen(::CreatePen(PS_SOLID, std::max(1, metrics.dip(1.0)), theme::colorRef(palette.focusRing)));
             if (pen) {
                 const HGDIOBJ oldPen = ::SelectObject(dc, pen.get());
+                const HGDIOBJ oldBrush = ::SelectObject(dc, ::GetStockObject(NULL_BRUSH));
                 (void)::Rectangle(dc, item.left + 1, item.top + 1, item.right - 1, item.bottom - 1);
+                ::SelectObject(dc, oldBrush);
                 ::SelectObject(dc, oldPen);
             }
         }

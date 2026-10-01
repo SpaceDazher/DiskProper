@@ -158,6 +158,31 @@ enum class StringId : std::uint16_t {
     kAgeDays,
     kAgeMonths,
     kAgeYears,
+    // Экран «Обзор» (SPEC §7.1). Раньше тринадцать пар ru/en лежали в
+    // src/ui/view_cleanup.cpp мимо каталога (там же стоял и pick(ru, en)).
+    // Теперь они в каталоге — так же, как слова узлов карты у экрана «Диски».
+    kOverviewTitle,
+    // Названия четырёх плиток: что это за число.
+    kOverviewTileDisks,
+    kOverviewTileFree,
+    kOverviewTileCandidates,
+    kOverviewTileReclaimable,
+    // Подписи плиток: из чего посчитано число.
+    kOverviewCaptionDisksReading,
+    kOverviewCaptionFree,
+    kOverviewCaptionCandidates,
+    kOverviewCaptionReclaimable,
+    // Значения, когда данных ещё нет. Ноль после скана и ноль без скана —
+    // разные вещи (§4 FR-3), поэтому «нет данных» отдельной строкой.
+    kOverviewValueReading,
+    kOverviewValueNoScan,
+    // Пояснения под плитками.
+    kOverviewNoteScanDone,
+    kOverviewNoteNeedScan,
+    kOverviewNoteRules,
+    kOverviewNoteRulesLoading,
+    // Кнопка внизу экрана. Вторая кнопка — kActionScan, та же строка.
+    kOverviewActionOpenDisks,
     // Экран «Диски» (SPEC §4 FR-2)
     kDisksTitle,
     kDisksModel,
@@ -179,6 +204,31 @@ enum class StringId : std::uint16_t {
     kDisksNotDetected,
     kDisksPartitionCount,
     kDisksVolumeCount,
+    // Слова узлов карты. Раньше эти девять слов были зашиты в src/ui/view_disks.cpp
+    // как пара ru/en мимо каталога (там же стояла и приписка «ключи для владельца
+    // каталога»). Теперь они в каталоге: строку из ресурсов можно перевести без
+    // правки исходников, а проверка «сколько ключей используется и сколько
+    // объявлено» видит их наравне с остальными.
+    kDisksWordDisk,
+    kDisksWordPartition,
+    kDisksWordVolume,
+    kDisksWordSystem,
+    kDisksWordBootable,
+    kDisksWordHidden,
+    kDisksWordRemovable,
+    kDisksWordReadOnly,
+    kDisksWordUnallocated,
+    // Три строки пустой карты, по одной на причину: фильтры скрыли всё, устройства
+    // не прочитаны, обход ещё идёт. Раньше тоже были зашиты в экран.
+    kDisksEmptyFiltersTitle,
+    kDisksEmptyFiltersReason,
+    kDisksEmptyFiltersHint,
+    kDisksEmptyUnreadTitle,
+    kDisksEmptyUnreadReason,
+    kDisksEmptyUnreadAction,
+    kDisksEmptyLoadingTitle,
+    kDisksEmptyLoadingReason,
+    kDisksEmptyLoadingAction,
     // Экран «Отчёт» (SPEC §4 FR-8)
     kReportTitle,
     kReportSaved,
@@ -242,11 +292,16 @@ inline constexpr std::array<Translation, kStringCount> kTranslations{{
     {"app.tagline", "Очистка диска с объяснением каждого удаления",
      "Disk cleanup that explains every deletion"},
 
-    {"nav.overview", "Обзор", "Overview"},
-    {"nav.disks", "Диски", "Disks"},
-    {"nav.cleanup", "Очистка", "Cleanup"},
-    {"nav.report", "Отчёт", "Report"},
-    {"nav.settings", "Настройки", "Settings"},
+    // Ключи рельса ровно те, что просит src/ui/nav.hpp (kPages[].titleKey) и
+    // резолвит src/ui/app_shell.cpp через tr(key). Пока в каталоге были другие
+    // имена, все пять подписей возвращались в рельс «пусто» и молча брались из
+    // запасного набора kPages — то есть пять ключей числились в каталоге и не
+    // использовались, а пять запрошенных ключей в нём отсутствовали.
+    {"nav.page.overview", "Обзор", "Overview"},
+    {"nav.page.disks", "Диски", "Disks"},
+    {"nav.page.cleanup", "Очистка", "Cleanup"},
+    {"nav.page.report", "Отчёт", "Report"},
+    {"nav.page.settings", "Настройки", "Settings"},
 
     {"action.scan", "Сканировать", "Scan"},
     {"action.rescan", "Сканировать заново", "Scan again"},
@@ -345,6 +400,33 @@ inline constexpr std::array<Translation, kStringCount> kTranslations{{
     {"units.age.months", "{0} мес|{0} мес|{0} мес", "{0} mo"},
     {"units.age.years", "{0} г|{0} г|{0} лет", "{0} y"},
 
+    // Строки экрана «Обзор». Тексты перенесены байт в байт из
+    // src/ui/view_cleanup.cpp: экран рисует их сам, и любая правка здесь
+    // меняет число пикселей в снимке.
+    {"overview.title", "Обзор", "Overview"},
+    {"overview.tile.disks", "Диски", "Disks"},
+    {"overview.tile.free", "Свободно", "Free"},
+    {"overview.tile.candidates", "Кандидаты", "Candidates"},
+    {"overview.tile.reclaimable", "Освободится", "Reclaimable"},
+    {"overview.caption.disksReading", "дисков: читается в фоне", "disks: read in the background"},
+    {"overview.caption.free", "свободно на всех томах", "free on all volumes"},
+    {"overview.caption.candidates", "кандидатов найдено", "candidates found"},
+    {"overview.caption.reclaimable", "можно освободить", "can be freed"},
+    {"overview.value.reading", "читаем...", "reading..."},
+    {"overview.value.noScan", "скана не было", "no scan"},
+    {"overview.note.scanDone",
+     "Скан выполнен. Выберите, что удалить, на странице «Очистка»: без вашего выбора ничего не удаляется.",
+     "Scan is done. Choose what to delete on the Cleanup page — nothing is deleted without your selection."},
+    {"overview.note.needScan",
+     "Пока вы не просканируете, ничего не считается и ничего не удаляется: нажмите «Сканировать», и "
+     "категории появятся с реальными размерами.",
+     "Nothing is deleted and nothing is counted until you scan: press Scan and the categories appear with "
+     "real sizes."},
+    {"overview.note.rules", "Набор правил: {0} правил, версия {1}", "Rule set: {0} rules, version {1}"},
+    {"overview.note.rulesLoading", "Набор правил ещё читается с диска (фоновый поток).",
+     "The rule set is still being read from disk (background thread)."},
+    {"overview.action.openDisks", "Открыть диски", "Open disks"},
+
     {"disks.title", "Диски", "Disks"},
     {"disks.model", "Модель", "Model"},
     {"disks.serial", "Серийный номер", "Serial number"},
@@ -365,6 +447,35 @@ inline constexpr std::array<Translation, kStringCount> kTranslations{{
     {"disks.notDetected", "Диск недоступен", "Disk unavailable"},
     {"disks.partitionCount", "{0} раздел|{0} раздела|{0} разделов", "{0} partition|{0} partitions"},
     {"disks.volumeCount", "{0} том|{0} тома|{0} томов", "{0} volume|{0} volumes"},
+
+    {"disks.word.disk", "Диск", "Disk"},
+    {"disks.word.partition", "Раздел", "Partition"},
+    {"disks.word.volume", "Том", "Volume"},
+    {"disks.word.system", "системный", "system"},
+    {"disks.word.bootable", "загрузочный", "bootable"},
+    {"disks.word.hidden", "скрытый", "hidden"},
+    {"disks.word.removable", "съёмный", "removable"},
+    {"disks.word.readOnly", "только чтение", "read-only"},
+    {"disks.word.unallocated", "неразмеченное место", "unallocated space"},
+
+    {"disks.empty.filters.title", "Фильтры скрывают все диски", "Filters hide every disk"},
+    {"disks.empty.filters.reason", "Снимите фильтры над картой — и карта вернётся",
+     "Clear the filters above the map to see disks again"},
+    {"disks.empty.filters.hint", "Подсказка: у диска с буквой есть том с буквой диска",
+     "Hint: a disk with a letter has a volume with a drive letter"},
+    {"disks.empty.unread.title", "Устройства не прочитаны", "Devices were not read"},
+    {"disks.empty.unread.reason",
+     "Карта разделов пуста: устройства \\\\.\\PhysicalDriveN открываются только с повышенными правами.",
+     "The partition map is empty: \\\\.\\PhysicalDriveN opens with elevated rights only."},
+    {"disks.empty.unread.action", "Запустите MrProper от имени администратора, затем нажмите «",
+     "Run MrProper as administrator, then press "},
+    {"disks.empty.loading.title", "Читаем диски", "Reading disks"},
+    {"disks.empty.loading.reason",
+     "Обход идёт в фоне: таймаут 2 с на устройство, обычно несколько секунд",
+     "The walk runs in the background: 2 s per device, usually a few seconds"},
+    {"disks.empty.loading.action",
+     "Карта разделов появится здесь сама — нажимать ничего не нужно",
+     "The partition map will appear here on its own, no button needed"},
 
     {"report.title", "Отчёт", "Report"},
     {"report.saved", "Отчёт сохранён: {0}", "Report saved: {0}"},

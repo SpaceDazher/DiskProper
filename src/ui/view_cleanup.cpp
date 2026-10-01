@@ -230,9 +230,10 @@ std::string categoryTitle(std::string_view categoryId) {
     return std::string(categoryId);
 }
 
-// Двуязычный выбор для слов, которых нет в каталоге строк (ui::locale — файл
-// чужой). Тот же приём, что у экрана «Диски»: интерфейс остаётся
-// двуязычным, а ключи для владельца каталога перечислены в отчёте по задаче.
+// Двуязычный выбор для слов, которых нет в каталоге строк. Экран «Обзор»
+// больше не пользуется этим приёмом: его тринадцать пар перенесены в
+// ui::locale (см. kOverview*). Осталось только пояснение пустого дерева на
+// экране «Очистке» — там слова ещё лежат в коде.
 std::string_view pick(std::string_view ru, std::string_view en) {
     return currentLanguage() == core::Language::English ? en : ru;
 }
@@ -322,17 +323,43 @@ bool CleanupRect::contains(int px, int py) const noexcept {
     return px >= x && px < x + width && py >= y && py < y + height;
 }
 
+double CleanupMetrics::summaryHeightDip() const noexcept {
+    // Панель агрегатов = отступ сверху + крупная цифра + три пояснения +
+    // отступ снизу. Раньше высота была константой 84 DIP, а четыре строки
+    // делили её поровну: на строку крупной цифры (кегль 32 DIP, высота ячейки
+    // около 38 px) оставалось 18 px, и заголовок рисовался срезанным сверху.
+    return 2.0 * summaryPaddingDip + metricLineHeightDip + 3.0 * bodyLineHeightDip;
+}
+
+double CleanupMetrics::toolbarHeightDip() const noexcept {
+    // Две строки кнопок плюс зазор между ними и отступы по краям строки.
+    return 2.0 * buttonHeightDip + buttonGapDip + 2.0 * toolbarPaddingDip;
+}
+
 int CleanupLayout::gapPx(int rowHeight) noexcept { return std::max(2, rowHeight / 6); }
 
-CleanupRect CleanupLayout::buttonInRow(const CleanupRect& row, int index, int count, int gap,
-                                      int rowTop) noexcept {
-    if (count <= 0 || row.width <= 0) return CleanupRect{};
+CleanupRect CleanupLayout::buttonInRow(const CleanupRect& row, int index, int count, int gap, int rowTop,
+                                      int rowHeight) noexcept {
+    if (count <= 0 || row.width <= 0 || rowHeight <= 0) return CleanupRect{};
     const int cell = row.width / count;
     const int extra = row.width - cell * count;
     const int clamped = std::clamp(index, 0, count - 1);
     const int x = row.x + clamped * cell + std::min(clamped, extra);
     const int width = cell + (clamped < extra ? 1 : 0);
-    return CleanupRect{x, rowTop, std::max(0, width - gap), std::max(0, row.height)};
+    return CleanupRect{x, rowTop, std::max(0, width - gap), rowHeight};
+}
+
+CleanupRect CleanupLayout::buttonRow(int row) const noexcept {
+    if (buttonHeight_ <= 0 || toolbar_ <= 0 || width_ <= 0) return CleanupRect{};
+    // Нижняя строка прижата к низу клиента через отступ: её нижняя граница
+    // равна height_ - toolbarPad_ и НИКОГДА не выходит за height_. Верхняя
+    // строка стоит на buttonGap_ выше нижней. Обе высоты одинаковы и не
+    // превышают половины доступного места (это гарантировано в compute()), так
+    // что строки не накладываются даже в окне ниже минимального.
+    const int inset = std::min(toolbarPad_, std::max(0, width_ / 8));
+    const int bottomRow = height_ - toolbarPad_ - buttonHeight_;
+    const int top = (row <= 0) ? bottomRow - buttonGap_ - buttonHeight_ : bottomRow;
+    return CleanupRect{inset, top, std::max(0, width_ - 2 * inset), buttonHeight_};
 }
 
 CleanupLayout CleanupLayout::compute(const CleanupMetrics& metrics, int dpi, int clientWidthPx,
@@ -351,10 +378,19 @@ CleanupLayout CleanupLayout::compute(const CleanupMetrics& metrics, int dpi, int
     // часть). Кнопки прижаты к низу, панель dry-run и пояснение — над ними.
     // Кнопка «Очистить сейчас» не должна прыгать при каждой смене числа строк,
     // поэтому снизу всё зафиксировано, а двигается только дерево.
-    out.summary_ = std::min(out.height_, px(metrics.summaryHeightDip));
+    out.summary_ = std::min(out.height_, px(metrics.summaryHeightDip()));
     out.progress_ = std::min(out.height_ - out.summary_, px(metrics.progressHeightDip));
-    out.toolbar_ = std::min(out.height_, px(metrics.toolbarHeightDip));
+    out.toolbar_ = std::min(out.height_, px(metrics.toolbarHeightDip()));
     out.dryRun_ = dryRunVisible ? std::min(out.height_, px(metrics.dryRunHeightDip)) : 0;
+
+    // Геометрия кнопок — из той же полосы toolbar_. Отступы и зазор сжимаются
+    // первыми, высота кнопки — последней и никогда не падает ниже минимума,
+    // пока в полосе есть для неё место.
+    out.toolbarPad_ = std::clamp(px(metrics.toolbarPaddingDip), 0, out.toolbar_ / 2);
+    const int gapWanted = px(metrics.buttonGapDip);
+    const int free = std::max(0, out.toolbar_ - 2 * out.toolbarPad_);
+    out.buttonGap_ = std::min(gapWanted, std::max(0, free - 2));
+    out.buttonHeight_ = std::min(px(metrics.buttonHeightDip), std::max(0, free - out.buttonGap_) / 2);
 
     const int top = out.summary_ + out.progress_;
     int bottom = out.height_ - out.toolbar_ - out.dryRun_;
@@ -392,38 +428,38 @@ CleanupRect CleanupLayout::toolbarRect() const noexcept {
 }
 
 CleanupRect CleanupLayout::cleanButtonRect() const noexcept {
-    const CleanupRect row = toolbarRect();
-    return buttonInRow(row, 0, 4, gapPx(row.height), row.y);
+    const CleanupRect row = buttonRow(0);
+    return buttonInRow(row, 0, 4, gapPx(row.height), row.y, row.height);
 }
 
 CleanupRect CleanupLayout::cancelButtonRect() const noexcept {
-    const CleanupRect row = toolbarRect();
-    return buttonInRow(row, 1, 4, gapPx(row.height), row.y);
+    const CleanupRect row = buttonRow(0);
+    return buttonInRow(row, 1, 4, gapPx(row.height), row.y, row.height);
 }
 
 CleanupRect CleanupLayout::rescanButtonRect() const noexcept {
-    const CleanupRect row = toolbarRect();
-    return buttonInRow(row, 2, 4, gapPx(row.height), row.y);
+    const CleanupRect row = buttonRow(0);
+    return buttonInRow(row, 2, 4, gapPx(row.height), row.y, row.height);
 }
 
 CleanupRect CleanupLayout::undoButtonRect() const noexcept {
-    const CleanupRect row = toolbarRect();
-    return buttonInRow(row, 3, 4, gapPx(row.height), row.y);
+    const CleanupRect row = buttonRow(0);
+    return buttonInRow(row, 3, 4, gapPx(row.height), row.y, row.height);
 }
 
 CleanupRect CleanupLayout::selectAllButtonRect() const noexcept {
-    const CleanupRect row = toolbarRect();
-    return buttonInRow(row, 0, 3, gapPx(row.height), row.y + row.height / 2);
+    const CleanupRect row = buttonRow(1);
+    return buttonInRow(row, 0, 3, gapPx(row.height), row.y, row.height);
 }
 
 CleanupRect CleanupLayout::clearSelectionButtonRect() const noexcept {
-    const CleanupRect row = toolbarRect();
-    return buttonInRow(row, 1, 3, gapPx(row.height), row.y + row.height / 2);
+    const CleanupRect row = buttonRow(1);
+    return buttonInRow(row, 1, 3, gapPx(row.height), row.y, row.height);
 }
 
 CleanupRect CleanupLayout::showAllButtonRect() const noexcept {
-    const CleanupRect row = toolbarRect();
-    return buttonInRow(row, 2, 3, gapPx(row.height), row.y + row.height / 2);
+    const CleanupRect row = buttonRow(1);
+    return buttonInRow(row, 2, 3, gapPx(row.height), row.y, row.height);
 }
 
 CleanupRect CleanupLayout::dryRunCloseRect() const noexcept {
@@ -1473,6 +1509,33 @@ int stateImageIndex(CheckState state, bool enabled) noexcept {
     return enabled ? base : base + kStateImageEnabledCount;
 }
 
+// Высота строки текста по настоящему шрифту, а не по размеру элемента. GDI рисует
+// текст в прямоугольнике DT_SINGLELINE и обрезает его по высоте ячейки
+// (tmHeight + tmExternalLeading), поэтому именно эта величина решает, влезет ли
+// строка. Здесь она измеряется один раз и поступает и в раскладку
+// (ViewState::syncMetrics), и в отрисовку: две стороны не должны считать высоту
+// строки по-разному, иначе панель агрегатов снова вырастет не по шрифту.
+int cleanupFontLineHeightPx(HDC dc, HFONT font) noexcept {
+    if (font == nullptr) return 0;
+    const HGDIOBJ previous = ::SelectObject(dc, font);
+    TEXTMETRICW metrics{};
+    const int height = ::GetTextMetricsW(dc, &metrics) != FALSE
+                           ? metrics.tmHeight + metrics.tmExternalLeading
+                           : 0;
+    ::SelectObject(dc, previous);
+    return std::max(1, height);
+}
+
+// Высота строки шрифта без DC окна: во временном контексте. Нужна раскладке,
+// которая считается до отрисовки.
+int cleanupFontLineHeight(HFONT font) noexcept {
+    HDC dc = ::CreateCompatibleDC(nullptr);
+    if (dc == nullptr) return 0;
+    const int height = cleanupFontLineHeightPx(dc, font);
+    ::DeleteDC(dc);
+    return height;
+}
+
 struct NodeRef {
     bool category;
     std::size_t index;
@@ -2009,6 +2072,24 @@ struct ViewState {
             if (fonts[i] != nullptr) ::DeleteObject(fonts[i]);
             fonts[i] = next[i];
         }
+        syncMetrics();
+    }
+
+    // Высоты строк панели агрегатов и высота кнопки — из настоящих шрифтов,
+    // а не из констант в метриках. Иначе при масштабе текста Windows 125-200 %
+    // крупная цифра переставала помещаться в свою строку (обрезалась сверху), а
+    // кнопка оставалась ниже высоты своей подписи. Минимум кнопки при этом не
+    // меняется: он задан отдельно (§7.2, доступность), и шрифт может его
+    // только увеличить.
+    void syncMetrics() {
+        const theme::Metrics themeScale = theme::metricsForDpi(static_cast<unsigned>(dpi > 0 ? dpi : 96));
+        const int metricLine = cleanupFontLineHeight(fonts[0]);
+        const int bodyLine = cleanupFontLineHeight(fonts[2]);
+        if (metricLine > 0) metrics.metricLineHeightDip = std::max(1.0, themeScale.undo(metricLine));
+        if (bodyLine > 0) metrics.bodyLineHeightDip = std::max(1.0, themeScale.undo(bodyLine));
+        const int wanted = bodyLine > 0 ? bodyLine + 2 * std::max(1, themeScale.dip(4.0)) : 0;
+        metrics.buttonHeightDip =
+            std::max(kMinButtonHeightDip, wanted > 0 ? themeScale.undo(wanted) : metrics.buttonHeightDip);
     }
 
     // Чекбоксы рисуются сами: картинки состояния — это те же три знака, что
@@ -2352,13 +2433,36 @@ LRESULT drawSummary(ViewState& state, const DRAWITEMSTRUCT& draw) {
     const std::array<HFONT, 4> used{state.fonts[0], state.fonts[2], state.fonts[2], state.fonts[2]};
     const std::array<theme::Color, 4> colors{palette.textPrimary, palette.textPrimary, palette.textSecondary,
                                             palette.textSecondary};
-    const int padding = scale.dip(8.0);
-    RECT row{box.left + padding, box.top + padding / 2, box.right - padding, box.bottom - padding};
-    if (row.bottom <= row.top) return TRUE;
-    const int lineHeight = (row.bottom - row.top) / static_cast<int>(lines.size());
+    // Отступ сверху равен отступу снизу: первая строка — крупная цифра, и раньше
+    // она начиналась с половины отступа и уходила под верхний край панели, то
+    // есть заголовок рисовался срезанным (дефект M1).
+    const int padding = std::max(1, scale.dip(state.metrics.summaryPaddingDip));
+    const int top = box.top + padding;
+    const int limit = box.bottom - padding;
+
+    // Строка получает столько, сколько просит её шрифт. Крупная цифра — первой
+    // и без уступок: если места не хватает, не хватает его пояснениям, а не
+    // заголовку. Остаток делят три пояснения пропорционально своим высотам, и
+    // последняя строка забирает остаток от целочисленного деления.
+    std::array<int, 4> wanted{cleanupFontLineHeightPx(dc, used[0]), cleanupFontLineHeightPx(dc, used[1]),
+                              cleanupFontLineHeightPx(dc, used[2]), cleanupFontLineHeightPx(dc, used[3])};
+    std::array<int, 4> heights{};
+    heights[0] = std::clamp(wanted[0], 0, std::max(0, limit - top));
+    const int rest = std::max(0, limit - top - heights[0]);
+    const int smallSum = wanted[1] + wanted[2] + wanted[3];
+    int taken = 0;
+    for (std::size_t i = 1; i < lines.size(); ++i) {
+        heights[i] = (i + 1 == lines.size())
+                         ? std::max(0, rest - taken)
+                         : (smallSum > 0 ? static_cast<int>(static_cast<long long>(wanted[i]) * rest / smallSum) : 0);
+        taken += heights[i];
+    }
+
+    int y = top;
     for (std::size_t i = 0; i < lines.size(); ++i) {
-        RECT line{row.left, row.top + static_cast<int>(i) * lineHeight, row.right,
-                  row.top + static_cast<int>(i + 1) * lineHeight};
+        RECT line{box.left + padding, y, box.right - padding, y + heights[i]};
+        y += heights[i];
+        if (line.bottom <= line.top) continue;
         if (used[i] != nullptr) ::SelectObject(dc, used[i]);
         ::SetTextColor(dc, theme::colorRef(colors[i]));
         ::DrawTextW(dc, lines[i].c_str(), -1, &line,
@@ -2477,8 +2581,19 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             }
             return 0;
         }
-        case WM_DPICHANGED: {
-            const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+        case WM_DPICHANGED:
+        case WM_DPICHANGED_BEFOREPARENT:
+        case WM_DPICHANGED_AFTERPARENT: {
+            // Per-monitor v2 (§5) сообщает смену масштаба дочерним окнам
+            // парами BEFORE/AFTERPARENT, и в этой паре lParameter НЕ является
+            // прямоугольником: размер окна пересчитывает система сама, от нас
+            // нужны только DPI, шрифты и раскладка. Без этих двух веток
+            // экран остаётся в метриках прежнего масштаба — это измерено на
+            // эмуляции 150 % (WM_DPICHANGED_AFTERPARENT, тот же приём, что в
+            // tools\ui-smoke.ps1): клиент 998x1065, а панель агрегатов 101 px и
+            // кнопки 32 px, то есть всё посчитано в пикселях 96 DPI.
+            const bool hasSuggested = (message == WM_DPICHANGED);
+            const auto* suggested = hasSuggested ? reinterpret_cast<const RECT*>(lParam) : nullptr;
             const int newDpi = HIWORD(wParam);
             if (newDpi > 0) state->dpi = newDpi;
             state->theme.setDpi(static_cast<unsigned>(state->dpi));
@@ -2854,6 +2969,16 @@ constexpr wchar_t kOverviewViewClass[] = L"MrProper.OverviewView";
 // или «Очистки» не пришёл сюда под тем же номером.
 enum : int { kOverviewScanButton = 1, kOverviewDisksButton = 2 };
 
+// «Нет данных» в плитке. Не перевод и не пустая строка: ноль в плитке
+// свободного места читается как «диск пуст», а это ложь, когда размер просто не
+// пришёл (FR-1: устройство могло не ответить). Ровно тот же приём и то же
+// обоснование, что в src/ui/view_disks.cpp (kNoData).
+constexpr std::string_view kNoData = "—";
+
+std::string sizeOrDash(std::uint64_t bytes, bool known) {
+    return known ? formatBytes(bytes) : std::string(kNoData);
+}
+
 struct ViewState {
     OverviewScreen::Callbacks callbacks;
     OverviewSnapshot snapshot;
@@ -2910,7 +3035,6 @@ struct ViewState {
     };
 
     [[nodiscard]] std::vector<Tile> tiles() const {
-        const bool en = currentLanguage() == core::Language::English;
         const theme::Metrics metrics = scale();
         RECT client{};
         if (window == nullptr || ::GetClientRect(window, &client) == FALSE) return {};
@@ -2922,55 +3046,46 @@ struct ViewState {
         // Четыре плитки в фиксированном порядке: диски, свободно, кандидаты,
         // освободится. «Нет данных» и «нет скана» — это разные надписи, а не
         // ноль: ноль после скана и ноль без скана значат разное (§4 FR-3).
-        const std::string disks = snapshot.inventoryKnown ? std::to_string(snapshot.diskCount)
-                                                          : (en ? "reading..." : "читаем...");
-        const std::string freeText = snapshot.inventoryKnown ? formatBytes(snapshot.freeBytes) : (en ? "-" : "—");
+        // Размер печатается только когда он известен, иначе прочерк: плитка
+        // «Диски» на хосте без прав администратора получала «0 Б» вместо «—»
+        // (то же, что делает и не делает экран «Диски»: sizeOrDash).
+        const std::string disks =
+            snapshot.inventoryKnown ? std::to_string(snapshot.diskCount) : tr(StringId::kOverviewValueReading);
+        const std::string freeText = sizeOrDash(snapshot.freeBytes, snapshot.freeKnown);
         const std::string candidates =
-            snapshot.scanned ? std::to_string(snapshot.candidates) : (en ? "no scan" : "скана не было");
-        const std::string reclaim = snapshot.scanned ? formatBytes(snapshot.reclaimableBytes) : (en ? "-" : "—");
+            snapshot.scanned ? std::to_string(snapshot.candidates) : tr(StringId::kOverviewValueNoScan);
+        const std::string reclaim = sizeOrDash(snapshot.reclaimableBytes, snapshot.scanned);
 
         std::vector<Tile> out;
         const int top = pad + std::max(10, metrics.dip(24.0)) + std::max(2, metrics.dip(8.0));
         out.push_back(Tile{{pad, top, pad + columnWidth, top + tileHeight},
-                           toWide(en ? "Disks" : "Диски"), toWide(disks),
+                           toWide(tr(StringId::kOverviewTileDisks)), toWide(disks),
                            toWide(snapshot.inventoryKnown
-                                      ? std::to_string(snapshot.diskCount) + " · " + formatBytes(snapshot.totalBytes)
-                                      : (en ? "disks: read in the background" : "дисков: читается в фоне"))});
+                                      ? std::to_string(snapshot.diskCount) + " · " +
+                                            sizeOrDash(snapshot.totalBytes, snapshot.sizeKnown)
+                                      : tr(StringId::kOverviewCaptionDisksReading))});
         out.push_back(Tile{{pad + columnWidth + gap, top, client.right - pad, top + tileHeight},
-                           toWide(en ? "Free" : "Свободно"), toWide(freeText),
-                           toWide(en ? "free on all volumes" : "свободно на всех томах")});
+                           toWide(tr(StringId::kOverviewTileFree)), toWide(freeText),
+                           toWide(tr(StringId::kOverviewCaptionFree))});
         out.push_back(Tile{{pad, top + tileHeight + gap, pad + columnWidth, top + tileHeight * 2 + gap},
-                           toWide(en ? "Candidates" : "Кандидаты"), toWide(candidates),
-                           toWide(en ? "candidates found" : "кандидатов найдено")});
+                           toWide(tr(StringId::kOverviewTileCandidates)), toWide(candidates),
+                           toWide(tr(StringId::kOverviewCaptionCandidates))});
         out.push_back(Tile{{pad + columnWidth + gap, top + tileHeight + gap, client.right - pad,
                             top + tileHeight * 2 + gap},
-                           toWide(en ? "Reclaimable" : "Освободится"), toWide(reclaim),
-                           toWide(en ? "can be freed" : "можно освободить")});
+                           toWide(tr(StringId::kOverviewTileReclaimable)), toWide(reclaim),
+                           toWide(tr(StringId::kOverviewCaptionReclaimable))});
         return out;
     }
 
     [[nodiscard]] std::vector<std::wstring> notes() const {
-        const bool en = currentLanguage() == core::Language::English;
         std::vector<std::wstring> out;
-        if (snapshot.scanned) {
-            out.push_back(toWide(en ? "Scan is done. Choose what to delete on the Cleanup page — nothing is deleted "
-                                      "without your selection."
-                                  : "Скан выполнен. Выберите, что удалить, на странице «Очистка»: без вашего выбора "
-                                    "ничего не удаляется."));
-        } else {
-            out.push_back(toWide(en ? "Nothing is deleted and nothing is counted until you scan: press Scan and the "
-                                      "categories appear with real sizes."
-                                  : "Пока вы не просканируете, ничего не считается и ничего не удаляется: нажмите "
-                                    "«Сканировать», и категории появятся с реальными размерами."));
-        }
+        out.push_back(toWide(snapshot.scanned ? tr(StringId::kOverviewNoteScanDone)
+                                             : tr(StringId::kOverviewNoteNeedScan)));
         if (snapshot.ruleCount > 0) {
-            out.push_back(toWide(en ? "Rule set: " + std::to_string(snapshot.ruleCount) + " rules, version " +
-                                          snapshot.ruleVersion
-                                      : "Набор правил: " + std::to_string(snapshot.ruleCount) + " правил, версия " +
-                                            snapshot.ruleVersion));
+            out.push_back(toWide(tr(StringId::kOverviewNoteRules,
+                                    core::StringArgs{std::to_string(snapshot.ruleCount), snapshot.ruleVersion})));
         } else {
-            out.push_back(toWide(en ? "The rule set is still being read from disk (background thread)."
-                                  : "Набор правил ещё читается с диска (фоновый поток)."));
+            out.push_back(toWide(tr(StringId::kOverviewNoteRulesLoading)));
         }
         return out;
     }
@@ -3003,6 +3118,11 @@ struct ViewState {
         snapshot.totalBytes = usage.totalBytes;
         snapshot.freeBytes = usage.freeBytes;
         snapshot.inventoryKnown = true;
+        // «Прочитано» не значит «известно». Хост без прав администратора
+        // возвращает пустую карту: freeKnown у неё false (томов нет), и печать
+        // 0 байт значила бы «свободно 0», то есть «диск полон».
+        snapshot.freeKnown = usage.freeKnown;
+        snapshot.sizeKnown = usage.totalBytes > 0;
     }
 
     void applyRules(const core::RuleSet& rules) {
@@ -3056,8 +3176,7 @@ struct ViewState {
         const int pad = std::max(2, metrics.dip(12.0));
         if (fonts[0] != nullptr) ::SelectObject(dc, fonts[0]);
         ::SetTextColor(dc, theme::colorRef(palette.textPrimary));
-        const std::wstring title =
-            toWide(currentLanguage() == core::Language::English ? "Overview" : "Обзор");
+        const std::wstring title = toWide(tr(StringId::kOverviewTitle));
         RECT titleRect{pad, y, client.right - pad, y + std::max(10, metrics.dip(24.0))};
         (void)::DrawTextW(dc, title.c_str(), -1, &titleRect, single | DT_VCENTER);
         y = titleRect.bottom + metrics.dip(6.0);
@@ -3152,15 +3271,6 @@ void logOverviewWin32(std::string_view event, std::string_view where, unsigned l
 // том же файле, и подписи обзора обязаны быть подписями, а не ключами.
 void ensureOverviewStrings() noexcept {
     if (!mrproper::ui::isInitialized()) (void)mrproper::ui::initialize();
-}
-
-std::wstring toWideOverview(std::string_view text) {
-    if (text.empty()) return {};
-    const int needed = ::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
-    if (needed <= 0) return {};
-    std::wstring wide(static_cast<std::size_t>(needed), L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), wide.data(), needed);
-    return wide;
 }
 
 ViewState* stateOf(HWND window) {
@@ -3279,7 +3389,6 @@ HWND OverviewScreen::create(HWND parent, int dpi) {
         return nullptr;
     }
 
-    const bool en = currentLanguage() == core::Language::English;
     state.scanButton = ::CreateWindowExW(0, L"BUTTON", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0,
                                          0, 0, 0, state.window,
                                          reinterpret_cast<HMENU>(static_cast<UINT_PTR>(kOverviewScanButton)),
@@ -3292,8 +3401,8 @@ HWND OverviewScreen::create(HWND parent, int dpi) {
         logOverviewWin32("ui.overview.create", "CreateWindowExW(button)", ::GetLastError());
         return nullptr;
     }
-    ::SetWindowTextW(state.scanButton, toWideOverview(en ? "Scan" : "Сканировать").c_str());
-    ::SetWindowTextW(state.disksButton, toWideOverview(en ? "Open disks" : "Открыть диски").c_str());
+    ::SetWindowTextW(state.scanButton, toWide(tr(StringId::kActionScan)).c_str());
+    ::SetWindowTextW(state.disksButton, toWide(tr(StringId::kOverviewActionOpenDisks)).c_str());
     state.applyPalette();
     state.applyFonts();
     state.controlsReady = true;

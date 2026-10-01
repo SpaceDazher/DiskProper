@@ -70,17 +70,16 @@ void ensureStrings() noexcept {
 // Слова узлов и флагов
 // ---------------------------------------------------------------------------
 //
-// В ui::locale (задача 69, чужой файл) нет ключей «Диск», «Раздел», «Том» и
-// названий флагов раздела: каталог закрывает FR-2 полем экрана, названием типа
-// раздела и формами множественного числа, но не подписью узла дерева. А подпись
-// узла — первое, что читает человек, и без неё дерево FR-2 не подписано.
+// Девять слов раньше были объявлены здесь как пары ru/en мимо каталога строк, с
+// припиской «список ключей для владельца каталога». Владелец каталога — модуль
+// локализации (src/ui/locale.hpp), и ключи добавлены: disks.word.*. Осталось
+// тонкое отображение «слово → идентификатор», а не сама строка, поэтому перевод
+// из ресурсов и смена языка работают здесь ровно так же, как на остальных
+// экранах.
 //
-// Поэтому девять слов объявлены здесь, на обоих языках: интерфейс остаётся
-// двуязычным (§12 «русская и английская локализация полны»), а список ключей
-// для владельца каталога — в отчёте по задаче. Всё остальное подписывается
-// штатными ключами и нейтральными именами core::disk_model
-// (partitionKindName, busTypeName, toString(PartitionScheme)), которые не
-// переводятся и потому одинаковы в обоих языках.
+// Всё остальное подписывается штатными ключами и нейтральными именами
+// core::disk_model (partitionKindName, busTypeName, toString(PartitionScheme)),
+// которые не переводятся и потому одинаковы в обоих языках.
 enum class Word : std::uint8_t {
     Disk,
     Partition,
@@ -93,24 +92,22 @@ enum class Word : std::uint8_t {
     Unallocated,
 };
 
-std::string_view pick(std::string_view ru, std::string_view en) {
-    return currentLanguage() == core::Language::English ? en : ru;
+constexpr StringId wordKey(Word value) noexcept {
+    switch (value) {
+    case Word::Disk: return StringId::kDisksWordDisk;
+    case Word::Partition: return StringId::kDisksWordPartition;
+    case Word::Volume: return StringId::kDisksWordVolume;
+    case Word::System: return StringId::kDisksWordSystem;
+    case Word::Bootable: return StringId::kDisksWordBootable;
+    case Word::Hidden: return StringId::kDisksWordHidden;
+    case Word::Removable: return StringId::kDisksWordRemovable;
+    case Word::ReadOnly: return StringId::kDisksWordReadOnly;
+    case Word::Unallocated: return StringId::kDisksWordUnallocated;
+    }
+    return StringId::kCommonUnknown;
 }
 
-std::string word(Word value) {
-    switch (value) {
-    case Word::Disk: return std::string(pick("Диск", "Disk"));
-    case Word::Partition: return std::string(pick("Раздел", "Partition"));
-    case Word::Volume: return std::string(pick("Том", "Volume"));
-    case Word::System: return std::string(pick("системный", "system"));
-    case Word::Bootable: return std::string(pick("загрузочный", "bootable"));
-    case Word::Hidden: return std::string(pick("скрытый", "hidden"));
-    case Word::Removable: return std::string(pick("съёмный", "removable"));
-    case Word::ReadOnly: return std::string(pick("только чтение", "read-only"));
-    case Word::Unallocated: return std::string(pick("неразмеченное место", "unallocated space"));
-    }
-    return std::string(pick("неизвестно", "unknown"));
-}
+std::string word(Word value) { return tr(wordKey(value)); }
 
 // ---------------------------------------------------------------------------
 // Ключи узлов
@@ -2174,30 +2171,21 @@ struct ViewState {
         const bool filtered = model.filters().any();
         if (filtered && model.hasInventory() && model.diskCount() > 0) {
             // Данные есть, показывать нечего только из-за фильтров.
-            state.headline = std::string(pick("Фильтры скрывают все диски", "Filters hide every disk"));
-            state.reason = std::string(pick("Снимите фильтры над картой — и карта вернётся",
-                                            "Clear the filters above the map to see disks again"));
-            state.action = std::string(pick("Подсказка: у диска с буквой есть том с буквой диска",
-                                            "Hint: a disk with a letter has a volume with a drive letter"));
+            state.headline = tr(StringId::kDisksEmptyFiltersTitle);
+            state.reason = tr(StringId::kDisksEmptyFiltersReason);
+            state.action = tr(StringId::kDisksEmptyFiltersHint);
             return state;
         }
         if (model.hasInventory()) {
-            state.headline = std::string(pick("Устройства не прочитаны", "Devices were not read"));
-            state.reason =
-                std::string(pick("Карта разделов пуста: устройства \\.\\PhysicalDriveN открываются только "
-                                 "с повышенными правами.",
-                                 "The partition map is empty: \\\\.\\PhysicalDriveN opens with elevated "
-                                 "rights only."));
-            state.action = std::string(pick("Запустите MrProper от имени администратора, затем нажмите «",
-                                            "Run MrProper as administrator, then press ")) +
-                          tr(StringId::kActionRefresh) + std::string("»");
+            state.headline = tr(StringId::kDisksEmptyUnreadTitle);
+            state.reason = tr(StringId::kDisksEmptyUnreadReason);
+            state.action = tr(StringId::kDisksEmptyUnreadAction) + tr(StringId::kActionRefresh) +
+                          std::string("»");
             return state;
         }
-        state.headline = std::string(pick("Читаем диски", "Reading disks"));
-        state.reason = std::string(pick("Обход идёт в фоне: таймаут 2 с на устройство, обычно несколько секунд",
-                                        "The walk runs in the background: 2 s per device, usually a few seconds"));
-        state.action = std::string(pick("Карта разделов появится здесь сама — нажимать ничего не нужно",
-                                        "The partition map will appear here on its own, no button needed"));
+        state.headline = tr(StringId::kDisksEmptyLoadingTitle);
+        state.reason = tr(StringId::kDisksEmptyLoadingReason);
+        state.action = tr(StringId::kDisksEmptyLoadingAction);
         return state;
     }
 

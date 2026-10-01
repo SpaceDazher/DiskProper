@@ -73,6 +73,46 @@
 # 0 чернил и 1 цвет, у пяти нарисованных экранов — от 409 (очистка) до 29264.
 # Порог 250 — в 1,6 раза ниже самой пустой нарисованной страницы.
 #
+# ОБХОД ВСЕХ СТРАНИЦ (-AllPages). Рельс и пять экранов: ворота выше смотрят на
+# стартовую страницу, а отказ живёт в остальных четырёх — кнопки «Очистки»,
+# обрезанные заголовок и единица измерения в плитке «Дисков» проходят зелёными.
+# Обход нужен ещё и потому, что раскладка зависит от высоты окна: при 1280x720
+# (клиент 685) нижние кнопки стоят в y=607..677, а при минимальных 900x600
+# (клиент 565) последняя кнопка «Отчёта» уезжает на 9 пикселей за правый край
+# хоста содержимого и наполовину обрезается краем окна.
+#
+# Переключение страниц — настоящими клавишами Ctrl+1..5 через keybd_event, а не
+# сообщениями WM_KEYDOWN: обработчик рельса читает GetKeyState(VK_CONTROL), а
+# синтетическое сообщение состояние клавиатуры не меняет, поэтому PostMessage
+# давал тихий ноль — страница не открывалась, а ворота этого не замечали.
+# Перед вводом окно приводится на передний план через ALT-нажатие: без него
+# SetForegroundWindow отклоняется, и нажатия уходят в чужое окно. И то и другое
+# НЕЛЬЗЯ делать на машине человека молча — ключи уходят в системный ввод, окно
+# MrProper всплывает и перехватывает фокус. Поэтому обход включается ключом
+# -AllPages, а не всегда: в CI его просит шаг, локально — человек.
+#
+# После переключения страница проверяется не «нарисован ли экран», а двумя
+# числами на КАЖДЫЙ видимый потомок окна содержимого:
+#   * размер ненулевой — иначе элемент есть, а нажать его нечем;
+#   * прямоугольник целиком внутри клиентской области хоста содержимого —
+#     именно это ловит кнопку, вылезшую за край. Хост содержимого берётся
+#     «самым крупным видимым дочерним окном», как и выше, а сравнение идёт в
+#     экранных координатах: так не нужно пересчитывать систему координат и
+#     нельзя перепутать клиентскую и оконную.
+# Допуск -LayoutTolerance (по умолчанию 1 пиксель) — на округление DIP→пиксель
+# вокруг рамок; девять пикселей вылета он не скрывает.
+#
+# Проверяется только живая ветвь: ShowWindow(SW_HIDE) снимает WS_VISIBLE с окна
+# экрана, но не с его потомков, поэтому перечисление всех потомков хоста видело
+# бы элементы четырёх скрытых страниц. Сначала берутся прямые дети хоста, и
+# обходятся лишь те из них, что видимы.
+#
+# Обход не состоялся — код 11, а не зелёный: иначе ворота, которые не смогли
+# открыть ни одну страницу, рапортовали бы «раскладка в порядке» о пустоте.
+#
+# Снимки страниц: -Shot задаёт имя БАЗОВОГО файла, обход дописывает суффикс
+# -p<N>-<имя> перед расширением (D:\Temp\ui.png -> D:\Temp\ui-p3-cleanup.png).
+#
 # Коды возврата:
 #   0 — окно нарисовало содержимое;
 #   2 — неверные аргументы;
@@ -84,7 +124,12 @@
 #   8 — фон не соответствует ожидаемой теме;
 #   9 — окно содержимого не найдено, в нём только фон, в нём меньше
 #       -MinContentColors разных цветов или в его центральных 70 % меньше
-#       -MinCenterInkPixels чернил.
+#       -MinCenterInkPixels чернил;
+#  10 — сломана раскладка: на обойдённой странице видимый потомок окна
+#       содержимого имеет нулевой размер или выходит за его клиентскую
+#       область (только при -AllPages);
+#  11 — обход не состоялся: окно не удалось привести на передний план или
+#       открыть страницу (только при -AllPages).
 #
 # Прав администратора не требует и не должен: приложение только рисует окно, а
 # состояние готовится в HKCU собственного ключа. Порог чернил подобран по
@@ -103,7 +148,12 @@ param(
     [string]$ThemeMode = '',
     [string]$ExpectBackground = '',
     [int]$SettleSeconds = 7,
-    [int]$RepaintSeconds = 2
+    [int]$RepaintSeconds = 2,
+    # --- обход всех страниц (см. шапку) ---------------------------------------
+    [switch]$AllPages,
+    [int]$PageSwitchTries = 8,
+    [int]$LayoutTolerance = 1,
+    [int]$PageSettleMilliseconds = 600
 )
 
 $ErrorActionPreference = 'Stop'
@@ -134,6 +184,8 @@ if ($ExpectBackground -ne '' -and @('dark', 'light') -notcontains $ExpectBackgro
     Write-Host "[ui] -ExpectBackground ожидает dark|light, получено '$ExpectBackground'"
     exit 2
 }
+if ($PageSwitchTries -lt 1) { Write-Host "[ui] -PageSwitchTries меньше 1: $PageSwitchTries"; exit 2 }
+if ($LayoutTolerance -lt 0) { Write-Host "[ui] -LayoutTolerance отрицателен: $LayoutTolerance"; exit 2 }
 
 Add-Type -TypeDefinition @'
 using System; using System.Text; using System.Runtime.InteropServices;
@@ -158,6 +210,12 @@ public class MrWin {
  [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+ // Обход страниц: передний план, клавиатура и обход дерева потомков.
+ [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+ [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+ [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+ [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+ [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);
  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr wp, IntPtr lp, uint flags, uint timeout, out IntPtr result);
  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
@@ -177,6 +235,23 @@ $script:wmGetMinMaxInfo = 0x0024
 $script:smtoAbortIfHung = 0x0002
 $script:redrawAll = 0x0181
 $script:baseDpi = 96
+#   GW_CHILD = 5, GW_HWNDNEXT = 2 (winuser.h) — обход прямых детей без
+#   перечисления всех потомков: EnumChildWindows рекурсивный и смотрел бы в
+#   ветви скрытых экранов.
+$script:gwChild = 5
+$script:gwHwndNext = 2
+$script:keyEventKeyUp = 0x0002
+$script:vkControl = 0x11
+$script:vkMenu = 0x12
+# Пять страниц рельса в порядке kPages (src/ui/nav.hpp): Overview, Disks,
+# Cleanup, Report, Settings; Ctrl+1..5 и класс окна экрана.
+$script:pages = @(
+    @{ Name = 'overview'; Digit = 0x31; View = 'MrProper.OverviewView' },
+    @{ Name = 'disks';    Digit = 0x32; View = 'MrProper.DisksView' },
+    @{ Name = 'cleanup';  Digit = 0x33; View = 'MrProper.CleanupView' },
+    @{ Name = 'report';   Digit = 0x34; View = 'MrProper.ReportView' },
+    @{ Name = 'settings'; Digit = 0x35; View = 'MrProper.SettingsView' }
+)
 
 # --- состояние темы в реестре: запомнить, поставить, вернуть как было ---------
 $script:themePath = 'HKCU:\Software\MrProper\UI'
@@ -270,6 +345,25 @@ function Find-AppWindow([int]$processId) {
     return $script:hwnd
 }
 
+# Снимок окна в файл. Отдельная функция нужна обходу страниц: он снимает ту же
+# иерархию пять раз и обязан писать в разные файлы, не трогая код стартовой
+# страницы.
+function Save-WindowShot([IntPtr]$hwnd, $windowRect, [string]$path) {
+    $shotDir = Split-Path -Parent $path
+    if ($shotDir -ne '' -and -not (Test-Path -LiteralPath $shotDir)) {
+        New-Item -ItemType Directory -Path $shotDir -Force | Out-Null
+    }
+    $bmp = New-Object System.Drawing.Bitmap(($windowRect.R - $windowRect.L), ($windowRect.B - $windowRect.T))
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $dc = $g.GetHdc()
+    [void][MrWin]::PrintWindow($hwnd, $dc, 2)
+    $g.ReleaseHdc($dc)
+    $g.Dispose()
+    $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+    return $path
+}
+
 # Окно содержимого — самое крупное видимое дочернее окно главного. Рельс
 # навигации рисует оболочка на самом окне, дочерних окон у него одно: хост
 # содержимого, в который views_* и рисуют. Возвращает @{ Found; X; Y; W; H } в
@@ -290,17 +384,18 @@ function Find-ContentHost([IntPtr]$hwnd, $windowRect) {
                 $script:best.T = $r.T
                 $script:best.R = $r.R
                 $script:best.B = $r.B
+                $script:bestHwnd = $h
             }
         }
         return $true
     }
     [void][MrWin]::EnumChildWindows($hwnd, $cb, [IntPtr]::Zero)
     if ($null -eq $script:best) {
-        return @{ Found = $false; X = 0; Y = 0; W = 0; H = 0 }
+        return @{ Found = $false; X = 0; Y = 0; W = 0; H = 0; Hwnd = [IntPtr]::Zero }
     }
     $x = $script:best.L - $windowRect.L
     $y = $script:best.T - $windowRect.T
-    return @{ Found = $true; X = $x; Y = $y; W = $script:best.R - $script:best.L; H = $script:best.B - $script:best.T }
+    return @{ Found = $true; X = $x; Y = $y; W = $script:best.R - $script:best.L; H = $script:best.B - $script:best.T; Hwnd = $script:bestHwnd }
 }
 
 # Считает чернила в прямоугольнике: пиксели, отличные от самого частого цвета
@@ -352,6 +447,150 @@ function Get-AppMinTrack([IntPtr]$hwnd) {
     } finally {
         [Runtime.InteropServices.Marshal]::FreeHGlobal($ptr)
     }
+}
+
+# Прямые дети окна: EnumChildWindows рекурсивный, а нужно только верхний
+# уровень, чтобы отличить окно экрана от его собственных элементов.
+function Get-DirectChild([IntPtr]$parent) {
+    $result = New-Object System.Collections.ArrayList
+    $child = [MrWin]::GetWindow($parent, $script:gwChild)
+    while ($child -ne [IntPtr]::Zero) {
+        [void]$result.Add($child)
+        $child = [MrWin]::GetWindow($child, $script:gwHwndNext)
+    }
+    return $result
+}
+
+# Видимые окна экранов (класс MrProper.*View), прямые дети хоста содержимого.
+# Возвращает массив @{ Class; Hwnd } — по нему видно, какая страница открыта.
+function Get-VisibleScreen([IntPtr]$hostWindow) {
+    $found = New-Object System.Collections.ArrayList
+    foreach ($child in Get-DirectChild $hostWindow) {
+        if (-not [MrWin]::IsWindowVisible($child)) { continue }
+        $c = New-Object Text.StringBuilder 256
+        [void][MrWin]::GetClassNameW($child, $c, 256)
+        $name = $c.ToString()
+        if ($name -like 'MrProper.*View') {
+            [void]$found.Add(@{ Class = $name; Hwnd = $child })
+        }
+    }
+    return $found
+}
+
+# Окно на передний план. SetForegroundWindow без ALT система его отклоняет:
+# право есть только у процесса, который последним щёлкнул мышью. ALT-нажатие
+# снимает ограничение — приём из штатной автоматизации, он же объясняет, почему
+# синтетический WM_SETFOCUS не помогает: он меняет фокус внутри потока, а
+# передний план определяет система.
+function Set-AppForeground([IntPtr]$hwnd) {
+    [void][MrWin]::SetForegroundWindow($hwnd)
+    if ([MrWin]::GetForegroundWindow() -eq $hwnd) { return $true }
+    [MrWin]::keybd_event($script:vkMenu, 0, 0, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 80
+    [void][MrWin]::SetForegroundWindow($hwnd)
+    [MrWin]::keybd_event($script:vkMenu, 0, $script:keyEventKeyUp, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 250
+    return ([MrWin]::GetForegroundWindow() -eq $hwnd)
+}
+
+# Ctrl+<цифра> настоящим вводом. Возвращает @{ Ok; Tries; Visible }.
+function Switch-AppPage([IntPtr]$hwnd, [IntPtr]$hostWindow, [hashtable]$page) {
+    $result = @{ Ok = $false; Tries = 0; Visible = '' }
+    $tries = 0
+    while ($tries -lt $PageSwitchTries) {
+        $tries++
+        $result.Tries = $tries
+        if (-not (Set-AppForeground $hwnd)) { continue }
+        [MrWin]::keybd_event($script:vkControl, 0, 0, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 80
+        [MrWin]::keybd_event($page.Digit, 0, 0, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 80
+        [MrWin]::keybd_event($page.Digit, 0, $script:keyEventKeyUp, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 80
+        [MrWin]::keybd_event($script:vkControl, 0, $script:keyEventKeyUp, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds $PageSettleMilliseconds
+        $visible = @(Get-VisibleScreen $hostWindow)
+        if ($visible.Count -eq 1 -and $visible[0].Class -eq $page.View) {
+            $result.Ok = $true
+            $result.Visible = $visible[0].Class
+            return $result
+        }
+        if ($visible.Count -gt 0) { $result.Visible = $visible[0].Class }
+    }
+    return $result
+}
+
+# Раскладка одной страницы. Возвращает @{ Checked; Violations } где Violations —
+# массив строк с классом, подписью, прямоугольником в координатах хоста и
+# величиной вылета по каждой стороне.
+function Measure-PageLayout([IntPtr]$hostWindow, [int]$tolerance) {
+    $client = New-Object MrWin+RECT
+    [void][MrWin]::GetClientRect($hostWindow, [ref]$client)
+    $origin = New-Object MrWin+POINT
+    $origin.X = $client.L
+    $origin.Y = $client.T
+    [void][MrWin]::ClientToScreen($hostWindow, [ref]$origin)
+    $limitLeft = $origin.X
+    $limitTop = $origin.Y
+    $limitRight = $origin.X + ($client.R - $client.L)
+    $limitBottom = $origin.Y + ($client.B - $client.T)
+
+    $violations = New-Object System.Collections.ArrayList
+    $checked = 0
+    foreach ($root in Get-DirectChild $hostWindow) {
+        if (-not [MrWin]::IsWindowVisible($root)) { continue }
+        $queue = New-Object System.Collections.ArrayList
+        [void]$queue.Add($root)
+        $cb = [MrWin+EnumProc] {
+            param($h, $l)
+            [void]$queue.Add($h)
+            return $true
+        }
+        [void][MrWin]::EnumChildWindows($root, $cb, [IntPtr]::Zero)
+        foreach ($item in $queue) {
+            if (-not [MrWin]::IsWindowVisible($item)) { continue }
+            $rect = New-Object MrWin+RECT
+            [void][MrWin]::GetWindowRect($item, [ref]$rect)
+            $checked++
+            $cls = New-Object Text.StringBuilder 256
+            [void][MrWin]::GetClassNameW($item, $cls, 256)
+            $cap = New-Object Text.StringBuilder 256
+            [void][MrWin]::GetWindowTextW($item, $cap, 256)
+            $label = $cap.ToString()
+            if ($label.Length -gt 40) { $label = $label.Substring(0, 40) + '...' }
+            $w = $rect.R - $rect.L
+            $h = $rect.B - $rect.T
+            $why = ''
+            if ($w -le 0 -or $h -le 0) {
+                $why = 'нулевой размер'
+            } else {
+                # Допуск ТОЛЬКО расширяет границу: элемент должен умещаться в
+                # прямоугольник [граница - T, граница + T]. Считать «вылет» как
+                # «граница + T минус элемент» нельзя — тогда элемент ровно по
+                # границе давал бы T и красный на пустом месте.
+                $over = ''
+                if ((($limitLeft - $tolerance) - $rect.L) -gt 0) {
+                    $over = 'слева ' + (($limitLeft - $tolerance) - $rect.L)
+                }
+                if (($rect.R - ($limitRight + $tolerance)) -gt 0) {
+                    $over = $over + '; справа ' + ($rect.R - ($limitRight + $tolerance))
+                }
+                if ((($limitTop - $tolerance) - $rect.T) -gt 0) {
+                    $over = $over + '; сверху ' + (($limitTop - $tolerance) - $rect.T)
+                }
+                if (($rect.B - ($limitBottom + $tolerance)) -gt 0) {
+                    $over = $over + '; снизу ' + ($rect.B - ($limitBottom + $tolerance))
+                }
+                if ($over -ne '') { $why = $over.TrimStart(';').Trim() }
+            }
+            if ($why -eq '') { continue }
+            $relL = $rect.L - $origin.X
+            $relT = $rect.T - $origin.Y
+            $text = '{0,-22} {1,-16} ({2},{3}) {4}x{5}  ' -f $cls.ToString(), ('"' + $label + '"'), $relL, $relT, $w, $h
+            [void]$violations.Add(($text + $why))
+        }
+    }
+    return @{ Checked = $checked; Violations = $violations }
 }
 
 function Stop-AppProcess($proc) {
@@ -580,6 +819,49 @@ function Invoke-Smoke {
                     $center.Ink, $MinCenterInkPixels, $Shot)
                 return 9
             }
+        }
+
+        # --- обход всех страниц: раскладка каждой (ключ -AllPages) --------------
+        # Стоит ПОСЛЕ проверок чернил: они смотрят на стартовую страницу, и
+        # их отказ не должен мешать обходу поставить свой, более точный.
+        if ($AllPages) {
+            $walkHost = Find-ContentHost $hwnd $rect
+            if (-not $walkHost.Found) {
+                Write-Host '[ui] ПРОВАЛ: обход страниц — окно содержимого не найдено'
+                return 9
+            }
+            $walk = New-Object System.Collections.ArrayList
+            $script:contentHwnd = $walkHost.Hwnd
+            $script:brokenPages = New-Object System.Collections.ArrayList
+            for ($index = 0; $index -lt $script:pages.Count; $index++) {
+                $page = $script:pages[$index]
+                $state = Switch-AppPage $hwnd $script:contentHwnd $page
+                if (-not $state.Ok) {
+                    Write-Host ("[ui] ПРОВАЛ: не удалось открыть страницу {0} за {1} попыток (последняя видимая: {2}) — обход не состоялся, раскладка не проверена" -f $page.Name, $state.Tries, $state.Visible)
+                    return 11
+                }
+                [void][MrWin]::RedrawWindow($hwnd, [IntPtr]::Zero, [IntPtr]::Zero, $script:redrawAll)
+                [void][MrWin]::UpdateWindow($hwnd)
+                Start-Sleep -Milliseconds $PageSettleMilliseconds
+                $layout = Measure-PageLayout $script:contentHwnd $LayoutTolerance
+                $pageShot = "$($Shot -replace '\.[^.]+$', '')-p$($index + 1)-$($page.Name)$([IO.Path]::GetExtension($Shot))"
+                [void](Save-WindowShot $hwnd $rect $pageShot)
+                Write-Host ("[ui] страница {0} (Ctrl+{1}, попыток {2}): проверено видимых элементов {3}, нарушений {4}; снимок {5}" -f `
+                    $page.Name, ($index + 1), $state.Tries, $layout.Checked, $layout.Violations.Count, $pageShot)
+                if ($layout.Violations.Count -gt 0) {
+                    [void]$script:brokenPages.Add($page.Name)
+                    foreach ($line in $layout.Violations) {
+                        [void]$walk.Add("  [$($page.Name)] $line")
+                    }
+                }
+            }
+            if ($script:brokenPages.Count -gt 0) {
+                Write-Host "[ui] ПРОВАЛ: сломана раскладка на страницах: $($script:brokenPages -join ', ')"
+                foreach ($line in $walk) { Write-Host $line }
+                Write-Host ("[ui] Хост содержимого: клиентская область {0}x{1}, окно содержимого {2}x{3}" -f $walkHost.W, $walkHost.H, $cw, $ch)
+                return 10
+            }
+            Write-Host '[ui] раскладка всех пяти страниц в порядке'
         }
 
         Write-Host "[ui] окно нарисовало содержимое. Снимок: $Shot"

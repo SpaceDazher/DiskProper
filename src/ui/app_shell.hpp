@@ -347,8 +347,11 @@ protected:
     virtual bool onCloseRequested(CloseReason /*reason*/) { return true; }
 
     // Последний вызов перед PostQuitMessage: сброс ресурсов, которые живут дольше
-    // окна. Исключения здесь ловятся и не мешают выходу из цикла.
-    virtual void onShutdown() {}
+    // окна. Исключения здесь ловятся и не мешают выходу из цикла. Каркас
+    // реализует его целиком (тело в .cpp): здесь ещё живы экраны, и он
+    // сохраняет состояние интерфейса (§4 FR-9), пока модель настроек ещё
+    // отвечает на вопросы.
+    virtual void onShutdown() noexcept;
 
 private:
     // Обработчики, разложенные по сообщениям. Каждый — с одной темой, чтобы
@@ -398,6 +401,23 @@ private:
     [[nodiscard]] std::wstring railShortcutHint(PageId page) const;
     static void fillWithColor(HDC dc, const RECT& rect, const theme::Color& color) noexcept;
 
+    // --- Настройки интерфейса между запусками (SPEC §4 FR-9) -----------------
+    //
+    // Три вызова на всё: прочитать (конструктор), применить (mountScreens) и
+    // сохранить (onShutdown). Хранилище — плоское «ключ → значение»
+    // NavStateStore, то же самое, что у навигации и модели настроек, поэтому
+    // чужие форматы в приложении не заводятся.
+    void restoreUiState() noexcept;
+    void saveUiState() noexcept;
+    // Язык ко всему интерфейсу: каталог строк, запасные подписи рельса, тема
+    // экранов и их содержимое. Одна точка, потому что «переключился только
+    // каталог» — это как раз тот молчаливый отказ, который даёт снимки ru и en
+    // побайтово равными.
+    void applyInterfaceLanguage(core::Language language) noexcept;
+    // Положение окна из сохранённых настроек: применяется до первого ShowWindow,
+    // иначе окно мелькнёт в дефолтном месте и уедет уже показанным.
+    void restoreSavedPlacement(HWND window) noexcept;
+
     // Служебное.
     void layoutContentHost() noexcept;
     // Применить тёмный режим окна с защитой от реентерабельности. Отдельный
@@ -416,11 +436,19 @@ private:
     [[nodiscard]] static DpiAwarenessMode fromAwareness(DPI_AWARENESS awareness) noexcept;
 
     Options options_;
+    // Прочитанное при старте состояние. Живёт до конца сеанса целиком: и
+    // положение окна, и язык нужны в разные моменты (до показа окна и после
+    // создания экранов), а перечитывать хранилище дважды — значит получить два
+    // разных ответа на один вопрос.
+    NavStateStore savedState_{};
     HINSTANCE instance_{nullptr};
     HWND mainWindow_{nullptr};
     HWND contentHost_{nullptr};
     DpiScale dpi_{};
     DpiAwarenessMode awareness_{DpiAwarenessMode::unknown};
+    // Положение окна из прошлого запуска. Заполняется при чтении настроек и
+    // применяется один раз — до первого ShowWindow.
+    WINDOWPLACEMENT settingsPlacement_{};
     WINDOWPLACEMENT lastPlacement_{};
     bool closeRequested_{false};
     bool classesRegistered_{false};

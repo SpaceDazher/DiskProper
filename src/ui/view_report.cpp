@@ -1474,6 +1474,287 @@ PageState ReportViewModel::pageState() const {
 }
 
 // ---------------------------------------------------------------------------
+// Раскладка (чистая арифметика: метрики, DPI, размеры клиента и ширины подписей)
+// ---------------------------------------------------------------------------
+//
+// Порядок решения задачи тот же, что у CleanupLayout в view_cleanup.cpp, и
+// порядок жертв тоже: сначала сжимаются отступы и зазоры, потом высота кнопки —
+// последней и только если клиент меньше минимальной раскладки; ширина кнопки до
+// минимума нажатия не падает никогда, потому что вместо цели нажатия у экрана
+// не осталось бы ничего. Единственное отличие в политике: строки нижнего ряда
+// выровнены по левому краю и имеют ширину по подписи, а не делят строку поровну,
+// как на «Очистке». Подписи экспорта разной длины («Экспорт в HTML» против
+// «Обновить»), и растянутая до общей ячейки кнопка выглядит панелью, которой
+// нет.
+
+// Прямоугольник непустой и ни в чём не вышел за клиент. Именно это обещание
+// раскладки проверяют ворота окна, поэтому оно выражено функцией, а не
+// «рассуждением в комментарии».
+bool ReportRect::empty() const noexcept { return width <= 0 || height <= 0; }
+
+int ReportLayout::rowWidth(const std::array<int, kReportBottomControls>& widths, int gap, int from,
+                           int to) noexcept {
+    if (from < 0 || to > static_cast<int>(kReportBottomControls) || from >= to) return 0;
+    int used = 0;
+    for (int i = from; i < to; ++i) {
+        used += widths[static_cast<std::size_t>(i)];
+        if (i > from) used += gap;
+    }
+    return used;
+}
+
+bool ReportLayout::rowFits(const std::array<int, kReportBottomControls>& widths, int gap, int available,
+                           int from, int to) noexcept {
+    return rowWidth(widths, gap, from, to) > 0 && rowWidth(widths, gap, from, to) <= available;
+}
+
+int ReportLayout::packRows(const std::array<int, kReportBottomControls>& widths, int gap, int available,
+                           int& split) noexcept {
+    const int count = static_cast<int>(kReportBottomControls);
+    if (available <= 0 || gap < 0) return 0;
+    // Одна строка: все семь контролов в ряд.
+    if (rowFits(widths, gap, available, 0, count)) {
+        split = count;
+        return 1;
+    }
+    // Две строки: разрез перебирается целиком и берётся тот, где шире строка
+    // меньше. Жадная укладка («набил первую строку до упора») оставила бы одну
+    // строку из шести контролов и одинокую галочку внизу; минимум максимума
+    // кладёт ряд ровнее и держит обе галочки рядом, когда они одинаковые.
+    int best = 0;
+    int bestWidest = 0;
+    for (int cut = 1; cut < count; ++cut) {
+        const int first = rowWidth(widths, gap, 0, cut);
+        const int second = rowWidth(widths, gap, cut, count);
+        if (first <= 0 || second <= 0) continue;
+        if (first > available || second > available) continue;
+        const int widest = std::max(first, second);
+        if (best == 0 || widest < bestWidest) {
+            best = cut;
+            bestWidest = widest;
+        }
+    }
+    if (best != 0) {
+        split = best;
+        return 2;
+    }
+    split = 0;
+    return 0;
+}
+
+void ReportLayout::clampRow(std::array<int, kReportBottomControls>& widths, int count, int from, int gap,
+                            int available) {
+    if (count <= 0 || from < 0 || from + count > static_cast<int>(kReportBottomControls)) return;
+    if (available <= 0) {
+        for (int i = 0; i < count; ++i) widths[static_cast<std::size_t>(from + i)] = 0;
+        return;
+    }
+    int total = 0;
+    for (int i = 0; i < count; ++i) total += widths[static_cast<std::size_t>(from + i)];
+    const int want = total + gap * (count - 1);
+    if (want <= available) return;
+    // Деление по остатку: доли от деления могут дать на 1…count-1 меньше, чем
+    // бюджет, и «добавим остаток последней кнопке» выкинуло бы её за край.
+    const int budget = std::max(0, available - gap * (count - 1));
+    int assigned = 0;
+    std::array<int, kReportBottomControls> shares{};  // остаток доли по индексу
+    for (int i = 0; i < count; ++i) {
+        const long long numerator =
+            static_cast<long long>(widths[static_cast<std::size_t>(from + i)]) * budget;
+        const int share = static_cast<int>(numerator / std::max(1, total));
+        widths[static_cast<std::size_t>(from + i)] = share;
+        shares[static_cast<std::size_t>(from + i)] = static_cast<int>(numerator % std::max(1, total));
+        assigned += share;
+    }
+    std::array<int, kReportBottomControls> order{};
+    for (int i = 0; i < count; ++i) order[static_cast<std::size_t>(i)] = from + i;
+    std::stable_sort(order.begin(), order.begin() + count, [&shares](int a, int b) {
+        return shares[static_cast<std::size_t>(a)] > shares[static_cast<std::size_t>(b)];
+    });
+    int extra = budget - assigned;
+    for (int i = 0; i < count && extra > 0; ++i) {
+        widths[static_cast<std::size_t>(order[static_cast<std::size_t>(i)])] += 1;
+        --extra;
+    }
+}
+
+ReportLayout ReportLayout::compute(const ReportMetrics& metrics, int dpi, int clientWidthPx, int clientHeightPx,
+                                   int cardHeightDip, const std::array<int, kReportBottomControls>& natural) {
+    ReportLayout out;
+    out.width_ = std::max(0, clientWidthPx);
+    out.height_ = std::max(0, clientHeightPx);
+    const int count = static_cast<int>(kReportBottomControls);
+    const theme::Metrics scale = theme::metricsForDpi(dpi > 0 ? static_cast<unsigned>(dpi) : 96);
+    const auto px = [&scale](double dip) { return dip <= 0.0 ? 0 : scale.dip(dip); };
+
+    out.cramped_ = out.width_ < px(metrics.minWidthDip) || out.height_ < px(metrics.minHeightDip);
+
+    // Отступы и зазоры сжимаются первыми: в тесном окне воздух вокруг кнопки
+    // важнее самой кнопки, и он ужимается вместе с остальным.
+    out.padding_ = std::clamp(px(metrics.paddingDip), 0, out.width_ / 4);
+    const int available = std::max(0, out.width_ - 2 * out.padding_);
+    out.gap_ = std::clamp(px(metrics.gapDip), 0, std::max(0, available / (2 * count)));
+
+    const int minWidth = std::max(1, px(metrics.minButtonWidthDip));
+    std::array<int, kReportBottomControls> widths{};
+    for (int i = 0; i < count; ++i) {
+        // Подпись короче минимума нажатия — это не подпись, а полоса: такой
+        // контрол всё равно получил бы минимум при раскладке.
+        widths[static_cast<std::size_t>(i)] = std::max(minWidth, natural[static_cast<std::size_t>(i)]);
+    }
+
+    int split = 0;
+    int rows = packRows(widths, out.gap_, available, split);
+    if (rows == 0) {
+        // Ни одна строка не помещается даже в две. Сжимаем пропорционально и
+        // ищем наибольшую долю подписей, при которой ряд влезает: доля
+        // монотонна (ужимаем — влезает всё больше), поэтому достаточно
+        // деления отрезка пополам, а не перебора шагами.
+        std::array<int, kReportBottomControls> best{};
+        double low = 0.0;
+        double high = 1.0;
+        std::array<int, kReportBottomControls> probe{};
+        const auto scaled = [&](double factor, std::array<int, kReportBottomControls>& into) {
+            for (int i = 0; i < count; ++i) {
+                const double wanted = static_cast<double>(std::max(0, natural[static_cast<std::size_t>(i)])) * factor;
+                into[static_cast<std::size_t>(i)] = std::max(minWidth, static_cast<int>(wanted + 0.5));
+            }
+        };
+        for (int step = 0; step < 16; ++step) {
+            const double middle = (low + high) / 2.0;
+            scaled(middle, probe);
+            int cut = 0;
+            if (packRows(probe, out.gap_, available, cut) != 0) {
+                low = middle;
+                best = probe;
+            } else {
+                high = middle;
+            }
+        }
+        if (low > 0.0) {
+            widths = best;
+            rows = packRows(widths, out.gap_, available, split);
+        }
+    }
+    if (rows == 0) {
+        // Даже минимумы нажатия шире строки. Тогда ряд всё равно раскладывается в
+        // две строки, но ширины делятся жёстко: цель нажатия остаётся на месте,
+        // подпись обрезается, и — главное — ничего не выходит за клиент.
+        out.squeezed_ = true;
+        int bestCut = 0;
+        int bestWidest = 0;
+        for (int cut = 1; cut < count; ++cut) {
+            std::array<int, kReportBottomControls> candidate = widths;
+            clampRow(candidate, cut, 0, out.gap_, available);
+            clampRow(candidate, count - cut, cut, out.gap_, available);
+            const int widest = std::max(rowWidth(candidate, out.gap_, 0, cut),
+                                        rowWidth(candidate, out.gap_, cut, count));
+            if (bestCut == 0 || widest < bestWidest) {
+                bestCut = cut;
+                bestWidest = widest;
+                widths = candidate;
+            }
+        }
+        split = bestCut;
+        rows = 2;
+    }
+    out.rows_ = std::max(1, rows);
+    out.split_ = std::clamp(split, 1, count - 1);
+
+    // Высота: ряд прижат к низу клиента и не наезжает на строку состояния.
+    // Места в клиенте может не хватить — тогда ужимается высота кнопки, и
+    // только когда и её не хватает, ряд скрывается целиком (пустой
+    // прямоугольник — это «спрятать»). Прямоугольники при этом остаются
+    // неотрицательными и внутри клиента.
+    const int minButtonHeight = std::max(1, px(kMinButtonHeightDip));
+    const int wantedHeight = std::max(0, px(metrics.buttonHeightDip));
+    const int statusWanted = std::max(0, px(metrics.statusHeightDip));
+    // Сверху вниз полос ровно три: список, карточка деталей, строка состояния, и
+    // между ними три зазора — в том числе между строкой состояния и рядом
+    // кнопок. Зазоров было два в первой версии раскладки, и список с карточкой
+    // отдавали рядом недостающий зазор: кнопки нижней строки наезжали на строку
+    // состояния (проверено на окне 900x600: строка 475…495, кнопка 473…501).
+    const int stackGaps = 3 * out.gap_;
+    const int reserve = 2 * out.padding_ + stackGaps + statusWanted;
+    int buttonHeight = wantedHeight;
+    if (out.rows_ * buttonHeight + (out.rows_ - 1) * out.gap_ + reserve > out.height_) {
+        buttonHeight = std::max(0, (out.height_ - reserve - (out.rows_ - 1) * out.gap_) / out.rows_);
+    }
+    out.buttonHeight_ = buttonHeight > 0 ? std::min(buttonHeight, out.height_) : 0;
+    if (out.buttonHeight_ > 0 && out.buttonHeight_ < minButtonHeight) out.buttonHeight_ = minButtonHeight;
+    if (out.buttonHeight_ * out.rows_ + (out.rows_ - 1) * out.gap_ + reserve > out.height_) out.rows_ = 0;
+
+    const int bandHeight = out.rows_ * out.buttonHeight_ + std::max(0, out.rows_ - 1) * out.gap_;
+    // Когда ряд скрыт, зазор над ним не нужен: иначе пустая полоса съела бы
+    // высоту списка в окне, которое и так ниже минимального.
+    const int gaps = bandHeight > 0 ? stackGaps : 2 * out.gap_;
+    const int budget = std::max(0, out.height_ - 2 * out.padding_ - gaps - bandHeight);
+    const int statusHeight = std::min(statusWanted, budget);
+    int free = std::max(0, budget - statusHeight);
+
+    // Карточка деталей уступает место журналу: если строк мало, карточка всё
+    // равно показывает одну выделенную строку, а журнал без строк — пустой
+    // список. Порядок «сначала карточка, потом список» сохранён, но список
+    // получает минимум первым.
+    const int minCard = std::max(0, px(metrics.minCardHeightDip));
+    const int minList = std::max(0, px(metrics.minListHeightDip));
+    int cardHeight = std::min(std::max(minCard, px(static_cast<double>(std::max(0, cardHeightDip)))),
+                              std::max(minCard, free));
+    int listHeight = std::max(0, free - cardHeight);
+    if (listHeight < minList && cardHeight > 0) {
+        const int give = std::min(cardHeight, minList - listHeight);
+        cardHeight -= give;
+        listHeight += give;
+    }
+
+    int cursor = out.padding_;
+    out.list_ = ReportRect{out.padding_, cursor, available, listHeight};
+    cursor += listHeight + out.gap_;
+    out.card_ = ReportRect{out.padding_, cursor, available, cardHeight};
+    cursor += cardHeight + out.gap_;
+    out.status_ = ReportRect{out.padding_, cursor, available, statusHeight};
+    cursor += statusHeight + out.gap_;
+
+    // Ряд кнопок прижат к низу клиента: его верхняя граница равна ровно
+    // cursor — сумма полос выше плюс три зазора плюс отступ, — и совпадает с
+    // height_ - padding_ - bandHeight, потому что список забрал ровно остаток
+    // бюджета. Нижняя строка поэтому начинается с cursor + bandHeight - height и
+    // идёт вверх: каждая выше на кнопку и зазор. Правый край любой кнопки не
+    // превышает available по построению (packRows/clampRow), поэтому вылет за
+    // правый край клиента невозможен ни при какой ширине и любом языке.
+    int rowTop = cursor + bandHeight;
+    for (int row = out.rows_ - 1; row >= 0; --row) {
+        rowTop -= out.buttonHeight_;
+        const int from = (row == 0) ? 0 : out.split_;
+        const int to = (row == 0) ? out.split_ : count;
+        int x = out.padding_;
+        for (int i = from; i < to; ++i) {
+            out.children_[static_cast<std::size_t>(i)] =
+                ReportRect{x, rowTop, widths[static_cast<std::size_t>(i)], out.buttonHeight_};
+            x += widths[static_cast<std::size_t>(i)] + out.gap_;
+        }
+        if (row > 0) rowTop -= out.gap_;
+    }
+    return out;
+}
+
+ReportRect ReportLayout::listRect() const noexcept { return list_; }
+ReportRect ReportLayout::statusRect() const noexcept { return status_; }
+ReportRect ReportLayout::cardRect() const noexcept { return card_; }
+
+ReportRect ReportLayout::childRect(int index) const noexcept {
+    if (index < 0 || index >= static_cast<int>(kReportBottomControls)) return ReportRect{};
+    return children_[static_cast<std::size_t>(index)];
+}
+
+int ReportLayout::rows() const noexcept { return rows_; }
+bool ReportLayout::squeezed() const noexcept { return squeezed_; }
+bool ReportLayout::cramped() const noexcept { return cramped_; }
+int ReportLayout::paddingPx() const noexcept { return padding_; }
+int ReportLayout::clientWidthPx() const noexcept { return width_; }
+int ReportLayout::clientHeightPx() const noexcept { return height_; }
+
+// ---------------------------------------------------------------------------
 // Хранилище отчётов (FR-8: «%LOCALAPPDATA%\MrProper\reports\, последние 20»)
 // ---------------------------------------------------------------------------
 
@@ -1774,6 +2055,10 @@ struct ViewState {
     ReportScreen::Callbacks callbacks;
     ReportViewModel model;
     theme::Theme theme;
+    // Раскладка живёт в метриках экрана, а не в константах layout(): на неё
+    // смотрят и шрифты (высота строки), и ворота окна. Значения по умолчанию
+    // те же, что были константами до выделения раскладки.
+    ReportMetrics metrics;
     int dpi{96};
 
     HWND window{nullptr};
@@ -1842,6 +2127,20 @@ struct ViewState {
         ::ShowWindow(child, SW_SHOW);
     }
 
+    // Тот же place для прямоугольника раскладки. Отдельная функция, а не перевод
+    // в RECT на месте вызова: у раскладки своя геометрия (x/y/width/height), и
+    // пересчитывать её вручную в семи местах — это семь chances забыть одно
+    // поле. Пустой прямоугольник раскладки означает «спрятать» ровно так же,
+    // как пустой RECT.
+    void placeRect(HWND child, const ReportRect& rect, bool visible) {
+        if (child == nullptr) return;
+        if (!visible || rect.empty()) {
+            ::ShowWindow(child, SW_HIDE);
+            return;
+        }
+        place(child, RECT{rect.x, rect.y, rect.right(), rect.bottom()}, true);
+    }
+
     // Прямоугольник, вписанный в другой на отступ. Пустой прямоугольник в place()
     // означает «спрятать», поэтому пустота отступа должна быть явно отрицательной,
     // а не «нулевой».
@@ -1860,7 +2159,7 @@ struct ViewState {
     int buttonWidth(HWND button, int fallback) const {
         if (button == nullptr) return fallback;
         const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
-        const int pad = scale.dip(20.0);
+        const int pad = scale.dip(metrics.buttonTextPadDip);
         HDC dc = ::GetDC(button);
         if (dc == nullptr) return fallback;
         const int length = ::GetWindowTextLengthW(button);
@@ -1884,69 +2183,53 @@ struct ViewState {
         RECT client{};
         if (::GetClientRect(window, &client) == FALSE) return;
         const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
-        const int gap = std::max(2, scale.dip(6.0));
-        const int outer = std::max(2, scale.dip(8.0));
-        const int buttonHeight = std::max(16, scale.dip(28.0));
-        const int statusHeight = std::max(12, scale.dip(20.0));
-
-        // Карточка деталей: высота из модели (PageState переживает уход на другую
-        // страницу), но не больше половины окна — иначе на неё не остаётся
-        // места журналу, ради которого экран и открыт.
         const int clientWidth = static_cast<int>(client.right) - static_cast<int>(client.left);
         const int clientHeight = static_cast<int>(client.bottom) - static_cast<int>(client.top);
-        const int cardHeight = std::min(std::max(scale.dip(model.cardHeightDip()), scale.dip(72.0)),
-                                        std::max(scale.dip(72.0), clientHeight / 2));
-        const int bottom = clientHeight - outer;
-        const int buttonsTop = bottom - buttonHeight;
-        const int statusTop = buttonsTop - gap - statusHeight;
-        const int cardTop = statusTop - gap - cardHeight;
 
-        RECT listRect{outer, outer, clientWidth - outer, std::max(outer, cardTop - gap)};
-        RECT statusRect{outer, statusTop, clientWidth - outer, statusTop + statusHeight};
-        RECT cardRect{outer, cardTop, clientWidth - outer, cardTop + cardHeight};
-        place(list, listRect, true);
-        place(status, statusRect, true);
-        place(card, cardRect, true);
+        // Ширина подписи — единственное, что здесь меряется шрифтом (нужен
+        // HWND). Дальше считает чистая раскладка, как на «Очистке»: она
+        // переносит ряд на две строки, сжимает пропорционально и не даёт ни
+        // одной кнопке выйти за клиент ни при какой ширине, языке и DPI.
+        std::array<int, kReportBottomControls> natural{};
+        for (std::size_t i = 0; i < buttons.size(); ++i) {
+            natural[i] = buttonWidth(buttons[i], scale.dip(120.0));
+        }
+        for (std::size_t i = 0; i < checks.size(); ++i) {
+            natural[buttons.size() + i] = buttonWidth(checks[i], scale.dip(150.0));
+        }
+        const ReportLayout layout = ReportLayout::compute(metrics, dpi, clientWidth, clientHeight,
+                                                          model.cardHeightDip(), natural);
+
+        placeRect(list, layout.listRect(), true);
+        placeRect(status, layout.statusRect(), true);
+        placeRect(card, layout.cardRect(), true);
         // Пояснение живёт поверх списка ровно тогда, когда строк нет. Поверх, а
         // не вместо: список остаётся на месте и наполняется, когда приходят
         // строки, — вёрстка не прыгает при первом же событии журнала.
         const bool rows = model.rowCount() > 0;
-        place(hint, rows ? RECT{} : insetRect(listRect, outer), !rows);
+        const ReportRect journal = layout.listRect();
+        const RECT listRect{journal.x, journal.y, journal.right(), journal.bottom()};
+        place(hint, rows ? RECT{} : insetRect(listRect, layout.paddingPx()), !rows);
         if (!rows) ::SetWindowPos(hint, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
-        // Ряд кнопок и галочек: сначала считаем нужную ширину по подписи, потом,
-        // если не влезает, сжимаем пропорционально. Молча обрезанная подпись
-        // хуже узкой кнопки, но и «многоточие на всех» — не подарок, поэтому при
-        // нехватке места пишем в журнал один раз, а не на каждое событие
-        // WM_SIZE (их при перетаскивании окна сотни).
-        std::array<int, 7> widths{};
-        int total = 0;
         for (std::size_t i = 0; i < buttons.size(); ++i) {
-            widths[i] = buttonWidth(buttons[i], scale.dip(120.0));
-            total += widths[i] + gap;
+            placeRect(buttons[i], layout.childRect(static_cast<int>(i)), true);
         }
         for (std::size_t i = 0; i < checks.size(); ++i) {
-            widths[buttons.size() + i] = buttonWidth(checks[i], scale.dip(150.0));
-            total += widths[buttons.size() + i] + gap;
+            placeRect(checks[i], layout.childRect(static_cast<int>(buttons.size() + i)), true);
         }
-        const int available = clientWidth - outer * 2;
-        if (total > available && total > 0) {
-            for (std::size_t i = 0; i < widths.size(); ++i) {
-                widths[i] = std::max(scale.dip(56.0), widths[i] * available / total);
+
+        // Перенос на вторую строку — это не авария: он молчалив и не пишет в
+        // журнал. А вот сжатие до минимума, где подпись уже обрезана, — да:
+        // человек должен знать, почему «Экспорт в HTML» стал «Экспорт в…».
+        // Одно сообщение на переход, а не на каждый WM_SIZE (их при
+        // перетаскивании окна сотни).
+        if (layout.squeezed() != squeezeLogged) {
+            squeezeLogged = layout.squeezed();
+            if (squeezeLogged) {
+                logEvent(core::LogLevel::Warn, "ui.report.layout",
+                         "bottom row labels squeezed to minimum width");
             }
-            if (!squeezeLogged) {
-                squeezeLogged = true;
-                logEvent(core::LogLevel::Warn, "ui.report.layout", "button row does not fit, widths squeezed");
-            }
-        } else {
-            squeezeLogged = false;
-        }
-        int x = outer;
-        for (std::size_t i = 0; i < widths.size(); ++i) {
-            RECT buttonRect{x, buttonsTop, x + widths[i], buttonsTop + buttonHeight};
-            const HWND child = i < buttons.size() ? buttons[i] : checks[i - buttons.size()];
-            place(child, buttonRect, true);
-            x += widths[i] + gap;
         }
     }
 

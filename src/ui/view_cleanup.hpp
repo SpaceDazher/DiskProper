@@ -251,17 +251,46 @@ struct CleanupProgress {
 // Метрики экрана в DIP (1/96 дюйма). Per-monitor v2 (§5) меняет pixelsPerDip,
 // но не размеры элементов, поэтому вёрстка не знает про DPI.
 struct CleanupMetrics {
-    double summaryHeightDip{84.0};    // три цифры + подпись «по аллоцированному размеру»
+    // Панель агрегатов (§7.2 «большая цифра сверху»): четыре строки, первая
+    // нарисована крупным шрифтом, остальные три — пояснения под ней. Высота
+    // панели НЕ задана числом: она складывается из высоты строк, потому что
+    // раньше панель была фиксированных 84 DIP, четыре строки делили её поровну
+    // (по 18 px) и крупная цифра не помещалась в свою строку — заголовок
+    // «Будет освобождено» рисовался срезанным сверху (дефект M1, измерен на
+    // снимке окна). Высоты строк ViewState проставляет из настоящих шрифтов
+    // (GetTextMetrics по созданному HFONT), поэтому при масштабе текста
+    // Windows 125-200 % панель растёт вместе со шрифтом, а не режет его.
+    double summaryPaddingDip{8.0};
+    double metricLineHeightDip{38.0}; // строка крупной цифры (кегль Metric 32 DIP)
+    double bodyLineHeightDip{17.0};   // строка пояснения (кегль Body 14 DIP)
+
     double progressHeightDip{20.0};   // полоса прогресса и её подпись
     double detailsHeightDip{48.0};    // объяснение и «занято процессами» (§7.2)
-    double toolbarHeightDip{48.0};    // две строки кнопок по 24 DIP
     double dryRunHeightDip{220.0};    // таблица точного списка операций
     double paddingDip{8.0};
     double gapDip{6.0};
     double minTreeHeightDip{120.0};
     double minWidthDip{520.0};
     double minHeightDip{300.0};
+
+    // Нижние кнопки. Две строки по четыре/три кнопки, прижатые к низу.
+    // buttonHeightDip — минимум для нажатия (§7.2, доступность): системная
+    // кнопка в Windows имеет высоту 23 px при 96 DPI, и ниже этой отметки
+    // цель нажатия становится неприятной; при масштабе текста высота обязана
+    // расти вместе с подписью. Как и высоты строк панели, значение
+    // проставляется из шрифта: max(минимум, шрифт + отступы).
+    double buttonHeightDip{32.0};
+    double buttonGapDip{6.0};        // зазор между строками и между кнопками
+    double toolbarPaddingDip{8.0};   // отступ строки от края окна
+
+    [[nodiscard]] double summaryHeightDip() const noexcept;
+    [[nodiscard]] double toolbarHeightDip() const noexcept;
 };
+
+// Нижняя граница кнопки, ниже которой нажимать нельзя: высота системной
+// кнопки в Windows (23 px при 96 DPI) плюс запас. В DIP, чтобы не плодить
+// копию этой константы в .cpp.
+inline constexpr double kMinButtonHeightDip = 32.0;
 
 // Прямоугольник в пикселях клиентской области. Правая и нижняя границы не
 // включаются: соседние прямоугольники делят область без зазора и без двойного
@@ -348,6 +377,13 @@ private:
     int treeBottom_{0};
     int detailsTop_{0};
     int dryRunTop_{0};
+    // Геометрия кнопок внутри строки инструментов. Держится отдельно от
+    // toolbar_, потому что строка — это полоса с отступами, а кнопка — цель
+    // нажатия: их высоты равны только по ошибке, и именно из этого равенства
+    // кнопки второй строки вылезали за нижний край клиента (дефект M1).
+    int buttonHeight_{0};
+    int buttonGap_{0};
+    int toolbarPad_{0};
     bool dryRunVisible_{false};
     bool cramped_{false};
 
@@ -356,7 +392,11 @@ private:
     // HWND (как RailLayout в nav).
     [[nodiscard]] static int gapPx(int rowHeight) noexcept;
     [[nodiscard]] static CleanupRect buttonInRow(const CleanupRect& row, int index, int count, int gap,
-                                                 int rowTop) noexcept;
+                                                 int rowTop, int rowHeight) noexcept;
+    // Строка кнопок (0 — верхняя, 1 — нижняя) в координатах клиента. Обе строки
+    // лежат внутри toolbarRect() и не накладываются: нижняя ограничена
+    // отступом от нижнего края клиента, верхняя — зазором над ней.
+    [[nodiscard]] CleanupRect buttonRow(int row) const noexcept;
 };
 
 // ---------------------------------------------------------------------------
@@ -737,6 +777,13 @@ struct OverviewSnapshot {
     std::uint64_t totalBytes{};
     std::uint64_t freeBytes{};
     bool inventoryKnown{false};
+    // «Прочитано» и «известен размер» — разные вещи, и различие приходит из
+    // ядра, а не выдумывается экраном: обход \\.\PhysicalDriveN без прав
+    // администратора возвращает пустую карту, и 0 байт в ней означают «диск не
+    // ответил», а не «диск пуст». Те же флаги считает core (usage.freeKnown и
+    // DiskUsage::sizeKnown), и экран «Диски» печатает для них прочерк.
+    bool freeKnown{false};  // есть том и все тома ответили размером
+    bool sizeKnown{false};  // хотя бы один диск ответил своим размером
 
     std::size_t candidates{};
     std::uint64_t reclaimableBytes{};
