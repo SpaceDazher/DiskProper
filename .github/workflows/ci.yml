@@ -6,13 +6,17 @@
 # §9.1 ADR-010 — репозиторий публичный, значит CI на публичных раннерах;
 # §8 Этап 0 — тулчейн это MSVC из состава Visual Studio.
 #
-# Три ворота, три отдельных статуса в статус-баре PR:
-# Четыре ворота, четыре отдельных статуса в статус-баре PR:
+# Пять ворот, пять отдельных статусов в статус-баре PR:
 #   build — матрица Debug, Debug+ASan/UBSan, Release: tools\build.bat, затем
 #           tools\test.bat;
 #   e2e   — сценарии tests\e2e на Pester: тот же tools\build.bat и тот же
 #           ctest, что и локально. Отдельный job, потому что сценариям нужна своя
 #           сборка, своя версия Pester и своё время;
+#   ui-smoke — снимок окна и счёт чернил в клиентской области И в окне
+#           содержимого: tools\ui-smoke.ps1 в двух размерах (1280x720 и
+#           1920x1080) и при 150 % DPI. Обязательные ворота без
+#           continue-on-error: версия, которая «работает» и пуста, обязана
+#           ронять сборку — иначе она вернётся на master;
 #   tidy  — clang-tidy по compile_commands.json, любое замечание = ошибка;
 #   sbom  — CycloneDX-SBOM собранного Release (нужен, чтобы «в чём собрано»
 #           читалось из артефакта, а не из догадок: репозиторий публичный).
@@ -280,6 +284,127 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
           path: build/e2e-artifacts
+
+  ui-smoke:
+    name: ui-smoke (окно не пустое)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      # Собираем ровно то, что собирает человек: без санитайзеров. В Debug с
+      # ASan/UBSan приложение под отладчиком стартует на секунды дольше, а
+      # время SettleSeconds в воротах подобрано под обычный Debug.
+      MRPROPER_SANITIZE: "OFF"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Сборка — tools\build.bat Debug
+        shell: pwsh
+        run: |
+          & cmd /c "tools\build.bat Debug"
+          if ($LASTEXITCODE -ne 0) {
+            throw "tools\build.bat Debug завершился с кодом $LASTEXITCODE"
+          }
+          # Путь к двоику передаётся дальше в -Exe, поэтому печатаем его и его
+          # размер: «ворота упали, потому что запустилось не то» — самая
+          # частая ошибка в смене путей после сборки, и одно число её отсекает.
+          $exe = "build\main\src\ui\Debug\mrproper.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Нет $exe — сборка не дала приложение, а воротам нечего запускать"
+          }
+          $info = Get-Item -LiteralPath $exe
+          Write-Host ("[ui] бинарник {0} байт, собран {1:o}" -f $info.Length, $info.LastWriteTime)
+
+      # Все три раскладки выполняются в одном шаге и решение принимается в
+      # конце. Иначе первая же упавшая прервёт шаг, и разбор увидит один снимок
+      # вместо трёх — а разбирать обычно нужно все: где именно поехала
+      # раскладка, видно только рядом с теми, что не поехали.
+      #
+      # -ThemeMode dark пишет СВОЙ ключ приложения HKCU\Software\MrProper\UI,
+      # а не системную тему: переключать Personalize\AppsUseLightTheme на
+      # раннере нельзя (это настройка машины, и она пережила бы прогон), а
+      # палитра MrProper обязана быть тёмной при любом ключе — это и проверяет
+      # -ExpectBackground dark (код 8 при несовпадении).
+      #
+      # 150 % — это 1280x720 логических пикселей при dpi 144, то есть окно
+      # 1920x1080 физических. Скрипт шлёт WM_DPICHANGED_AFTERPARENT и требует,
+      # чтобы минимум окна вырос в effDpi/96 раз: молчаливый «масштаб не
+      # применился» дал бы зелёные ворота на непроверенной раскладке.
+      #
+      # Прав администратора ворота не требуют: приложение только рисует окно.
+      # Код 5 («окно не создано») на раннере означает, что процесс не смог
+      # создать окно в сеансе 1, а не «нужны права» — тогда это падение ворота,
+      # и замалчивать его continue-on-error нельзя.
+      - name: Снимки окна — ui-smoke.ps1 (1280x720, 1920x1080, 150 % DPI)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # RUNNER_TEMP на раннере есть, но путь с пробелом на конце или пустая
+          # переменная уронили бы Join-Path и оставили бы ворота без снимка —
+          # ровно того доказательства, ради которого они существуют.
+          $shotRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP.Trim() } else { "build\ui-smoke" }
+          New-Item -ItemType Directory -Path $shotRoot -Force | Out-Null
+          $exe = "build\main\src\ui\Debug\mrproper.exe"
+          $log = Join-Path $shotRoot "ui-smoke.log"
+          "=== ui-smoke $(Get-Date -Format o) ===" | Out-File -LiteralPath $log -Encoding utf8
+          $cases = @(
+            @{ Name = "1280x720";  Args = @("-Width", "1280", "-Height", "720") },
+            @{ Name = "1920x1080"; Args = @("-Width", "1920", "-Height", "1080") },
+            @{ Name = "150dpi";     Args = @("-Width", "1280", "-Height", "720", "-DpiPercent", "150") }
+          )
+          $failed = @()
+          foreach ($case in $cases) {
+            $shot = Join-Path $shotRoot ("ui-window-{0}.png" -f $case.Name)
+            "--- $($case.Name): $($case.Args -join ' ') ---" | Out-File -LiteralPath $log -Append -Encoding utf8
+            # Splatting требует имени переменной, а не выражения: @($case.Args)
+            # PowerShell не разворачивает, и скрипт молча ушёл бы в дефолтный
+            # размер окна — то есть все три раскладки стали бы одной.
+            $smokeArgs = $case.Args
+            & powershell -NoProfile -ExecutionPolicy Bypass -File tools\ui-smoke.ps1 `
+                -Exe $exe -Shot $shot -ThemeMode dark -ExpectBackground dark @smokeArgs *>&1 |
+              Tee-Object -Variable output | Out-Null
+            $code = $LASTEXITCODE
+            $output | Out-File -LiteralPath $log -Append -Encoding utf8
+            "код: $code" | Out-File -LiteralPath $log -Append -Encoding utf8
+            if ($code -ne 0) {
+              # Расшифровка кодов повторяет CONTRIBUTING.md, раздел «Ворота
+              # интерфейса»: тот, кто чинит, смотрит снимок и код, а не ищет
+              # по репозиторию, откуда взялось число.
+              $why = switch ($code) {
+                2 { "неверные аргументы" }
+                3 { "окно не приняло размер или DPI" }
+                4 { "клиентская область пустая: только фон" }
+                5 { "окно не создано" }
+                6 { "процесса нет или он упал" }
+                7 { "среда не подготовлена" }
+                8 { "фон не соответствует теме" }
+                9 { "окно содержимого пустое: рельс есть, экрана нет" }
+                default { "неизвестный код" }
+              }
+              Write-Host "[ui] ПРОВАЛ $($case.Name): код $code — $why"
+              $failed += "$($case.Name)=$code"
+            } else {
+              Write-Host "[ui] OK $($case.Name): содержимое нарисовано, снимок $shot"
+            }
+          }
+          "=== сводка: $($failed -join ', ') ===" | Out-File -LiteralPath $log -Append -Encoding utf8
+          if ($failed.Count -gt 0) {
+            throw ("ui-smoke.ps1 не прошёл: {0}. Лог: {1}. Снимки: {2}\ui-window-*.png. Коды: 0 — содержимое есть, 4 — только фон, 5 — окна нет, 6 — упал, 9 — пустое окно содержимого (см. CONTRIBUTING.md)." -f ($failed -join ', '), $log, $shotRoot)
+          }
+
+      # Снимок — часть результата, а не отладка: по нему видно, ЧТО нарисовано,
+      # а по коду — только сколько это весит в пикселях. Артефакт снимается
+      # всегда, включая красный job: именно на падении он и нужен.
+      - name: Снимки окна
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-smoke-shots
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/ui-window-*.png
+            ${{ runner.temp }}/ui-smoke.log
 
   tidy:
     name: clang-tidy

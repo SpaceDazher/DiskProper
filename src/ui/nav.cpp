@@ -524,6 +524,14 @@ void Navigator::setTitleResolver(TitleResolver resolver) {
     bumpRevision();
 }
 
+void Navigator::setPageChangedHandler(PageChangedHandler handler) {
+    // Обработчик не вызывается на установку: подписчик узнаёт о переходах,
+    // которые он сам инициирует, а начальная страница читается через current().
+    // Иначе подписка на «Обзоре» немедленно перерисовала бы окно, которое и
+    // так перерисовывается после создания.
+    pageChanged_ = std::move(handler);
+}
+
 void Navigator::bumpRevision() noexcept {
     ++revision_;
 }

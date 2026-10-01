@@ -14,13 +14,21 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
+#include <cwchar>
 
 #include "core/log.hpp"
+#include "core/rulesync.hpp"
+#include "platform/inventory.hpp"
 
 namespace mrproper::ui::mv {
 namespace {
@@ -116,6 +124,7 @@ const char* eventKindName(EventKind kind) noexcept {
     case EventKind::UndoAvailable: return "UndoAvailable";
     case EventKind::Notice: return "Notice";
     case EventKind::Error: return "Error";
+    case EventKind::RuleSet: return "RuleSet";
     default: break;
     }
     // Неизвестный номер приходит из испорченной памяти или из более новой сборки
@@ -959,6 +968,453 @@ std::string ModelViewBridge::toText() const {
     appendNumber(out, static_cast<std::uint64_t>(impl_->uiThreadId));
     out.append(", наблюдателей ");
     appendNumber(out, static_cast<std::uint64_t>(impl_->observers.size()));
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Стартовая раздача: ScreenEndpoint и StartupFeed
+// ---------------------------------------------------------------------------
+//
+// Проектные решения — в шапке (mv_bridge.hpp). Здесь три вещи, которых нет в
+// мосте самом: очередь кадров у экрана, фоновый поток и чтение набора правил с
+// диска. Мост они не меняют: кадр по-прежнему уходит PostMessage'ом в окно
+// UI-потока, и по-прежнему его исполняет UI-поток.
+namespace {
+
+void feedLog(core::LogLevel level, std::string_view event, std::string_view message) noexcept {
+    core::Logger::instance().write(level, event, message, core::LogFields{});
+}
+
+void feedLogField(core::LogLevel level, std::string_view event, std::string_view message,
+                  std::string_view name, std::string_view value) noexcept {
+    core::LogFields fields;
+    fields.push_back(core::logField(std::string(name), std::string(value)));
+    core::Logger::instance().write(level, event, message, std::move(fields));
+}
+
+// UTF-16 → UTF-8 без суррогатных сюрпризов. Своя обёртка нужна потому, что в
+// файле нет ui::locale (мост не знает про локализацию), а std::filesystem на
+// Windows отдаёт пути в UTF-16.
+std::string toUtf8Path(const std::wstring& wide) {
+    if (wide.empty()) return {};
+    const int needed = ::WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0,
+                                             nullptr, nullptr);
+    if (needed <= 0) return {};
+    std::string utf8(static_cast<std::size_t>(needed), '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), utf8.data(), needed, nullptr,
+                          nullptr);
+    return utf8;
+}
+
+// «NAME=value\n» для подстановки переменных в правила (%LOCALAPPDATA% и подобное
+// внутри locator'ов). Тот же дамп, что у CLI и у rulesync-клиента: свой здесь
+// означал бы, что правило разрешается на экране иначе, чем в отчёте.
+std::string environmentDumpUtf8() {
+    LPWCH block = ::GetEnvironmentStringsW();
+    if (block == nullptr) return {};
+    std::string out;
+    for (const wchar_t* cursor = block; *cursor != L'\0'; cursor += std::wcslen(cursor) + 1u) {
+        const std::wstring_view entry(cursor);
+        // Скрытые переменные вида «=C:=C:\» начинаются с «=» и для правил
+        // бесполезны; пропускаем их, как это делает platform::rulesync_client.
+        const std::size_t equals = entry.find(L'=');
+        if (equals == std::wstring_view::npos || equals == 0) continue;
+        out += toUtf8Path(std::wstring(entry.substr(0, equals)));
+        out.push_back('=');
+        out += toUtf8Path(std::wstring(entry.substr(equals + 1u)));
+        out.push_back('\n');
+    }
+    ::FreeEnvironmentStringsW(block);
+    return out;
+}
+
+// Сколько уровней вверх от каталога экземпляра искать набор правил. Пять с
+// запасом: build\a2\src\ui\Debug (отладочная раскладка) — уже четыре.
+inline constexpr int kRuleSearchLevels = 6;
+
+std::wstring moduleDirectory() {
+    std::wstring buffer(32768, L'\0');
+    const DWORD written = ::GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (written == 0 || written >= buffer.size()) return {};
+    buffer.resize(written);
+    const std::size_t slash = buffer.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return {};
+    return buffer.substr(0, slash);
+}
+
+std::wstring environmentDirectory() {
+    const DWORD written = ::GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+    if (written == 0) return {};
+    std::wstring buffer(written, L'\0');
+    const DWORD filled = ::GetEnvironmentVariableW(L"LOCALAPPDATA", buffer.data(), written);
+    if (filled == 0 || filled >= buffer.size()) return {};
+    buffer.resize(filled);
+    return buffer;
+}
+
+struct RuleLoad {
+    core::RuleSet set;
+    std::string origin;   // каталог, из которого взят набор
+    std::string version;  // версия набора (из манифеста или из правил)
+    std::string problem;  // непусто, если набор не прочитан
+};
+
+// Каталоги, где набор правил может лежать, в порядке убывания правды.
+//
+//   1) %LOCALAPPDATA%\MrProper\rules — сюда rulesync-клиент кладёт обновлённый
+//      набор (ADR-008); если человек обновлял правила, показывать надо их, а не
+//      те, что лежат рядом с программой;
+//   2) <каталог экземпляра>\rules — отладочная и портативная раскладка;
+//   3) вверх по дереву: share\MrProper\rules (установленная раскладка, §8) и
+//      снова rules (репозиторий: build\a2\src\ui\Debug → корень).
+std::vector<std::filesystem::path> ruleSearchPaths() {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> candidates;
+    const std::wstring local = environmentDirectory();
+    if (!local.empty()) candidates.push_back(fs::path(local) / L"MrProper" / L"rules");
+
+    std::wstring dir = moduleDirectory();
+    for (int level = 0; level <= kRuleSearchLevels && !dir.empty(); ++level) {
+        candidates.push_back(fs::path(dir) / L"rules");
+        candidates.push_back(fs::path(dir) / L"share" / L"MrProper" / L"rules");
+        const std::size_t slash = dir.find_last_of(L"\\/");
+        if (slash == std::wstring::npos) break;
+        dir = dir.substr(0, slash);
+    }
+    return candidates;
+}
+
+// Сколько *.json в каталоге. Ноль — каталога нет или набора в нём нет.
+std::size_t countRuleFiles(const std::filesystem::path& directory) {
+    namespace fs = std::filesystem;
+    std::error_code code;
+    if (!fs::is_directory(directory, code)) return 0;
+    std::size_t count = 0;
+    for (fs::directory_iterator it(directory, code), end; !code && it != end; it.increment(code)) {
+        if (!it->is_regular_file(code)) continue;
+        if (it->path().extension() == L".json") ++count;
+    }
+    return count;
+}
+
+// Чтение набора тем же способом, что и CLI (cmd_scan.cpp loadRuleSetFromDirectory):
+// порядок файлов фиксирован сортировкой, манифест опознаётся разбором, а не
+// именем. Свой разбор здесь означал бы, что экран «Настройки» и отчёт считают
+// разные правила (§11.4 — цифры и правила на всех поверхностях одни).
+RuleLoad loadRuleSetFromDisk() {
+    namespace fs = std::filesystem;
+    RuleLoad out;
+    std::vector<fs::path> files;
+    for (const fs::path& candidate : ruleSearchPaths()) {
+        if (countRuleFiles(candidate) == 0) continue;
+        std::error_code code;
+        for (fs::directory_iterator it(candidate, code), end; !code && it != end; it.increment(code)) {
+            if (it->is_regular_file(code) && it->path().extension() == L".json") files.push_back(it->path());
+        }
+        out.origin = toUtf8Path(candidate.wstring());
+        break;
+    }
+    if (out.origin.empty()) {
+        out.problem = "каталог набора правил не найден (искали рядом с программой и в %LOCALAPPDATA%)";
+        return out;
+    }
+
+    std::sort(files.begin(), files.end());
+    std::vector<std::pair<std::string, std::string>> texts;
+    texts.reserve(files.size());
+    for (const fs::path& path : files) {
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream) {
+            out.problem = "файл правил не читается: " + toUtf8Path(path.wstring());
+            return out;
+        }
+        std::ostringstream buffer;
+        buffer << stream.rdbuf();
+        const std::string text = buffer.str();
+        const std::string name = toUtf8Path(path.filename().wstring());
+        try {
+            out.version = core::parseRuleSetManifest(text, name).version;
+            continue;  // манифест, а не правило
+        } catch (const core::RuleSyncError&) {
+            // Не манифест: пойдёт в набор, разберётся загрузчик.
+        }
+        texts.emplace_back(name, text);
+    }
+    if (texts.empty()) {
+        out.problem = "в каталоге набора нет ни одного файла правил";
+        return out;
+    }
+
+    try {
+        out.set = core::loadRuleFiles(texts, environmentDumpUtf8(), nullptr);
+        core::validateRuleSet(out.set);
+    } catch (const std::exception& failure) {
+        out.problem = failure.what();
+        return out;
+    }
+    if (out.version.empty()) out.version = out.set.version;
+    return out;
+}
+
+}  // namespace
+
+// --- ScreenEndpoint ---------------------------------------------------------
+
+ScreenEndpoint::ScreenEndpoint(void* window, std::uint32_t message) noexcept
+    : window_(window), message_(message) {}
+
+ScreenEndpoint::~ScreenEndpoint() = default;
+
+bool ScreenEndpoint::take(Event& out) {
+    if (window_ == nullptr) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (queue_.empty()) return false;
+    out = std::move(queue_.front());
+    queue_.erase(queue_.begin());
+    return true;
+}
+
+std::uint64_t ScreenEndpoint::received() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return received_;
+}
+
+std::uint64_t ScreenEndpoint::lost() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return lost_;
+}
+
+void ScreenEndpoint::onFrame(const Event& event) {
+    // Кадр кладём в очередь ДО PostMessage: иначе сообщение может обработаться
+    // раньше, чем кадр окажется в очереди, и экран показал бы старое состояние.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++received_;
+        // Больше двух кадров ждать бессмысленно: показывается последний, а
+        // переполнение очереди — это уже признак того, что экран не читает
+        // кадры вообще (лог об этом скажет).
+        if (queue_.size() >= 8) {
+            queue_.erase(queue_.begin());
+            ++lost_;
+        }
+        queue_.push_back(event);
+    }
+    if (window_ == nullptr) return;
+    if (::PostMessageW(static_cast<HWND>(window_), message_, 0, 0) == FALSE) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++lost_;
+        const unsigned long code = ::GetLastError();
+        feedLogField(core::LogLevel::Warn, "ui.feed.post", "кадр не доставлен окну экрана", "code",
+                     std::to_string(code));
+    }
+}
+
+void ScreenEndpoint::onProgress(const ProgressFrame& /*frame*/) {
+    // Прогресса раздача не публикует: на старте идёт обход дисков и чтение
+    // правил, а не скан. Когда скан появится, у него будет свой владелец.
+}
+
+void ScreenEndpoint::onTick(const BridgeStats& /*stats*/) {}
+
+// --- StartupFeed ------------------------------------------------------------
+
+struct StartupFeed::Impl {
+    std::unique_ptr<ModelViewBridge> bridge;
+    std::vector<std::shared_ptr<ScreenEndpoint>> endpoints;
+    std::mutex mutex;  // endpoints и снимки
+
+    std::thread worker;
+    std::atomic<bool> started{false};
+    std::atomic<bool> finished{false};
+
+    std::shared_ptr<const core::DiskInventory> inventory;
+    std::shared_ptr<const core::RuleSet> rules;
+    std::string rulesOrigin;
+    std::string rulesProblem;
+    std::string inventoryProblem;
+    std::size_t diskCount{0};
+    std::uint64_t unavailable{0};
+
+    // Фоновый поток. Останавливается только в деструкторе раздачи: обход
+    // дисков нельзя прерывать на полпути, оставляя экран с половиной карты.
+    void run() noexcept;
+    void publishInventory();
+    void publishRules(const RuleLoad& load);
+};
+
+void StartupFeed::Impl::run() noexcept {
+    // Порядок осознанный. Правила читаются быстро (десятки мелких файлов) и нужны
+    // двум экранам сразу; обход дисков — это IOCTL с таймаутом 2 с на
+    // устройство, то есть секунды. Начать с правил — значит, что «Настройки» и
+    // «Очистка» наполняются, пока «Диски» ещё ждут устройства.
+    const RuleLoad load = loadRuleSetFromDisk();
+    publishRules(load);
+    publishInventory();
+    finished.store(true, std::memory_order_release);
+}
+
+void StartupFeed::Impl::publishRules(const RuleLoad& load) {
+    if (load.problem.empty()) {
+        auto set = std::make_shared<const core::RuleSet>(load.set);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            rules = set;
+            rulesOrigin = load.origin;
+            rulesProblem.clear();
+        }
+        if (bridge) {
+            (void)bridge->postSnapshot(EventKind::RuleSet, set, true);
+        }
+        feedLogField(core::LogLevel::Info, "ui.feed.rules", "набор правил прочитан", "origin", load.origin);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        rulesProblem = load.problem;
+    }
+    feedLogField(core::LogLevel::Warn, "ui.feed.rules", "набор правил не прочитан", "problem", load.problem);
+    // Отказ виден на экране «Настройки» строкой состояния, а не пустым списком:
+    // §5 — «каждый отказ виден и записан».
+    if (bridge) {
+        (void)bridge->postStatus(EventKind::Error, std::string("Набор правил не прочитан: ") + load.problem, true);
+    }
+}
+
+void StartupFeed::Impl::publishInventory() {
+    const platform::inventory::Options options;
+    const std::shared_ptr<const platform::inventory::Snapshot> snapshot =
+        platform::inventory::collect(options, platform::inventory::RefreshReason::Startup, nullptr);
+    if (snapshot == nullptr) {
+        std::lock_guard<std::mutex> lock(mutex);
+        inventoryProblem = "обход дисков не вернул снимок";
+        return;
+    }
+
+    const core::DiskInventory& map = snapshot->inventory;
+    auto published = std::make_shared<const core::DiskInventory>(map);
+    std::string problem;
+    if (!snapshot->hasDiskData()) {
+        // Пустая карта и «карту не удалось прочитать» — разные ситуации, и
+        // подпись на экране обязана их различать: первое — «устройств нет»,
+        // второе — «нужны права администратора» (§5, §10).
+        problem = "устройства не прочитаны: \\.\\PhysicalDriveN открывается только с повышенными правами — "
+                  "запустите MrProper от имени администратора";
+    } else if (snapshot->unavailableCount() > 0) {
+        problem = "часть устройств не ответила за таймаут: показаны только те, что ответили";
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        inventory = published;
+        inventoryProblem = problem;
+        diskCount = map.disks().size();
+        unavailable = snapshot->unavailableCount();
+    }
+    if (bridge) {
+        (void)bridge->postSnapshot(EventKind::Inventory, published, true);
+        if (!problem.empty()) (void)bridge->postStatus(EventKind::Notice, problem, false);
+    }
+    feedLogField(core::LogLevel::Info, "ui.feed.inventory", "инвентаризация опубликована", "disks",
+                 std::to_string(map.disks().size()));
+}
+
+StartupFeed::StartupFeed() : impl_(std::make_unique<Impl>()) {}
+
+// Разрушение раздачи — на выходе из процесса, в UI-потоке. Фоновый поток здесь
+// обязателен к присоединению: ~thread на присоединяемом потоке вызывает
+// std::terminate (а не «тихо отваливается»), то есть закрытие окна кончалось бы
+// аварийным кодом — ровно тот отказ, который ловит ui-smoke.ps1 как «процесс
+// упал». Обход дисков не прерывается на полпути: оснастка присоединяется целиком,
+// а опубликованные снимки к этому моменту уже никому не нужны.
+StartupFeed::~StartupFeed() {
+    if (impl_ && impl_->worker.joinable()) impl_->worker.join();
+}
+
+StartupFeed& StartupFeed::instance() noexcept {
+    // Функциональный статик: инициализация потокобезопасна начиная с C++11, а
+    // экземпляр обязан быть один на процесс (см. шапку).
+    static StartupFeed feed;
+    return feed;
+}
+
+std::shared_ptr<ScreenEndpoint> StartupFeed::subscribe(void* window, std::uint32_t message) {
+    if (window == nullptr) return nullptr;
+    auto endpoint = std::make_shared<ScreenEndpoint>(window, message);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->bridge == nullptr) {
+        ModelViewBridge::Options options;
+        options.ownerWindow = window;
+        options.createSink = true;
+        options.logTraffic = false;
+        impl_->bridge = std::make_unique<ModelViewBridge>(std::move(options));
+    }
+    if (impl_->bridge) {
+        // Наблюдатель остаётся жить, пока экран его не отпишет: мост держит
+        // только shared_ptr, и молчаливый отзыв потерял бы кадры на ровном
+        // месте — при пересоздании экрана.
+        (void)impl_->bridge->subscribe(endpoint);
+    }
+    impl_->endpoints.push_back(endpoint);
+    return endpoint;
+}
+
+void StartupFeed::unsubscribe(const std::shared_ptr<ScreenEndpoint>& endpoint) noexcept {
+    if (!endpoint) return;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    for (auto it = impl_->endpoints.begin(); it != impl_->endpoints.end(); ++it) {
+        if (*it == endpoint) {
+            impl_->endpoints.erase(it);
+            break;
+        }
+    }
+    if (impl_->bridge) (void)impl_->bridge->unsubscribe(endpoint);
+}
+
+void StartupFeed::start() noexcept {
+    if (impl_->started.exchange(true, std::memory_order_acq_rel)) return;
+    try {
+        impl_->worker = std::thread([impl = impl_.get()] { impl->run(); });
+    } catch (const std::exception& failure) {
+        // Фоновый поток не поднялся — приложение обязано работать и без него:
+        // экраны покажут состояние «данных ещё нет» с пояснением (§5).
+        feedLogField(core::LogLevel::Error, "ui.feed.start", "фоновый поток не создан", "problem", failure.what());
+    }
+}
+
+std::shared_ptr<const core::DiskInventory> StartupFeed::inventory() const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->inventory;
+}
+
+std::shared_ptr<const core::RuleSet> StartupFeed::ruleSet() const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->rules;
+}
+
+std::string StartupFeed::toText() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::string out = "feed: дисков=";
+    out += std::to_string(impl_->diskCount);
+    out += ", не ответило=";
+    out += std::to_string(impl_->unavailable);
+    out += ", правила=";
+    if (impl_->rules) {
+        out += std::to_string(impl_->rules->rules.size());
+        out += " верс.";
+        out += impl_->rules->version;
+        if (!impl_->rulesOrigin.empty()) {
+            out += " из ";
+            out += impl_->rulesOrigin;
+        }
+    } else if (!impl_->rulesProblem.empty()) {
+        out += "не прочитаны (";
+        out += impl_->rulesProblem;
+        out += ')';
+    } else {
+        out += "ещё читаются";
+    }
+    out += ", экранов=";
+    out += std::to_string(impl_->endpoints.size());
+    out += impl_->finished.load(std::memory_order_acquire) ? ", фон завершён" : ", фон идёт";
     return out;
 }
 

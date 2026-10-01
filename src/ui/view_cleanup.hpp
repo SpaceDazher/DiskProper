@@ -700,3 +700,93 @@ private:
 };
 
 }  // namespace mrproper::ui::cleanup
+
+// ---------------------------------------------------------------------------
+// Экран «Обзор» (SPEC §7.1 п.1, nav::PageId::Overview)
+// ---------------------------------------------------------------------------
+//
+// Живёт здесь по двум причинам, и обе должны быть записаны, пока файл существует:
+//
+//   1) своего файла у него нет. Ни view_overview.*, ни класса OverviewScreen не
+//      было ни в одной волне до K2: пять страниц рельса, четыре экрана. Свой
+//      файл завести нельзя — за списком работ стоит один владелец на файл, и
+//      молчаливо занятый чужой файл ломает параллельную работу агентов.
+//   2) данные обзора — это агрегаты очистки плюс снимок инвентаризации, то есть
+//      ровно те два значения, которые CleanupViewModel и DisksViewModel уже
+//      научились считать. Дублировать их расчёт здесь означало бы, что сводка
+//      и отчёт разойдутся в цифрах, а §11.4 требует одних и тех же чисел на всех
+//      поверхностях. Экран получает их готовыми и только показывает.
+//
+// Что экран показывает (SPEC §7.1: «сводка: сколько кандидатов, сколько
+// освободится»):
+//   * четыре плитки: диски, свободно, кандидаты, освободится;
+//   * версию и размер набора правил;
+//   * когда скана не было — не пустоту, а «сначала просканируйте» с названием
+//     кнопки, которая это делает.
+//
+// Экран рисует сам (GDI, WM_PAINT), без дочерних контролов: на нём нет ни
+// таблиц, ни деревьев, а Direct2D для плиток не нужен — §7 ADR-003 оставляет
+// D2D только для графики собственной природы, а не для рамок.
+namespace mrproper::ui::overview {
+
+// Числа сводки. Значения по умолчанию — это «ничего не известно», и они же
+// рисуются как «нет данных», а не как ноль: ноль кандидатов после скана и ноль
+// кандидатов без скана — разные вещи (§4 FR-3, §12).
+struct OverviewSnapshot {
+    std::size_t diskCount{};
+    std::uint64_t totalBytes{};
+    std::uint64_t freeBytes{};
+    bool inventoryKnown{false};
+
+    std::size_t candidates{};
+    std::uint64_t reclaimableBytes{};
+    bool scanned{false};
+
+    std::size_t ruleCount{};
+    std::string ruleVersion;
+};
+
+class OverviewScreen {
+public:
+    // Действия с кнопок «Сканировать» и «Открыть диски». Экран ничего не
+    // запускает сам: скан принадлежит движку, а переключение страницы —
+    // оболочке (§6.1: UI-поток не занимается I/O).
+    using ScanHandler = std::function<void()>;
+    using ShowDisksHandler = std::function<void()>;
+
+    struct Callbacks {
+        ScanHandler onScan;
+        ShowDisksHandler onShowDisks;
+    };
+
+    explicit OverviewScreen(Callbacks callbacks = {});
+    ~OverviewScreen();
+
+    OverviewScreen(const OverviewScreen&) = delete;
+    OverviewScreen& operator=(const OverviewScreen&) = delete;
+    OverviewScreen(OverviewScreen&&) = delete;
+    OverviewScreen& operator=(OverviewScreen&&) = delete;
+
+    // Создать окно-экран в parent (обычно хост содержимого app_shell). nullptr —
+    // не зарегистрировался класс окна или не хватило ресурсов; причина в журнале.
+    [[nodiscard]] HWND create(HWND parent, int dpi);
+    [[nodiscard]] HWND window() const noexcept;
+    void destroy() noexcept;
+
+    void setDpi(int dpi);
+    void reloadTheme();
+    void refresh();
+
+    // Сводка по скану. Владелец (оболочка или мост) зовёт после того, как
+    // кандидаты пришли в CleanupScreen: пока этого нет, экран честно показывает
+    // «просканируйте сначала», а не выдуманный ноль.
+    void publishScanSummary(std::size_t candidates, std::uint64_t reclaimableBytes, bool scanned);
+
+    [[nodiscard]] const OverviewSnapshot& snapshot() const noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace mrproper::ui::overview

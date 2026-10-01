@@ -47,6 +47,14 @@ void logWin32(std::string_view event, std::string_view where, unsigned long code
     core::Logger::instance().write(core::LogLevel::Warn, event, "Win32 call failed", std::move(fields));
 }
 
+// Каталог строк грузит оболочка (locale.hpp:456 — «до создания окон»), но
+// вызова initialize() в проекте нет: без него колонки журнала и подписи
+// фильтров остаются ключами («report.column.time», «units.byte»). Экран
+// поднимает каталог сам, один раз на процесс: initialize() идемпотентна.
+void ensureStrings() noexcept {
+    if (!mrproper::ui::isInitialized()) (void)mrproper::ui::initialize();
+}
+
 // Отказ с путём: §12 требует, чтобы в журнале ошибка была с HRESULT и путём, а
 // не «сохранить не вышло».
 void logSave(std::string_view event, const platform::WinErrorInfo& info) noexcept {
@@ -93,6 +101,8 @@ enum class Word : std::uint8_t {
     DetailTitle,
     MaskSerials,
     OnlyProblems,
+    EmptyWhy,
+    EmptyWhat,
 };
 
 std::string_view pick(std::string_view ru, std::string_view en) {
@@ -125,6 +135,16 @@ std::string_view wordOf(Word value) noexcept {
     // от человека, что именно он разрешает.
     case Word::MaskSerials: return pick("Маскировать серийники", "Mask serials");
     case Word::OnlyProblems: return pick("Только ошибки и предупреждения", "Errors and warnings only");
+    // Пояснение к пустому журналу: причина и действие. Склеивать их в одну
+    // строку нельзя — «ничего не найдено» без «что делать» это то же молчание,
+    // ради которого экран и переделывается.
+    case Word::EmptyWhy:
+        return pick("Операций ещё не было: журнал пишется при очистке и при каждой ошибке.",
+                    "No operations yet: the log is written during cleanup and on every error.");
+    case Word::EmptyWhat:
+        return pick("Запустите очистку на странице «Очистка» — строки появятся здесь сразу после каждой "
+                    "операции.",
+                    "Start a cleanup on the Cleanup page, rows appear here right after each operation.");
     }
     return pick("неизвестно", "unknown");
 }
@@ -365,12 +385,30 @@ std::vector<core::PhysicalDisk> maskedDisks(const std::vector<core::PhysicalDisk
     return copy;
 }
 
+// Имя действия. core::toString(PlanAction) объявлено в core/model.hpp, но
+// определения не имеет (см. предупреждение в core/disk_model.hpp:20 — модуля
+// model.cpp в проекте нет), и ссылка на него даёт LNK2019 при первой же
+// компоновке экрана «Отчёт». Поэтому имя своё, тем же приёмом, что в
+// engine/plan_builder.cpp: это единственный способ показать действия, не
+// ожидая чужую правку core.
+std::string actionName(core::PlanAction action) {
+    switch (action) {
+    // std::string, а не std::string_view: pick отдаёт представление, а функция
+    // возвращает владеющий тип — C2440 иначе.
+    case core::PlanAction::Delete: return std::string(pick("удалить", "delete"));
+    case core::PlanAction::Trash: return std::string(pick("в корзину", "trash"));
+    case core::PlanAction::Keep: return std::string(pick("оставить", "keep"));
+    case core::PlanAction::SkipLocked: return std::string(pick("пропуск (занято)", "skip (locked)"));
+    }
+    return std::string(pick("оставить", "keep"));
+}
+
 // Строка операции в дампе: действие, результат, объём, имя — потом путь и
 // подробности отдельной строкой, чтобы длинный путь не сдвигал разбор колонок.
 std::string operationLine(const core::ReportOperation& operation) {
     std::string out;
     out += "  ";
-    out += pad(core::toString(operation.action), 12);
+    out += pad(actionName(operation.action), 12);
     out += " ";
     out += pad(core::toString(operation.status), 9);
     out += " ";
@@ -770,7 +808,7 @@ struct ReportViewModel::Impl {
             row.detail = operation.detail;
             row.transactionId = operation.transactionId;
             row.safetyText = safetyTextOf(operation.safety);
-            row.actionText = core::toString(operation.action);
+            row.actionText = actionName(operation.action);
             row.bytes = operation.bytes;
             row.attempts = operation.attempts;
             row.occurrences = 1;
@@ -1695,6 +1733,7 @@ enum : int {
     kChildList = 51,
     kChildStatus = 52,
     kChildCard = 53,
+    kChildHint = 54,
 };
 
 // Колонки журнала. Порядок — от «когда» к «чему»: журнал читают слева направо по
@@ -1741,6 +1780,7 @@ struct ViewState {
     HWND list{nullptr};
     HWND status{nullptr};
     HWND card{nullptr};
+    HWND hint{nullptr};
     std::array<HWND, 5> buttons{};
     std::array<HWND, 2> checks{};
 
@@ -1802,6 +1842,16 @@ struct ViewState {
         ::ShowWindow(child, SW_SHOW);
     }
 
+    // Прямоугольник, вписанный в другой на отступ. Пустой прямоугольник в place()
+    // означает «спрятать», поэтому пустота отступа должна быть явно отрицательной,
+    // а не «нулевой».
+    static RECT insetRect(const RECT& outer, int pad) noexcept {
+        RECT inset{outer.left + pad, outer.top + pad, outer.right - pad, outer.bottom - pad};
+        if (inset.right <= inset.left) inset.right = outer.right;
+        if (inset.bottom <= inset.top) inset.bottom = outer.bottom;
+        return inset;
+    }
+
     // --- Раскладка ----------------------------------------------------------
 
     // Ширина кнопки по её подписи. Подписи локализованы и разной длины
@@ -1857,6 +1907,12 @@ struct ViewState {
         place(list, listRect, true);
         place(status, statusRect, true);
         place(card, cardRect, true);
+        // Пояснение живёт поверх списка ровно тогда, когда строк нет. Поверх, а
+        // не вместо: список остаётся на месте и наполняется, когда приходят
+        // строки, — вёрстка не прыгает при первом же событии журнала.
+        const bool rows = model.rowCount() > 0;
+        place(hint, rows ? RECT{} : insetRect(listRect, outer), !rows);
+        if (!rows) ::SetWindowPos(hint, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
         // Ряд кнопок и галочек: сначала считаем нужную ширину по подписи, потом,
         // если не влезает, сжимаем пропорционально. Молча обрезанная подпись
@@ -2086,6 +2142,12 @@ struct ViewState {
                                    reinterpret_cast<HMENU>(kChildStatus), instance, this);
         card = ::CreateWindowExW(0, L"STATIC", nullptr, childVisible | SS_OWNERDRAW, 0, 0, 0, 0, window,
                                  reinterpret_cast<HMENU>(kChildCard), instance, this);
+        // Пояснение вместо пустого списка. Создаётся всегда, показывается только
+        // когда строк нет: пустой SysListView32 выглядит как «сломанная
+        // программа», а «ничего не записано + что делать» — это содержимое
+        // (SPEC §7.1, и требование волны: запрещена пустота).
+        hint = ::CreateWindowExW(0, L"STATIC", nullptr, childVisible | SS_OWNERDRAW, 0, 0, 0, 0, window,
+                                 reinterpret_cast<HMENU>(kChildHint), instance, this);
         // Порядок кнопок совпадает с ControlId: и то и другое — один перечень,
         // и синхронизировать их вручную нельзя.
         // Идентификатор кнопки — её ControlId (2201…): WM_COMMAND приносит
@@ -2106,7 +2168,7 @@ struct ViewState {
                                           0, 0, window, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(checkIds[i])),
                                           instance, this);
         }
-        for (const HWND child : {list, status, card}) {
+        for (const HWND child : {list, status, card, hint}) {
             if (child == nullptr) {
                 logWin32("ui.report.create", "CreateWindowExW(child)", ::GetLastError());
                 return false;
@@ -2331,6 +2393,53 @@ LRESULT drawCard(ViewState& state, const DRAWITEMSTRUCT& draw) {
     return TRUE;
 }
 
+// Пояснение вместо пустого списка: рамка, заголовок, причина и действие.
+//
+// Отдельная функция, а не переиспользование drawCard: у карточки деталей есть
+// заголовок и строки «поле: значение», а здесь нужен один крупный заголовок и
+// две строки прозы с переносом. Смешивать их — значит получить текст, который
+// в одном случае обрезается, в другом выглядит как отчёт об ошибке.
+LRESULT drawEmptyState(ViewState& state, const DRAWITEMSTRUCT& draw) {
+    const theme::Palette& palette = state.theme.palette();
+    const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(state.dpi));
+    HDC dc = draw.hDC;
+    RECT box = draw.rcItem;
+
+    HBRUSH surface = ::CreateSolidBrush(theme::colorRef(palette.surface));
+    ::FillRect(dc, &box, surface);
+    ::DeleteObject(surface);
+    HBRUSH border = ::CreateSolidBrush(theme::colorRef(palette.border));
+    ::FrameRect(dc, &box, border);
+    ::DeleteObject(border);
+
+    const int pad = std::max(2, scale.dip(12.0));
+    const int titleHeight = std::max(10, scale.dip(22.0));
+    RECT inner{box.left + pad, box.top + pad, box.right - pad, box.bottom - pad};
+    if (inner.bottom <= inner.top) return TRUE;
+
+    ::SetBkMode(dc, TRANSPARENT);
+    if (state.fonts[2] != nullptr) ::SelectObject(dc, state.fonts[2]);
+    ::SetTextColor(dc, theme::colorRef(palette.textPrimary));
+    RECT title{inner.left, inner.top, inner.right, std::min(inner.bottom, inner.top + titleHeight)};
+    const std::wstring headline = toWide(word(Word::JournalEmpty));
+    ::DrawTextW(dc, headline.c_str(), -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+
+    if (state.fonts[1] != nullptr) ::SelectObject(dc, state.fonts[1]);
+    ::SetTextColor(dc, theme::colorRef(palette.textSecondary));
+    constexpr DWORD wrap = DT_LEFT | DT_WORDBREAK | DT_NOPREFIX;
+    int y = title.bottom + scale.dip(4.0);
+    for (const Word which : {Word::EmptyWhy, Word::EmptyWhat}) {
+        const std::wstring text = toWide(word(which));
+        RECT line{inner.left, y, inner.right, inner.bottom};
+        (void)::DrawTextW(dc, text.c_str(), -1, &line, wrap | DT_CALCRECT);
+        if (line.bottom <= y) break;
+        (void)::DrawTextW(dc, text.c_str(), -1, &line, wrap);
+        y = line.bottom + scale.dip(4.0);
+        if (y >= inner.bottom) break;
+    }
+    return TRUE;
+}
+
 LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     ViewState* state = nullptr;
     if (message == WM_NCCREATE) {
@@ -2544,6 +2653,10 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
                 draw->hwndItem == state->card) {
                 return drawCard(*state, *draw);
             }
+            if (draw->CtlType == ODT_STATIC && draw->CtlID == static_cast<UINT>(kChildHint) &&
+                draw->hwndItem == state->hint) {
+                return drawEmptyState(*state, *draw);
+            }
             break;
         }
         case WM_CTLCOLORSTATIC: {
@@ -2637,6 +2750,7 @@ ReportScreen::~ReportScreen() { destroy(); }
 HWND ReportScreen::create(HWND parent, int dpi) {
     auto& state = *impl_;
     if (parent == nullptr) return nullptr;
+    ensureStrings();
     if (state.window != nullptr) return state.window;
     if (dpi > 0) state.dpi = dpi;
     state.theme.setDpi(static_cast<unsigned>(state.dpi));
@@ -2698,6 +2812,7 @@ void ReportScreen::destroy() noexcept {
     state.list = nullptr;
     state.status = nullptr;
     state.card = nullptr;
+    state.hint = nullptr;
     state.buttons.fill(nullptr);
     state.checks.fill(nullptr);
 }

@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <exception>
 #include <map>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -24,6 +25,8 @@
 
 #include "core/json.hpp"
 #include "core/log.hpp"
+#include "locale.hpp"
+#include "mv_bridge.hpp"
 #include "theme.hpp"
 
 namespace mrproper::ui::settings {
@@ -51,6 +54,14 @@ void logWin32(std::string_view event, std::string_view where, unsigned long code
     core::Logger::instance().write(core::LogLevel::Warn, event, "Win32 call failed", std::move(fields));
 }
 
+// Каталог строк должен быть поднят до первого контрола: без initialize()
+// (вызова нет ни в одном файле проекта — проверено поиском по src/) подписи
+// колонок и строки состояния остаются ключами. Идемпотентно, поэтому проверка
+// флага вместо повторной загрузки.
+void ensureStrings() noexcept {
+    if (!mrproper::ui::isInitialized()) (void)mrproper::ui::initialize();
+}
+
 // ---------------------------------------------------------------------------
 // Строки
 // ---------------------------------------------------------------------------
@@ -72,7 +83,7 @@ struct LocalText {
     std::string_view en;
 };
 
-constexpr std::array<LocalText, 44> kLocalTexts{{
+constexpr std::array<LocalText, 47> kLocalTexts{{
     // Заголовки и сводка списка правил
     {"settings.rules", "Правила", "Rules"},
     {"settings.ruleColumn", "Правило", "Rule"},
@@ -131,6 +142,20 @@ constexpr std::array<LocalText, 44> kLocalTexts{{
     {"settings.statChanged", "Изменено правил, всего", "Rules changed, total"},
     {"settings.statFilter", "Фильтр", "Filter"},
     {"settings.statSelected", "Выбранное правило", "Selected rule"},
+    // Пояснение к пустому списку правил: заголовок, причина, действие. Три
+    // отдельных ключа, потому что причина отказа и подсказка «что делать» —
+    // разные предложения, и склеенная строка читается как отписка.
+    {"settings.empty.title", "Набор правил не прочитан", "The rule set was not read"},
+    {"settings.empty.why",
+     "Правила лежат на диске (рядом с программой или в %LOCALAPPDATA%\\MrProper\\rules) и читаются в "
+     "фоновом потоке. Пока они не пришли, список пуст — и это не значит, что правил нет.",
+     "Rules live on disk (next to the program or in %LOCALAPPDATA%\\MrProper\\rules) and are read in a "
+     "background thread. Until they arrive the list is empty, which does not mean there are no rules."},
+    {"settings.empty.what",
+     "Если список не наполнился за несколько секунд, проверьте каталог правил и нажмите «Импорт» — "
+     "причина отказа остаётся в строке состояния и в журнале.",
+     "If the list stays empty for a few seconds, check the rules directory and press Import; the reason "
+     "stays in the status line and in the log."},
 }};
 
 // Перевод по ключу: сначала каталог строк, потом локальная таблица, потом сам
@@ -1237,6 +1262,7 @@ enum : UINT_PTR {
     kChildLanguageCombo,
     kChildSafetyLabel,
     kChildSafetyCombo,
+    kChildHint,
 };
 
 // Порядок кнопок панели = порядок индексов раскладки и порядок ControlId.
@@ -1274,6 +1300,7 @@ struct ViewState {
     HWND status{nullptr};
     HWND details{nullptr};
     HWND about{nullptr};
+    HWND hint{nullptr};
     HWND filterLabel{nullptr};
     HWND filterEdit{nullptr};
     HWND autoUpdate{nullptr};
@@ -1286,6 +1313,7 @@ struct ViewState {
     HBRUSH surfaceBrush{nullptr};
     std::vector<ChildProc> children;
     std::vector<std::string> rowKeys;
+    std::shared_ptr<mv::ScreenEndpoint> feed;
     WINDOWPLACEMENT placement{};
     bool syncing{false};
     bool controlsReady{false};
@@ -1468,14 +1496,19 @@ struct ViewState {
                                         reinterpret_cast<HMENU>(kChildSafetyLabel), instance, nullptr);
         safetyCombo = ::CreateWindowExW(0, L"COMBOBOX", nullptr, childVisible | WS_TABSTOP | CBS_DROPDOWNLIST, 0, 0,
                                         0, 0, window, reinterpret_cast<HMENU>(kChildSafetyCombo), instance, nullptr);
+        // Пояснение вместо пустого списка правил: список без набора — это не
+        // «настраивать нечего», а «набор не прочитан», и разница видна только по
+        // словам (§9.2, §5 «каждый отказ виден»).
+        hint = ::CreateWindowExW(0, L"STATIC", nullptr, childVisible | SS_OWNERDRAW, 0, 0, 0, 0, window,
+                                 reinterpret_cast<HMENU>(kChildHint), instance, nullptr);
         for (std::size_t i = 0; i < kButtonIds.size(); ++i) {
             buttons[i] = ::CreateWindowExW(0, L"BUTTON", nullptr, childVisible | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 0,
                                            0, window, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(kButtonIds[i])),
                                            instance, nullptr);
         }
 
-        const std::array<HWND, 11> created{list, status, details, about, filterLabel, filterEdit, autoUpdate,
-                                          languageLabel, languageCombo, safetyLabel, safetyCombo};
+        const std::array<HWND, 12> created{list, status, details, about, filterLabel, filterEdit, autoUpdate,
+                                           languageLabel, languageCombo, safetyLabel, safetyCombo, hint};
         for (const HWND child : created) {
             if (child == nullptr) {
                 logWin32("ui.settings.create", "CreateWindowExW(child)", ::GetLastError());
@@ -1493,7 +1526,7 @@ struct ViewState {
             // едят клавиши, и без подкласса пробел (вкл/выкл правило) и стрелки
             // (уровень риска) до модели не дошли бы (§5 «Клавиатурная навигация,
             // фокус»). Статическим подписям подкласс не нужен.
-            createChild(child);
+            if (child != hint) createChild(child);
         }
         for (const HWND button : buttons) createChild(button);
 
@@ -1531,6 +1564,59 @@ struct ViewState {
                 filterSyncing = false;
             }
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // Набор правил из фонового потока
+    // ------------------------------------------------------------------------
+    //
+    // Экран «Настроек» без набора правил показывал пустой список и не говорил
+    // почему: набор приходит с диска (ADR-008), читать его — I/O, а §6.1 запрещает
+    // его в UI-потоке. Поэтому чтение делает раздача (mv::StartupFeed), а экран
+    // только принимает готовый неизменяемый снимок.
+    void attachFeed() {
+        if (feed != nullptr || window == nullptr) return;
+        feed = mv::StartupFeed::instance().subscribe(window);
+        if (const std::shared_ptr<const core::RuleSet> ready = mv::StartupFeed::instance().ruleSet()) {
+            model.publishRuleSet(ready);
+        }
+        mv::StartupFeed::instance().start();
+    }
+
+    void detachFeed() noexcept {
+        if (feed == nullptr) return;
+        mv::StartupFeed::instance().unsubscribe(feed);
+        feed.reset();
+    }
+
+    void applyFeedFrames() {
+        if (feed == nullptr) return;
+        bool changed = false;
+        mv::Event event;
+        while (feed->take(event)) {
+            switch (event.kind()) {
+            case mv::EventKind::RuleSet: {
+                if (const auto rules = event.as<core::RuleSet>()) {
+                    model.publishRuleSet(rules);
+                    changed = true;
+                }
+                break;
+            }
+            case mv::EventKind::Notice:
+            case mv::EventKind::Error: {
+                if (const std::shared_ptr<const std::string> text = event.as<std::string>()) {
+                    // Причина отказа — в строке состояния, а не в заголовке окна:
+                    // её видно, не переключая страницу, и она остаётся в журнале.
+                    setChildText(status, *text);
+                    changed = true;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        if (changed) refreshAll();
     }
 
     void syncButtons() {
@@ -1722,6 +1808,21 @@ struct ViewState {
         ::ShowWindow(child, SW_SHOW);
     }
 
+    // Пояснение поверх списка правил — только когда правил нет. Фильтр при этом
+    // может отсечь всё в пустом наборе, и тогда причина другая, поэтому emptiness
+    // считается по набору, а не по видимым строкам.
+    void placeHint() {
+        if (hint == nullptr) return;
+        const SettingsRect listRect = current.listRect();
+        const bool empty = model.ruleCount() == 0;
+        const int pad = std::max(2, dipToPx(8.0, dpi));
+        const SettingsRect box{listRect.x + pad, listRect.y + pad,
+                               std::max(listRect.x + pad, listRect.x + listRect.width - pad),
+                               std::max(listRect.y + pad, listRect.y + listRect.height - pad)};
+        place(hint, empty ? box : SettingsRect{}, empty);
+        if (empty) ::SetWindowPos(hint, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
     void layout() {
         int clientWidth = 0;
         int clientHeight = 0;
@@ -1735,6 +1836,7 @@ struct ViewState {
         place(status, current.statusRect(), true);
         place(details, current.detailsRect(), current.detailsVisible());
         place(about, current.aboutRect(), current.aboutVisible());
+        placeHint();
 
         // Подпись фильтра слева от поля, само поле — на всю оставшуюся строку.
         const SettingsRect filter = current.filterRect();
@@ -1869,6 +1971,51 @@ void paintRiskIcon(HDC dc, const RECT& item, SafetyLevel safety, const theme::Pa
     ::SelectObject(dc, oldPen);
     ::DeleteObject(brush);
     ::DeleteObject(pen);
+}
+
+// Пояснение вместо пустого списка правил: рамка, заголовок, причина и действие.
+// Рисуется GDI по WM_DRAWITEM — тот же путь, что у соседних экранов, и он не
+// зависит от Direct2D: если рендерер не поднялся, список правил всё равно должен
+// объяснять, почему он пуст (§5).
+LRESULT drawHint(ViewState& state, const DRAWITEMSTRUCT& draw) {
+    const theme::Palette& palette = state.theme.palette();
+    const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(state.dpi));
+    HDC dc = draw.hDC;
+    RECT box = draw.rcItem;
+
+    HBRUSH surface = ::CreateSolidBrush(theme::colorRef(palette.surface));
+    ::FillRect(dc, &box, surface);
+    ::DeleteObject(surface);
+    HBRUSH border = ::CreateSolidBrush(theme::colorRef(palette.border));
+    ::FrameRect(dc, &box, border);
+    ::DeleteObject(border);
+
+    const int pad = std::max(2, scale.dip(12.0));
+    const int titleHeight = std::max(10, scale.dip(22.0));
+    RECT inner{box.left + pad, box.top + pad, box.right - pad, box.bottom - pad};
+    if (inner.bottom <= inner.top) return TRUE;
+
+    ::SetBkMode(dc, TRANSPARENT);
+    if (state.fonts[1] != nullptr) ::SelectObject(dc, state.fonts[1]);
+    ::SetTextColor(dc, theme::colorRef(palette.textPrimary));
+    RECT title{inner.left, inner.top, inner.right, std::min(inner.bottom, inner.top + titleHeight)};
+    const std::wstring headline = toWide(text("settings.empty.title"));
+    ::DrawTextW(dc, headline.c_str(), -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+
+    if (state.fonts[2] != nullptr) ::SelectObject(dc, state.fonts[2]);
+    ::SetTextColor(dc, theme::colorRef(palette.textSecondary));
+    constexpr DWORD wrap = DT_LEFT | DT_WORDBREAK | DT_NOPREFIX;
+    int y = title.bottom + scale.dip(4.0);
+    for (const char* key : {"settings.empty.why", "settings.empty.what"}) {
+        const std::wstring body = toWide(text(key));
+        RECT line{inner.left, y, inner.right, inner.bottom};
+        (void)::DrawTextW(dc, body.c_str(), -1, &line, wrap | DT_CALCRECT);
+        if (line.bottom <= y) break;
+        (void)::DrawTextW(dc, body.c_str(), -1, &line, wrap);
+        y = line.bottom + scale.dip(4.0);
+        if (y >= inner.bottom) break;
+    }
+    return TRUE;
 }
 
 // Обработчик окна экрана. Исключение не пересекает границу Win32 (§5): ловим
@@ -2052,6 +2199,15 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             }
             return 0;
         }
+        case WM_DRAWITEM: {
+            const auto* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+            if (draw == nullptr) break;
+            if (draw->CtlType == ODT_STATIC && draw->CtlID == static_cast<UINT>(detail::kChildHint) &&
+                draw->hwndItem == state->hint) {
+                return detail::drawHint(*state, *draw);
+            }
+            break;
+        }
         case WM_CTLCOLORSTATIC:
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORLISTBOX: {
@@ -2073,6 +2229,11 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             return 0;
         }
         case kMsgSyncModel: state->refreshAll(); return 0;
+        case mv::kFeedMessage:
+            // Набор правил или причина, по которой он не прочитан. Модель
+            // меняется только здесь, в UI-потоке (§6.1).
+            state->applyFeedFrames();
+            return 0;
         case WM_ERASEBKGND:
             // Дети перекрывают окно целиком; стирать собственную поверхность
             // незачем, а лишнее стирание мигает при перерисовке списка.
@@ -2135,6 +2296,7 @@ SettingsScreen::~SettingsScreen() { destroy(); }
 HWND SettingsScreen::create(HWND parent, int dpi) {
     auto& state = *impl_;
     if (parent == nullptr) return nullptr;
+    ensureStrings();
     if (state.window != nullptr) return state.window;
     if (dpi > 0) state.dpi = dpi;
 
@@ -2167,6 +2329,7 @@ HWND SettingsScreen::create(HWND parent, int dpi) {
     }
     state.applyPalette();
     state.applyFonts();
+    state.attachFeed();
     state.refreshAll();
     return state.window;
 }
@@ -2183,12 +2346,14 @@ void SettingsScreen::destroy() noexcept {
     // нечего, а мост (задача 75) спросит положение окна при закрытии.
     state.rememberScroll();
     ::DestroyWindow(window);
+    state.detachFeed();
     state.children.clear();
     state.rowKeys.clear();
     state.list = nullptr;
     state.status = nullptr;
     state.details = nullptr;
     state.about = nullptr;
+    state.hint = nullptr;
     state.filterLabel = nullptr;
     state.filterEdit = nullptr;
     state.autoUpdate = nullptr;

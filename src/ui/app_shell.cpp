@@ -7,14 +7,18 @@
 #include <objbase.h>
 #include <windowsx.h> // GET_X_LPARAM/GET_Y_LPARAM: позиция мыши в WM_COMMAND
 
+#include <algorithm>
 #include <cstddef>
 #include <exception>
+#include <string>
 #include <string_view>
 #include <utility>
 
 #include "core/log.hpp"
+#include "locale.hpp" // каталог строк: подписи рельса лежат прямо в mrproper::ui
 
 namespace mrproper::ui {
+
 namespace {
 
 // Стиль главного окна. WS_CLIPCHILDREN обязателен: окно непрозрачно, и без этой
@@ -80,6 +84,38 @@ void logEvent(core::LogLevel level, const char* event, std::string_view message,
     core::Logger::instance().write(level, event, message, std::move(fields));
 }
 
+// --- Объекты GDI на время одной отрисовки ------------------------------------
+//
+// Ручной DeleteObject в двух выходах из функции отрисовки — это ровно тот код,
+// где про вторую ветку забывают, а утечка GDI-объектов кончается «рисунок
+// перестал обновляться» через несколько тысяч перерисовок. Владелец один
+// класс на оба типа, потому что отличается только вызов DeleteObject.
+class ScopedGdi {
+public:
+    explicit ScopedGdi(HGDIOBJ handle) noexcept : handle_(handle) {}
+    ~ScopedGdi() {
+        if (handle_ != nullptr) (void)::DeleteObject(handle_);
+    }
+
+    ScopedGdi(const ScopedGdi&) = delete;
+    ScopedGdi& operator=(const ScopedGdi&) = delete;
+    ScopedGdi(ScopedGdi&&) = delete;
+    ScopedGdi& operator=(ScopedGdi&&) = delete;
+
+    [[nodiscard]] HGDIOBJ get() const noexcept { return handle_; }
+    [[nodiscard]] explicit operator bool() const noexcept { return handle_ != nullptr; }
+
+private:
+    HGDIOBJ handle_{nullptr};
+};
+
+// RailRect — это x/y/width/height, а Win32 ждёт right/bottom. Одно
+// преобразование здесь, иначе в отрисовке появятся четыре места, где
+// «ширина плюс x» могли бы забыть.
+[[nodiscard]] RECT asRect(const RailRect& rect) noexcept {
+    return RECT{rect.x, rect.y, rect.x + rect.width, rect.y + rect.height};
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -96,6 +132,91 @@ const char* dpiAwarenessModeName(DpiAwarenessMode mode) noexcept {
     }
     return "unknown";
 }
+// ---------------------------------------------------------------------------
+// Экраны: создание, показ, освобождение
+// ---------------------------------------------------------------------------
+
+HWND AppShell::screenWindow(PageId page) const noexcept {
+    switch (page) {
+        case PageId::Overview: return overviewScreen_ ? overviewScreen_->window() : nullptr;
+        case PageId::Disks: return disksScreen_ ? disksScreen_->window() : nullptr;
+        case PageId::Cleanup: return cleanupScreen_ ? cleanupScreen_->window() : nullptr;
+        case PageId::Report: return reportScreen_ ? reportScreen_->window() : nullptr;
+        case PageId::Settings: return settingsScreen_ ? settingsScreen_->window() : nullptr;
+    }
+    return nullptr;
+}
+
+void AppShell::mountScreens() {
+    if (screensReady_ || contentHost_ == nullptr) return;
+    const int dpi = static_cast<int>(dpi_.x);
+    // Порядок важен только для читаемости журнала: все пять создаются сразу, чтобы
+    // переключение страницы не ждало создания окна (переключение должно быть мгновенным).
+    disksScreen_ = std::make_unique<disks::DisksScreen>();
+    cleanupScreen_ = std::make_unique<cleanup::CleanupScreen>();
+    overviewScreen_ = std::make_unique<overview::OverviewScreen>();
+    reportScreen_ = std::make_unique<report::ReportScreen>();
+    settingsScreen_ = std::make_unique<settings::SettingsScreen>();
+
+    struct Slot {
+        PageId page;
+        HWND window;
+    };
+    const Slot slots[] = {
+        {PageId::Disks, disksScreen_->create(contentHost_, dpi)},
+        {PageId::Cleanup, cleanupScreen_->create(contentHost_, dpi)},
+        {PageId::Overview, overviewScreen_->create(contentHost_, dpi)},
+        {PageId::Report, reportScreen_->create(contentHost_, dpi)},
+        {PageId::Settings, settingsScreen_->create(contentHost_, dpi)},
+    };
+    for (const Slot& slot : slots) {
+        if (slot.window == nullptr) {
+            logEvent(core::LogLevel::Error, "ui.screen.create_failed",
+                     "экран не создался в хосте содержимого", "page", pageKey(slot.page));
+        }
+    }
+    screensReady_ = true;
+    showActiveScreen(navigator_.current());
+    logEvent(core::LogLevel::Info, "ui.screens.mounted",
+             "экраны созданы в хосте содержимого", "count", static_cast<long long>(std::size(slots)));
+}
+
+void AppShell::showActiveScreen(PageId page) {
+    if (!screensReady_) return;
+    for (PageId candidate : {PageId::Overview, PageId::Disks, PageId::Cleanup, PageId::Report,
+                             PageId::Settings}) {
+        const HWND screen = screenWindow(candidate);
+        if (screen == nullptr) continue;
+        // SW_SHOW для активной страницы, SW_HIDE для остальных: экран, оставленный
+        // видимым, перекрывает активный и рисуется поверх него.
+        ::ShowWindow(screen, candidate == page ? SW_SHOW : SW_HIDE);
+    }
+    refreshActiveScreen();
+    layoutContentHost();
+    invalidateChrome();
+}
+
+void AppShell::refreshActiveScreen() {
+    if (!screensReady_) return;
+    switch (navigator_.current()) {
+        case PageId::Overview:
+            if (overviewScreen_) overviewScreen_->refresh();
+            break;
+        case PageId::Disks:
+            if (disksScreen_) disksScreen_->refresh();
+            break;
+        case PageId::Cleanup:
+            if (cleanupScreen_) cleanupScreen_->refresh();
+            break;
+        case PageId::Report:
+            if (reportScreen_) reportScreen_->refresh();
+            break;
+        case PageId::Settings:
+            if (settingsScreen_) settingsScreen_->refresh();
+            break;
+    }
+}
+
 
 DpiAwarenessMode AppShell::fromAwareness(DPI_AWARENESS awareness) noexcept {
     switch (awareness) {
@@ -190,6 +311,22 @@ DpiScale AppShell::dpiFor(HWND window) noexcept {
 
 AppShell::AppShell(Options options) : options_(std::move(options)) {
     dpi_ = DpiScale{dpiForSystem(), dpiForSystem()};
+    // Тема читается один раз здесь, до первого окна: первый же WM_PAINT уже
+    // должен знать цвета иначе кадр мигнёт системным белым.
+    theme_.setDpi(dpi_.x);
+
+    // Подписи рельса. Резолвер отдаёт ПУСТУЮ строку, когда перевода нет:
+    // core::StringCatalog::resolve на неизвестном ключе возвращает сам ключ
+    // (core/i18n.cpp), а рисовать в рельсе «nav.page.overview» вместо слова
+    // «Обзор» нельзя. Пустой ответ Navigator::label превращает во встроенную
+    // подпись ru/en из kPages — рельс осмыслен с первого кадра и без каталога.
+    navigator_.setTitleResolver([](std::string_view key) -> std::string {
+        const std::string translated = tr(key);
+        if (translated.empty() || translated == key) return std::string();
+        return translated;
+    });
+    // Подписка на смену страницы: перерисовать рельс и хост и позвать экран.
+    navigator_.setPageChangedHandler([this](PageId from, PageId to) { handlePageChanged(from, to); });
 }
 
 AppShell::~AppShell() {
@@ -329,7 +466,13 @@ HWND AppShell::createMainWindow() noexcept {
         ::ShowWindow(window, options_.showCommand);
     }
     ::UpdateWindow(window);
-    logEvent(core::LogLevel::Info, "ui.window.created", "главное окно создано", "dpi", dpi);
+    // Фокус ввода — на рельсе, а не «где оказалось»: без этого первое же
+    // нажатие Ctrl+1..5 ушло бы мимо нашего WM_KEYDOWN, и горячие клавиши
+    // страниц выглядели бы сломанными при живом приложении. SetFocus работает
+    // только внутри потока, чужие окна он не забирает.
+    ::SetFocus(window);
+    logEvent(core::LogLevel::Info, "ui.window.created", "главное окно создано", "dpi", dpi,
+        "railWidthPx", railWidthPx());
     return window;
 }
 
@@ -502,8 +645,24 @@ LRESULT AppShell::handleMessage(HWND window, UINT message, WPARAM wParam, LPARAM
         // нужно один раз — по главному окну.
         if (isMainWindow(window)) {
             dpi_ = dpiFor(window);
-            ::InvalidateRect(window, nullptr, FALSE);
+            theme_.setDpi(dpi_.x);
+            layoutRail();
+            layoutContentHost();
+            invalidateChrome();
             logEvent(core::LogLevel::Info, "ui.dpi.display_changed", "сменилась топология мониторов", "dpi", dpi_.x);
+        }
+        return 0;
+
+    // Смена темы и системных цветов. applyMessage внутри решает, что именно
+    // изменилось (схема, шрифты, DPI), и возвращает false, если ничего: молча
+    // согласиться на WM_SETTINGCHANGE, не перечитав цвета, значило бы оставить
+    // окно в прошлой теме до следующего запуска (§5 «Тема»).
+    case WM_SETTINGCHANGE:
+    case WM_THEMECHANGED:
+    case WM_SYSCOLORCHANGE:
+        if (theme_.applyMessage(message, wParam, lParam)) {
+            applyWindowDarkMode(window);
+            invalidateChrome();
         }
         return 0;
 
@@ -520,9 +679,71 @@ LRESULT AppShell::handleMessage(HWND window, UINT message, WPARAM wParam, LPARAM
         return handleNotify(window, lParam);
 
     case WM_KEYDOWN:
-        // Ctrl+Z (§7.2) и цифровые переходы между страницами.
-        if (!isMainWindow(window)) break;
+        // Ctrl+Z (§7.2) и цифровые переходы между страницами. Ключи приходят
+        // и в главное окно (фокус на рельсе), и в хост содержимого (фокус на
+        // активном экране) — оба окна живут в одном цикле сообщений, поэтому
+        // «Ctrl+3» работает откуда угодно (§5 доступность: клавиатура не
+        // должна «застревать» там, где стоит фокус).
+        if (!isMainWindow(window) && window != contentHost_) break;
         return handleKeyDown(window, wParam, lParam);
+
+    // --- Рельс: мышь и фокус -------------------------------------------------
+    // Только главное окно: хост содержимого занимает всю остальную площадь,
+    // и мышь над пунктом рельса приходит в WM_LBUTTONDOWN главного окна, а не
+    // вложенного. Вне рельса сообщение уходит в DefWindowProc, чтобы поведение
+    // главного окна (будущее меню, заголовок) не менялось.
+
+    case WM_MOUSEMOVE:
+        if (isMainWindow(window) && handleRailMouseMove(window, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam))) {
+            return 0;
+        }
+        break;
+
+    case WM_MOUSELEAVE:
+        if (!isMainWindow(window)) break;
+        // Подписка одноразовая: без сброса флага следующий WM_MOUSEMOVE не
+        // переподписался бы и наведение «залипло» бы после ухода с рельса.
+        railMouseTracked_ = false;
+        if (railHover_.has_value() || railPressed_.has_value()) {
+            railHover_.reset();
+            railPressed_.reset();
+            invalidateChrome();
+        }
+        return 0;
+
+    case WM_LBUTTONDOWN:
+        if (isMainWindow(window) && handleRailClick(window, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam))) {
+            return 0;
+        }
+        break;
+
+    case WM_LBUTTONUP:
+        if (!isMainWindow(window)) break;
+        handleRailRelease(window, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        return 0;
+
+    case WM_CANCELMODE:
+    case WM_CAPTURECHANGED:
+        // Прерванное нажатие (Alt+Tab, другое окно перехватило мышь) не должно
+        // оставлять пункт «залипшим» нажатым.
+        if (!isMainWindow(window)) break;
+        if (railPressed_.has_value()) {
+            railPressed_.reset();
+            invalidateChrome();
+        }
+        return 0;
+
+    case WM_SETFOCUS:
+        if (!isMainWindow(window)) break;
+        railFocused_ = true;
+        invalidateChrome();
+        return 0;
+
+    case WM_KILLFOCUS:
+        if (!isMainWindow(window)) break;
+        railFocused_ = false;
+        invalidateChrome();
+        return 0;
 
     case WM_CLOSE:
         handleClose(window);
@@ -546,22 +767,64 @@ LRESULT AppShell::handleMessage(HWND window, UINT message, WPARAM wParam, LPARAM
         return ::DefWindowProcW(window, message, wParam, lParam);
 
     case WM_ERASEBKGND:
-        // Хост содержимого закрашивается сам в WM_PAINT: когда в нём появится
-        // D2D-поверхность (задача 67), двойная закраска исчезла бы сама.
-        if (!isMainWindow(window)) return 1;
-        break;
+        // Фон целиком закрашивается в WM_PAINT, поэтому закраска здесь только
+        // мелькала бы. 1 означает «считать стёртым»: невызванная закраска
+        // оставила бы мусор от прошлого кадра в области, которую WM_PAINT
+        // перерисует позже в этом же кадре.
+        return 1;
 
     case WM_PAINT:
-        if (!isMainWindow(window)) {
-            paintContentHost(window);
+        if (isMainWindow(window)) {
+            paintMainWindow(window);
             return 0;
         }
-        break;
+        paintContentHost(window);
+        return 0;
 
     default:
         break;
     }
     return ::DefWindowProcW(window, message, wParam, lParam);
+}
+
+// Хост содержимого создан как дочернее окно ТОГО ЖЕ класса и того же
+// windowProc, поэтому его WM_CREATE приходит в handleMessage и попадает сюда
+// же. Собирать на нём главное окно нельзя: ниже стоят mainWindow_ = window и
+// CreateWindowExW хоста содержимого, а значит хост содержимого завёл бы
+// собственного хоста содержимого, тот — ещё одного, и так до исчерпания
+// стека. Наружу это выходит как 0xC000041D (STATUS_FATAL_USER_CALLBACK_
+// EXCEPTION), то есть ui-smoke.ps1 рапортовал «процесс упал», а не «окно
+// пустое». Признак «своё это окно или чужое» берём из WS_CHILD: он задан
+// стилем окна, а не порядком присваиваний, и потому не зависит от того,
+// успел ли mainWindow_ уже получить значение.
+void AppShell::applyWindowDarkMode(HWND window) noexcept {
+    // Реентерабельность, а не «осторожность». theme::enableDarkModeForWindow
+    // внутри зовёт RefreshImmersiveColorPolicy(), а та рассылает WM_SETTINGCHANGE
+    // со сменой ImmersiveColorSet — в том числе самому этому окну. Обработчик
+    // WM_SETTINGCHANGE вызывает enableDarkModeForWindow снова (цвет мог
+    // поменяться), тот снова рассылает сообщение, и рекурсия съедает стек:
+    // приложение падало с 0xC00000FD (STATUS_STACK_OVERFLOW) прямо в WM_CREATE,
+    // то есть до первого кадра — ровно тот отказ, который ui-smoke.ps1 рапортует
+    // как «процесс упал» (код 6). Повторный вход молча игнорируется: вложенная
+    // рассылка всё равно дойдёт до конца, а тему мы применим на следующем
+    // WM_SETTINGCHANGE или при следующей перерисовке.
+    if (darkModeApplying_) return;
+    darkModeApplying_ = true;
+    (void)theme::enableDarkModeForWindow(window, theme_.scheme());
+    darkModeApplying_ = false;
+}
+
+LRESULT AppShell::handleContentHostCreate(HWND window) {
+    contentHost_ = window;
+    // Ни DPI, ни тему здесь не перечитываем: хост создан в ту же секунду, что и
+    // главное окно, на том же мониторе, а его собственный WM_DPICHANGED_AFTERPARENT
+    // разбудит handleDpiChanged и обновит кэш при первой же смене масштаба.
+    // Раскладку хоста тоже не считаем: в момент его собственного WM_CREATE
+    // клиентская область ещё нулевая, и единственный источник правильных
+    // размеров — handleSize главного окна, вызванный сразу после этого.
+    logEvent(core::LogLevel::Info, "ui.content_host.created", "хост содержимого создан");
+    onCreate(window);
+    return 0;
 }
 
 LRESULT AppShell::handleCreate(HWND window, const CREATESTRUCTW* create) {
@@ -573,11 +836,24 @@ LRESULT AppShell::handleCreate(HWND window, const CREATESTRUCTW* create) {
         return -1;  // отказ создать окно
     }
 
+    if ((::GetWindowLongPtrW(window, GWL_STYLE) & WS_CHILD) != 0) return handleContentHostCreate(window);
+
     mainWindow_ = window;
+    dpi_ = dpiFor(window);
+    theme_.setDpi(dpi_.x);
+    applyWindowDarkMode(window);
     // Именно GetDpiForWindow, а не dpiForSystem(): окно может появиться на
     // втором мониторе (например, при восстановлении положения), и системный DPI
     // тогда не имеет отношения к его содержимому.
     dpi_ = dpiFor(window);
+    theme_.setDpi(dpi_.x);
+    // Нативные контролы внутри хоста содержимого обязаны стать тёмными вместе
+    // с окном: иначе при тёмной теме белый SysListView32 выглядит как дыра.
+    applyWindowDarkMode(window);
+
+    // Рельс — до хоста содержимого: ширина рельса входит в раскладку хоста,
+    // и хост, созданный раньше, получил бы в WM_SIZE ещё одну пустую раскладку.
+    layoutRail();
 
     contentHost_ = ::CreateWindowExW(0, options_.contentClassName.c_str(), options_.contentHostTitle.c_str(),
                                      kContentHostStyle, 0, 0, 0, 0, window, nullptr, instance_, this);
@@ -589,17 +865,23 @@ LRESULT AppShell::handleCreate(HWND window, const CREATESTRUCTW* create) {
             ::GetLastError());
     } else {
         layoutContentHost();
+        // Экраны живут в хосте содержимого: без них окно показывает только рельс.
+        mountScreens();
     }
 
     // Текст окна (заголовок и имя хоста содержимого) доступен экранному диктору
     // и UI Automation (§5 «Доступность»): без него окно озвучивается как «пустое».
     logEvent(core::LogLevel::Info,
         "ui.window.create_completed",
-        "клиентская область и хост содержимого готовы",
+        "клиентская область, рельс и хост содержимого готовы",
         "dpi",
         dpi_.x,
         "contentHost",
-        contentHost_ != nullptr);
+        contentHost_ != nullptr,
+        "railWidthPx",
+        railWidthPx(),
+        "page",
+        std::string(pageKey(navigator_.current())));
     onCreate(window);
     return 0;
 }
@@ -613,6 +895,7 @@ void AppShell::handleSize(HWND window, WPARAM sizeType) {
     // Раскладку хоста двигает только главное окно. WM_SIZE приходит и хосту
     // содержимого, и его ответный SetWindowPos был бы вызовом вхолостую.
     if (isMainWindow(window)) {
+        layoutRail();
         layoutContentHost();
     }
 
@@ -656,6 +939,10 @@ void AppShell::handleDpiChanged(HWND window, UINT dpiX, UINT dpiY, const RECT* s
     const DpiScale next{dpiX, dpiY};
     const bool changed = !(next == dpi_);
     dpi_ = next;
+    // Ширина рельса задана в DIP (§7.1, ui::nav RailMetrics), поэтому при
+    // 150 % она 224 → 336 px. Кегли и метрики темы обязаны уехать вместе с ней,
+    // иначе подписи останутся 96-DPI на полосе в 336 px.
+    theme_.setDpi(dpi_.x);
 
     if (isMainWindow(window) && suggested != nullptr && suggested->right > suggested->left &&
         suggested->bottom > suggested->top) {
@@ -664,6 +951,11 @@ void AppShell::handleDpiChanged(HWND window, UINT dpiX, UINT dpiY, const RECT* s
         // перерисовалась бы до того, как система её обновит.
         (void)::SetWindowPos(window, nullptr, suggested->left, suggested->top, suggested->right - suggested->left,
                              suggested->bottom - suggested->top, kFlagsNoZOrderNoActivate);
+        // WM_SIZE после SetWindowPos пересчитает раскладку сам, но к этому
+        // моменту dpi_ уже новый — а если система не прислала suggested
+        // (перенос без изменения размера), раскладку надо посчитать здесь.
+        layoutRail();
+        layoutContentHost();
     }
 
     if (contentHost_ != nullptr) {
@@ -736,6 +1028,10 @@ void AppShell::handleNcDestroy(HWND window) noexcept {
         // строками, полезет в мёртвое HWND.
         mainWindow_ = nullptr;
         contentHost_ = nullptr;
+        railHover_.reset();
+        railPressed_.reset();
+        railFocused_ = false;
+        railMouseTracked_ = false;
         logEvent(core::LogLevel::Info, "ui.window.destroyed", "главное окно уничтожено");
     }
     ::SetWindowLongPtrW(window, GWLP_USERDATA, 0);
@@ -770,31 +1066,409 @@ LRESULT AppShell::handleNotify(HWND window, LPARAM lParam) {
 }
 
 LRESULT AppShell::handleKeyDown(HWND window, WPARAM wParam, LPARAM lParam) {
+    // Сначала рельс: он владеет глобальными переходами между страницами, и их
+    // должен видеть и экран. Перехватывание без разбора ключа здесь отдало бы
+    // Ctrl+Z экрану только потому, что он объявил хук раньше рельса.
+    if (handleNavKey(window, static_cast<UINT>(wParam))) return 0;
     if (onKeyDown(window, static_cast<UINT>(wParam), lParam)) return 0;
     // Необработанный ключ уходит системе: обработка ускорителей меню (Alt+F) и
     // повтор при удержании живёт именно там.
     return ::DefWindowProcW(window, WM_KEYDOWN, wParam, lParam);
 }
 
+void AppShell::layoutRail() noexcept {
+    int clientWidth = 0;
+    int clientHeight = 0;
+    if (mainWindow_ != nullptr) {
+        RECT client{};
+        if (::GetClientRect(mainWindow_, &client) != 0) {
+            clientWidth = client.right - client.left;
+            clientHeight = client.bottom - client.top;
+        }
+    }
+    railLayout_ = RailLayout::compute(railMetrics_, static_cast<int>(dpi_.x), clientHeight,
+                                      defaultRailSide(navigator_.language()), navigator_.railScrollPx());
+    // Прокрутка хранится у Navigator, а применяется макетом. Расхождение после
+    // смены DPI или языка (рельс стал шире/выше и прокрутка больше не нужна)
+    // заносим обратно, иначе следующий WM_PAINT посчитал бы макет заново — и
+    // получилось бы два разных ответа на один и тот же вопрос.
+    if (navigator_.railScrollPx() != railLayout_.scrollOffsetPx()) {
+        navigator_.setRailScrollPx(railLayout_.scrollOffsetPx());
+    }
+}
+
+std::optional<PageId> AppShell::railHitTest(POINT clientPoint) const noexcept {
+    if (mainWindow_ == nullptr) return std::nullopt;
+    int x = clientPoint.x;
+    if (railLayout_.side() == RailSide::Right) {
+        // Зеркалирование появляется здесь, а не в каждом обработчике мыши:
+        // RailLayout::hitTest ждёт координаты от ведущего края рельса, и при
+        // RailSide::Right это правый край окна (§5 «RTL-ready»).
+        RECT client{};
+        if (::GetClientRect(mainWindow_, &client) == 0) return std::nullopt;
+        x = (client.right - client.left) - x;
+    }
+    return railLayout_.hitTest(x, clientPoint.y);
+}
+
+void AppShell::invalidateChrome() noexcept {
+    if (mainWindow_ == nullptr) return;
+    // Рельс и хост — два разных окна, у каждого своя невалидированная область.
+    // Инвалидировать только главное нельзя: WS_CLIPCHILDREN вырезает из его
+    // области прямоугольник хоста, и содержимое осталось бы от прежней
+    // страницы — то самое «окно живо, а картинка старая».
+    ::InvalidateRect(mainWindow_, nullptr, FALSE);
+    if (contentHost_ != nullptr) ::InvalidateRect(contentHost_, nullptr, FALSE);
+}
+
+bool AppShell::showPage(PageId page) {
+    if (!isValidPage(page)) {
+        logEvent(core::LogLevel::Warn,
+            "ui.nav.invalid_page",
+            "запрошена страница вне перечисления",
+            "value",
+            static_cast<int>(page));
+        return false;
+    }
+    // Фокус рельса следует за целью даже при повторе: иначе второй щелчок по
+    // активному пункту оставил бы фокус на прошлой странице и стрелка вниз
+    // уехала бы не с того места, куда кликнул человек.
+    navigator_.setSelection(page);
+    const bool changed = navigator_.goTo(page);
+    if (!changed) invalidateChrome();
+    return changed;
+}
+
+void AppShell::handlePageChanged(PageId from, PageId to) {
+    logEvent(core::LogLevel::Info,
+        "ui.nav.page_changed",
+        "открыта страница интерфейса",
+        "from",
+        pageKey(from),
+        "to",
+        pageKey(to),
+        "ordinal",
+        pageOrdinal(to));
+    // Экран готовит содержимое хоста ДО перерисовки: иначе между сменой
+    // current_ и первым WM_PAINT хоста пользователь увидел бы пустой белый
+    // прямоугольник — ровно тот отказ, который ловит ui-smoke.ps1.
+    onPageChanged(from, to);
+    showActiveScreen(to);
+    invalidateChrome();
+}
+
+bool AppShell::handleRailMouseMove(HWND window, int x, int y) noexcept {
+    const std::optional<PageId> hit = railHitTest(POINT{x, y});
+    trackRailMouseLeave(window);
+    if (hit == railHover_) return false;
+    railHover_ = hit;
+    invalidateChrome();
+    return true;
+}
+
+bool AppShell::handleRailClick(HWND window, int x, int y) {
+    const std::optional<PageId> hit = railHitTest(POINT{x, y});
+    if (!hit.has_value()) {
+        // Щелчок мимо пунктов (зазор, отступ, область содержимого) не должен
+        // ничего открывать: «промахнулся — ничего не произошло» надёжнее, чем
+        // переключение на ближайший пункт.
+        if (railPressed_.has_value()) {
+            railPressed_.reset();
+            invalidateChrome();
+        }
+        return false;
+    }
+    if (railPressed_.has_value() && *railPressed_ == *hit) return true;
+    railPressed_ = hit;
+    trackRailMouseLeave(window);
+    // Фокус — на рельс: иначе после первого щелчка клавиатура продолжила бы
+    // слать стрелки в хост содержимого, а не в то, что человек только что
+    // открыл (§5 «Клавиатурная навигация, фокус»).
+    ::SetFocus(window);
+    // Захват мыши: отпустить кнопку над другим пунктом должно означать
+    // «отменить», а не «переключить на тот, под которым отпустили».
+    ::SetCapture(window);
+    invalidateChrome();
+    return true;
+}
+
+void AppShell::handleRailRelease(HWND window, int x, int y) {
+    if (!railPressed_.has_value()) return;
+    const std::optional<PageId> hit = railHitTest(POINT{x, y});
+    const bool activate = hit.has_value() && *hit == *railPressed_;
+    railPressed_.reset();
+    if (::GetCapture() == window) (void)::ReleaseCapture();
+    if (activate) (void)showPage(*hit);
+    invalidateChrome();
+}
+
+void AppShell::trackRailMouseLeave(HWND window) noexcept {
+    if (railMouseTracked_) return;
+    TRACKMOUSEEVENT track{};
+    track.cbSize = sizeof(track);
+    track.dwFlags = TME_LEAVE;
+    track.hwndTrack = window;
+    // dwHoverTime = 0 с TME_LEAVE означает «подписаться один раз»: без HOVEREVENTS
+    // это единственный код в структуре, который важен здесь, а значение по
+    // умолчанию (300 мс) заставило бы ждать отсчёта перед уходом курсора.
+    track.dwHoverTime = 0;
+    // Отказ означает «подписка уже есть» и ничего больше: попробуем снова при
+    // следующем движении, флаг снимется в WM_MOUSELEAVE.
+    railMouseTracked_ = (::TrackMouseEvent(&track) != FALSE);
+}
+
+bool AppShell::handleNavKey(HWND /*window*/, UINT virtualKey) {
+    const bool ctrl = (::GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool alt = (::GetKeyState(VK_MENU) & 0x8000) != 0;
+
+    // Ctrl+1..Ctrl+5 — глобальный переход на страницу: работает независимо от
+    // того, где стоит фокус. Alt+1..Alt+5 принимается вторым вариантом
+    // (см. nav.hpp: он уйдёт меню вместе с Alt+F, поэтому в подписи рельса
+    // показывается только Ctrl). Ctrl+Alt — не наш случай: это системные
+    // сочетания цифровой клавиатуры.
+    if (ctrl != alt) {
+        for (std::size_t i = 0; i < kPageCount; ++i) {
+            const auto digit = static_cast<UINT>(static_cast<unsigned char>('1' + static_cast<int>(i)));
+            if (virtualKey != digit) continue;
+            if (ctrl) {
+                if (kCtrlDigitSwitchesPage) (void)showPage(kPages[i].id);
+            } else if (kAltDigitSwitchesPage) {
+                // selectByAccessKey делает и выбор, и переход одним действием.
+                (void)navigator_.selectByAccessKey(virtualKey);
+            }
+            // Клавиша считается обработанной и когда нужная страница уже
+            // открыта: иначе Ctrl+1 ушёл бы дальше и сработал как ускоритель
+            // меню, то есть повторное нажатие делало бы что-то другое.
+            return true;
+        }
+    }
+
+    // Стрелки, Home/End, PageUp/PageDown, Enter и пробел принадлежат рельсу
+    // только когда фокус стоит на нём. Иначе они ушли бы в дерево очистки и
+    // список дисков мимо себя, и клавиатура перестала бы работать там, где
+    // работала (SPEC §5, §7.1).
+    if (!railFocused_) return false;
+    switch (virtualKey) {
+    case VK_UP:
+    case VK_DOWN:
+        navigator_.moveSelection(virtualKey == VK_DOWN ? 1 : -1);
+        // moveSelection двигает выделение, но не страницу; если страница уже
+        // та, notifyPageChanged не будет и перерисовки тоже — а выделение
+        // (и рамка фокуса) обязаны уехать.
+        if (!navigator_.activateSelection()) invalidateChrome();
+        return true;
+    case VK_HOME:
+        if (!navigator_.goToFirst()) invalidateChrome();
+        return true;
+    case VK_END:
+        if (!navigator_.goToLast()) invalidateChrome();
+        return true;
+    case VK_PRIOR:
+        if (!navigator_.goToPrevious()) invalidateChrome();
+        return true;
+    case VK_NEXT:
+        if (!navigator_.goToNext()) invalidateChrome();
+        return true;
+    case VK_RETURN:
+    case VK_SPACE:
+        if (!navigator_.activateSelection()) invalidateChrome();
+        return true;
+    default:
+        break;
+    }
+    return false;
+}
+
+std::wstring AppShell::railLabel(PageId page) const {
+    const std::string_view fallback = pageTitleFallback(page, navigator_.language());
+    // Navigator::label уже вернул подпись из каталога, если перевод есть, и
+    // встроенную ru/en — если нет. Слой locale отдаёт пустую строку на
+    // неизвестном ключе, а core::StringCatalog::resolve вернул бы сам ключ
+    // («nav.page.overview» в рельсе вместо «Обзора»), поэтому проверка на
+    // пустоту здесь не формальность, а единственная защита от такого вывода.
+    const std::wstring resolved = toWide(navigator_.label(page));
+    if (!resolved.empty()) return resolved;
+    return toWide(fallback);
+}
+
+std::wstring AppShell::railShortcutHint(PageId page) const {
+    const std::string_view shortcut = pageDescriptor(page).shortcut;
+    return toWide(shortcut);
+}
+
+void AppShell::fillWithColor(HDC dc, const RECT& rect, const theme::Color& color) noexcept {
+    if (dc == nullptr || rect.right <= rect.left || rect.bottom <= rect.top) return;
+    const ScopedGdi brush(::CreateSolidBrush(theme::colorRef(color)));
+    if (!brush) return;  // CreateSolidBrush может вернуть nullptr при нехватке GDI
+    (void)::FillRect(dc, &rect, reinterpret_cast<HBRUSH>(brush.get()));
+}
+
+void AppShell::paintMainWindow(HWND window) {
+    PAINTSTRUCT paint{};
+    HDC dc = ::BeginPaint(window, &paint);
+    // EndPaint зовётся только после успешного BeginPaint: при nullptr окну
+    // нечего валидировать, и вызов был бы вызовом по пустому дескриптору.
+    if (dc == nullptr) return;
+
+    RECT client{};
+    (void)::GetClientRect(window, &client);
+    const int clientWidth = client.right - client.left;
+    const int clientHeight = client.bottom - client.top;
+    paintRail(dc, client, clientWidth, clientHeight);
+    (void)::EndPaint(window, &paint);
+}
+
+void AppShell::paintRail(HDC dc, const RECT& client, int clientWidth, int clientHeight) {
+    if (dc == nullptr || clientWidth <= 0 || clientHeight <= 0) return;
+    const theme::Palette& palette = theme_.palette();
+    const theme::Metrics& metrics = theme_.metrics();
+    const unsigned dpi = dpi_.x != 0 ? dpi_.x : kBaseDpi;
+
+    // 1) Фон клиентской области. Тот же цвет, что у хоста содержимого: рельс и
+    //    содержимое — одно поле, и разный фон читался бы как шов.
+    fillWithColor(dc, client, palette.windowBackground);
+
+    const int railWidth = railLayout_.railWidthPx();
+    if (railWidth <= 0) return;
+    const bool rtl = (railLayout_.side() == RailSide::Right);
+    const RECT rail = asRect(railLayout_.toClient(RailRect{0, 0, railWidth, clientHeight}, clientWidth));
+
+    // 2) Полотно рельса — surface, а не windowBackground: иначе у рельса не
+    //    было бы собственного цвета и он был бы неотличим от содержимого.
+    fillWithColor(dc, rail, palette.surface);
+
+    // 3) Разделитель толщиной в один DIP. Линия, а не тень: тень стоила бы
+    //    второго прохода с полупрозрачной кистью, а линия в один пиксель видна
+    //    и в светлой, и в тёмной схеме, и при высокой контрастности.
+    const int dividerThickness = std::max(1, metrics.dip(1.0));
+    const int dividerLeft = rtl ? rail.left : rail.right - dividerThickness;
+    fillWithColor(dc, RECT{dividerLeft, rail.top, dividerLeft + dividerThickness, rail.bottom}, palette.border);
+
+    // 4) Шрифты: обычный для неактивных, полужирный для активного. Создаются
+    //    на один WM_PAINT и удаляются ScopedGdi — GDI-объекты, переживающие
+    //    перерисовку, копятся до «рисунок перестал обновляться».
+    LOGFONTW bodyLog = theme_.typography().body.toLogFont(dpi);
+    LOGFONTW strongLog = theme_.typography().bodyStrong.toLogFont(dpi);
+    const ScopedGdi bodyFont(::CreateFontIndirectW(&bodyLog));
+    const ScopedGdi strongFont(::CreateFontIndirectW(&strongLog));
+    const HGDIOBJ oldFont = bodyFont ? ::SelectObject(dc, bodyFont.get()) : nullptr;
+    const int oldBkMode = ::SetBkMode(dc, TRANSPARENT);
+
+    const int inset = metrics.dip(12.0);
+    const int hintWidth = metrics.dip(56.0);
+
+    for (const PageDescriptor& descriptor : kPages) {
+        const PageId page = descriptor.id;
+        const RECT item = asRect(railLayout_.toClient(railLayout_.itemRect(page), clientWidth));
+        if (item.bottom <= rail.top || item.top >= rail.bottom) continue;  // прокрученный пункт
+
+        const bool active = (navigator_.current() == page);
+        const bool selected = (navigator_.selection() == page);
+        const bool hovered = railHover_.has_value() && railHover_ == page;
+        const bool pressed = railPressed_.has_value() && railPressed_ == page;
+
+        if (active) {
+            fillWithColor(dc, item, palette.accent);
+        } else if (pressed) {
+            fillWithColor(dc, item, palette.accentPressed);
+        } else if (selected) {
+            fillWithColor(dc, item, palette.surfaceSelected);
+        } else if (hovered) {
+            fillWithColor(dc, item, palette.surfaceHover);
+        }
+
+        // Рамка фокуса — только когда фокус действительно на рельсе. Без
+        // клавиатуры выделение и так читается по фону, а с клавиатуры рамка
+        // обязательна: иначе человек не видит, куда уедут стрелки (§5).
+        if (railFocused_ && selected) {
+            const ScopedGdi pen(::CreatePen(PS_SOLID, std::max(1, metrics.dip(1.0)), theme::colorRef(palette.focusRing)));
+            if (pen) {
+                const HGDIOBJ oldPen = ::SelectObject(dc, pen.get());
+                (void)::Rectangle(dc, item.left + 1, item.top + 1, item.right - 1, item.bottom - 1);
+                ::SelectObject(dc, oldPen);
+            }
+        }
+
+        const theme::Color textColor = active ? palette.textOnAccent : palette.textPrimary;
+        const theme::Color hintColor = active ? palette.textOnAccent : palette.textSecondary;
+        const HGDIOBJ itemFont = (active && strongFont) ? strongFont.get() : bodyFont.get();
+        if (itemFont != nullptr) (void)::SelectObject(dc, itemFont);
+        (void)::SetTextColor(dc, theme::colorRef(textColor));
+
+        // Правая колонка — подсказка горячей клавиши, левая — подпись. При RTL
+        // колонки меняются местами: текст идёт справа налево, и подпись должна
+        // прилегать к ведущему краю, а подсказка — к противоположному.
+        RECT labelRect{item.left + inset, item.top, item.right - inset, item.bottom};
+        RECT hintRect{item.right - inset - hintWidth, item.top, item.right - inset, item.bottom};
+        if (rtl) std::swap(labelRect, hintRect);
+
+        const std::wstring hint = railShortcutHint(page);
+        if (!hint.empty()) {
+            (void)::SetTextColor(dc, theme::colorRef(hintColor));
+            (void)::DrawTextW(dc, hint.c_str(), -1, &hintRect,
+                              DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+        const std::wstring label = railLabel(page);
+        if (!label.empty()) {
+            (void)::SetTextColor(dc, theme::colorRef(textColor));
+            // DT_NOPREFIX обязателен: без него «&» в подписи съедал бы букву и
+            // рисовал вместо неё амперсанд.
+            (void)::DrawTextW(dc, label.c_str(), -1, &labelRect,
+                              DT_SINGLELINE | DT_VCENTER | (rtl ? DT_RIGHT : DT_LEFT) | DT_END_ELLIPSIS |
+                                  DT_NOPREFIX);
+        }
+    }
+
+    if (oldFont != nullptr) (void)::SelectObject(dc, oldFont);
+    ::SetBkMode(dc, oldBkMode);
+}
+
 void AppShell::layoutContentHost() noexcept {
     if (mainWindow_ == nullptr || contentHost_ == nullptr) return;
     RECT client{};
     if (::GetClientRect(mainWindow_, &client) == 0) return;
-    const int width = client.right - client.left;
-    const int height = client.bottom - client.top;
-    if (width <= 0 || height <= 0) return;
+    const int clientWidth = client.right - client.left;
+    const int clientHeight = client.bottom - client.top;
+    if (clientWidth <= 0 || clientHeight <= 0) return;
+
+    // Хост занимает клиентскую область МИНУС рельс (§7.1). Раньше он был на всю
+    // область, и рельс, нарисованный поверх, закрывал бы левый край первого
+    // экрана; теперь ширина рельса вычитается явно, а при RailSide::Right хост
+    // прижат к левому краю.
+    const int railWidth = railLayout_.railWidthPx();
+    const int hostWidth = clientWidth - railWidth;
+    if (hostWidth <= 0) return;  // окно уже рельса: хосту негде жить, но и не падаём
+    const int hostLeft = (railLayout_.side() == RailSide::Right) ? 0 : railWidth;
+
+    // Окна экранов — дети хоста, и create() задаёт им только класс и родителя, но не
+    // размер. Без этого они остаются нулевыми: хост рисует фон, внутри него пусто,
+    // и ворота «окно не пустое» видят ноль чернил при живых экранах в памяти.
+    // Раскладка экрана совпадает с клиентской областью хоста.
+    for (PageId page : {PageId::Overview, PageId::Disks, PageId::Cleanup, PageId::Report, PageId::Settings}) {
+        const HWND screen = screenWindow(page);
+        if (screen == nullptr) continue;
+        (void)::SetWindowPos(screen, nullptr, 0, 0, hostWidth, clientHeight, kFlagsNoZOrderNoActivate);
+    }
+
     // SetWindowPos с теми же размерами и положением — вызов вхолостую: он всё
-    // равно проходит через USER32 и будит перерисовку хоста. Хост и так
-    // растянут на клиентскую область, поэтому чаще всего именно этот случай.
+    // равно проходит через USER32 и будит перерисовку хоста. Чаще всего именно
+    // этот случай (окно изменило размер, но не ширину рельса).
     RECT current{};
     if (::GetWindowRect(contentHost_, &current) != 0) {
-        POINT origin{client.left, client.top};
+        POINT origin{hostLeft, 0};
         if (::ClientToScreen(mainWindow_, &origin) != 0 && current.left == origin.x && current.top == origin.y &&
-            current.right - current.left == width && current.bottom - current.top == height) {
+            current.right - current.left == hostWidth && current.bottom - current.top == clientHeight) {
             return;
         }
     }
-    (void)::SetWindowPos(contentHost_, nullptr, 0, 0, width, height, kFlagsNoZOrderNoActivate);
+    if (::SetWindowPos(contentHost_, nullptr, hostLeft, 0, hostWidth, clientHeight, kFlagsNoZOrderNoActivate) == 0) {
+        logEvent(core::LogLevel::Warn,
+            "ui.layout.content_host_failed",
+            "не удалось переместить хост содержимого",
+            "hr",
+            ::GetLastError());
+    }
+
 }
 
 void AppShell::paintContentHost(HWND window) noexcept {
@@ -803,9 +1477,10 @@ void AppShell::paintContentHost(HWND window) noexcept {
     if (dc != nullptr) {
         RECT client{};
         (void)::GetClientRect(window, &client);
-        auto brush = reinterpret_cast<HBRUSH>(::GetClassLongPtrW(window, GCLP_HBRBACKGROUND));
-        if (brush == nullptr) brush = systemWindowBrush();
-        (void)::FillRect(dc, &client, brush);
+        // Фон хоста — из темы, а не GetSysColorBrush: окно и содержимое должны
+        // совпадать по цвету, иначе шов между рельсом и содержимым виден даже
+        // на первом кадре.
+        fillWithColor(dc, client, theme_.palette().windowBackground);
     }
     // EndPaint обязателен в любом случае: невызванный он оставляет невалидированную
     // область, и система будет слать WM_PAINT снова и снова.

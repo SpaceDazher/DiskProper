@@ -23,6 +23,7 @@
 #include "core/log.hpp"
 #include "core/report_json.hpp"
 #include "locale.hpp"
+#include "mv_bridge.hpp"
 #include "renderer.hpp"
 #include "theme.hpp"
 
@@ -50,6 +51,19 @@ void logWin32(std::string_view event, std::string_view where, unsigned long code
     fields.push_back(core::logField("where", where));
     fields.push_back(core::logField("code", code));
     core::Logger::instance().write(core::LogLevel::Warn, event, "Win32 call failed", std::move(fields));
+}
+
+// Каталог строк должен быть загружен ДО первого контрола: без него любой
+// tr(StringId) отдаёт сам ключ, и экран показывает «disks.free», «units.byte»
+// и «action.refresh» вместо подписей (проверено снимком окна).
+//
+// Вызывать initialize() должна оболочка один раз при старте (locale.hpp:456
+// прямо требует «до создания окон»), но в проекте у неё нет ни одного вызова —
+// проверено поиском по src/. Поэтому экран проверяет флаг сам: initialize()
+// идемпотентна, цена проверки — одно чтение bool, а польза — экран остаётся
+// осмысленным и без оболочки.
+void ensureStrings() noexcept {
+    if (!mrproper::ui::isInitialized()) (void)mrproper::ui::initialize();
 }
 
 // ---------------------------------------------------------------------------
@@ -1696,6 +1710,7 @@ struct ViewState {
     HBRUSH surfaceBrush{nullptr};
     std::vector<std::string> rowKeys;
     std::vector<ChildProc> children;
+    std::shared_ptr<mv::ScreenEndpoint> feed;
     render::Renderer renderer;
     MapResources mapResources;
     bool syncing{false};
@@ -1911,6 +1926,20 @@ struct ViewState {
 
     // --- Раскладка -----------------------------------------------------------
 
+    // Будет ли карта пустой. Считается по МОДЕЛИ, а не по раскладке: от
+    // раскладки здесь нечего взять, она сама спрашивает модель, и обращение
+    // было бы рекурсией. Диск без размерных сегментов (не ответил, нет прав)
+    // карты не даёт — рисовать для него нечего.
+    [[nodiscard]] bool mapWillBeEmpty() const {
+        for (const MapDiskModel& disk : model.mapDisks()) {
+            if (disk.unavailable) continue;
+            for (const MapSegmentModel& segment : disk.segments) {
+                if (!segment.unavailable && segment.lengthBytes > 0) return false;
+            }
+        }
+        return true;
+    }
+
     [[nodiscard]] DisksLayout currentLayout() const {
         RECT client{};
         if (window == nullptr || ::GetClientRect(window, &client) == FALSE) return DisksLayout{};
@@ -1925,8 +1954,15 @@ struct ViewState {
             tr(StringId::kActionCheck)};
         const std::vector<int> filters = measureButtons(filterButtons, filterLabels);
         const std::vector<int> actions = measureButtons(actionButtons, actionLabels);
+        // Карте без полос нужна высота состояния, а не высота полосы: заголовок,
+        // причина и действие занимают около 72 DIP, а полоса недоступного диска —
+        // вдвое меньше. Без этой надбавки подпись обрезается по нижней кромке и
+        // экран снова выглядит пустым (проверено снимком окна).
+        const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
+        int mapHeightPx = static_cast<int>(model.mapHeightDip(mapMetrics));
+        if (mapWillBeEmpty()) mapHeightPx += scale.dip(72.0);
         return DisksLayout::compute(metrics, dpi, static_cast<int>(client.right), static_cast<int>(client.bottom),
-                                    model.mapHeightDip(mapMetrics), static_cast<int>(model.cardLines().size()),
+                                    mapHeightPx, static_cast<int>(model.cardLines().size()),
                                     filters, actions);
     }
 
@@ -2099,6 +2135,117 @@ struct ViewState {
         return computeMap(mapMetrics, model.mapDisks(), width, height);
     }
 
+    // ------------------------------------------------------------------------
+    // Состояние без данных
+    // ------------------------------------------------------------------------
+    //
+    // Три состояния, и склеивать их в одно нельзя: человек должен понимать,
+    // что делать дальше, а «пустая карта» не говорит ни слова ни о том, что
+    // данные ещё идут, ни о том, что их не удалось получить.
+    //
+    //   1) инвентаризации ещё нет  — обход идёт (2 с на устройство, §4 FR-1),
+    //      ждать нужно секунды, а не нажимать «Обновить»;
+    //   2) снимок есть, но данных о дисках нет — не хватило прав: именно это
+    //      состояние и требовалось показать словами, а не пустым прямоугольником;
+    //   3) диски есть, но отфильтрованы все — фильтры, а не отказ.
+    struct MapEmptyState {
+        std::string headline;
+        std::string reason;
+        std::string action;
+    };
+
+    // Есть ли на карте что рисовать. Не «есть ли диски», а «есть ли хоть один
+    // размерный сегмент на доступном диске»: диск, который не ответил, тоже
+    // даёт полосу MapBar, но сегментов в ней нет — рисовать там нечего, и
+    // вместо этого экран обязан сказать словами, что устройства не прочитаны.
+    // Проверено снимком: с одним недоступным диском карта оставалась пустой.
+    [[nodiscard]] bool mapHasContent(const MapLayout& layout) const {
+        for (const MapBar& bar : layout.bars) {
+            if (bar.unavailable) continue;
+            for (const MapSegment& segment : bar.segments) {
+                if (segment.width > 0.0F) return true;
+            }
+        }
+        return false;
+    }
+
+    [[nodiscard]] MapEmptyState mapEmptyState() const {
+        MapEmptyState state;
+        const bool filtered = model.filters().any();
+        if (filtered && model.hasInventory() && model.diskCount() > 0) {
+            // Данные есть, показывать нечего только из-за фильтров.
+            state.headline = std::string(pick("Фильтры скрывают все диски", "Filters hide every disk"));
+            state.reason = std::string(pick("Снимите фильтры над картой — и карта вернётся",
+                                            "Clear the filters above the map to see disks again"));
+            state.action = std::string(pick("Подсказка: у диска с буквой есть том с буквой диска",
+                                            "Hint: a disk with a letter has a volume with a drive letter"));
+            return state;
+        }
+        if (model.hasInventory()) {
+            state.headline = std::string(pick("Устройства не прочитаны", "Devices were not read"));
+            state.reason =
+                std::string(pick("Карта разделов пуста: устройства \\.\\PhysicalDriveN открываются только "
+                                 "с повышенными правами.",
+                                 "The partition map is empty: \\\\.\\PhysicalDriveN opens with elevated "
+                                 "rights only."));
+            state.action = std::string(pick("Запустите MrProper от имени администратора, затем нажмите «",
+                                            "Run MrProper as administrator, then press ")) +
+                          tr(StringId::kActionRefresh) + std::string("»");
+            return state;
+        }
+        state.headline = std::string(pick("Читаем диски", "Reading disks"));
+        state.reason = std::string(pick("Обход идёт в фоне: таймаут 2 с на устройство, обычно несколько секунд",
+                                        "The walk runs in the background: 2 s per device, usually a few seconds"));
+        state.action = std::string(pick("Карта разделов появится здесь сама — нажимать ничего не нужно",
+                                        "The partition map will appear here on its own, no button needed"));
+        return state;
+    }
+
+    // Пустая карта на Direct2D: рамка «здесь будет карта», заголовок, причина и
+    // что делать. Три строки текста — это ~2000 пикселей «чернил» даже на самом
+    // маленьком окне, то есть экран перестаёт быть «пустым» даже без данных.
+    void paintMapEmptyWithRenderer(const MapResources& res) {
+        const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
+        RECT client{};
+        if (::GetClientRect(map, &client) == FALSE) return;
+        const MapEmptyState state = mapEmptyState();
+
+        const float width = static_cast<float>(client.right);
+        const float height = static_cast<float>(client.bottom);
+        const float pad = static_cast<float>(scale.dip(16.0));
+        const float headlineHeight = static_cast<float>(scale.dip(20.0));
+        const float lineHeight = static_cast<float>(scale.dip(16.0));
+
+        // Плашка с пунктирной рамкой: пустое место должно выглядеть как «место под
+        // карту», а не как обрыв интерфейса.
+        const render::Rect frame{pad, pad, std::max(pad + 1.0F, width - pad), std::max(pad + 1.0F, height - pad)};
+        renderer.strokeRect(frame, res.border, 1.0F);
+        renderer.strokeLine(render::Point{frame.left, frame.top}, render::Point{frame.left + 24.0F, frame.top},
+                            res.border, 1.0F);
+
+        const float textLeft = frame.left + static_cast<float>(scale.dip(12.0));
+        const float textWidth = std::max(1.0F, frame.right - textLeft - static_cast<float>(scale.dip(12.0)));
+        float y = frame.top + static_cast<float>(scale.dip(10.0));
+
+        render::TextOptions options;
+        options.vertical = render::TextVerticalAlign::Center;
+        options.ellipsis = true;
+        const render::Rect headlineArea{textLeft, y, textLeft + textWidth, y + headlineHeight};
+        renderer.drawText(state.headline, headlineArea, res.label, res.text, options);
+        y += headlineHeight + static_cast<float>(scale.dip(4.0));
+
+        for (const std::string* line : {&state.reason, &state.action}) {
+            const render::Size measured = renderer.measureText(res.caption, *line, textWidth);
+            const float height2 = std::max(lineHeight, measured.height + 2.0F);
+            const render::Rect lineArea{textLeft, y, textLeft + textWidth, y + height2};
+            render::TextOptions wrapped = options;
+            wrapped.wordWrap = true;
+            renderer.drawText(*line, lineArea, res.caption, res.subtitle, wrapped);
+            y += height2 + static_cast<float>(scale.dip(2.0));
+            if (y > frame.bottom) break;
+        }
+    }
+
     // Рендерер создаётся лениво: в WM_NCCREATE клиентская область ещё нулевая, а
     // create() на нулевом размере честно отказывается (§7 renderer.hpp). Попытка
     // повторяется на каждом WM_SIZE, то есть как только окно получило размер, и
@@ -2120,6 +2267,13 @@ struct ViewState {
     void paintMapWithRenderer() {
         const MapResources& res = mapResources;
         const MapLayout layout = mapLayoutNow();
+        // Нет ни одного диска — рисуем не пустоту, а состояние с причиной.
+        // Иначе окно «Дисков» было бы единственным экраном волны, который
+        // выглядит как программа сломанной (см. также paintMapEmptyWithGdi).
+        if (layout.bars.empty() || !mapHasContent(layout)) {
+            paintMapEmptyWithRenderer(res);
+            return;
+        }
         const float minLabel = static_cast<float>(mapMetrics.minLabelSegmentDip);
         for (const MapBar& bar : layout.bars) {
             render::TextOptions options;
@@ -2192,6 +2346,10 @@ struct ViewState {
         HBRUSH surface = ::CreateSolidBrush(theme::colorRef(palette.surface));
         ::FillRect(dc, &client, surface);
         ::DeleteObject(surface);
+        if (layout.bars.empty() || !mapHasContent(layout)) {
+            paintMapEmptyWithGdi(dc, scale);
+            return;
+        }
 
         HBRUSH track = ::CreateSolidBrush(theme::colorRef(palette.surfaceAlt));
         HBRUSH segment = ::CreateSolidBrush(theme::colorRef(palette.accent));
@@ -2236,9 +2394,78 @@ struct ViewState {
         ::DeleteObject(danger);
     }
 
+    // Тот же экран состояния, что и на Direct2D, но на GDI. Он нужен не для
+    // красоты, а для честности: если рендерер не поднялся (нет D3D11, отказ
+    // драйвера), экран всё равно обязан объяснять, что происходит, — §5 «ни один
+    // отказ не оставляет окно пустым».
+    void paintMapEmptyWithGdi(HDC dc, const theme::Metrics& scale) {
+        const theme::Palette& palette = theme.palette();
+        const MapEmptyState state = mapEmptyState();
+        RECT client{};
+        ::GetClientRect(map, &client);
+        // Фон — из темы, а не из кисти класса окна: карта рисуется этим путём
+        // всегда (см. paintMap), и белая полоса посреди тёмной темы была бы
+        // не состоянием, а обрывом интерфейса.
+        HBRUSH surface = ::CreateSolidBrush(theme::colorRef(palette.surface));
+        ::FillRect(dc, &client, surface);
+        ::DeleteObject(surface);
+        const auto px = [&scale](float dip) {
+            return static_cast<LONG>(std::lround(static_cast<double>(dip) * scale.scale));
+        };
+        const LONG pad = px(16.0F);
+        RECT frame{pad, pad, std::max(pad + 1L, client.right - pad), std::max(pad + 1L, client.bottom - pad)};
+
+        HPEN border = ::CreatePen(PS_DOT, 1, theme::colorRef(palette.border));
+        const HGDIOBJ oldPen = ::SelectObject(dc, border);
+        const HGDIOBJ oldBrush = ::SelectObject(dc, ::GetStockObject(NULL_BRUSH));
+        (void)::Rectangle(dc, frame.left, frame.top, frame.right, frame.bottom);
+        ::SelectObject(dc, oldBrush);
+        ::SelectObject(dc, oldPen);
+        ::DeleteObject(border);
+
+        ::SetBkMode(dc, TRANSPARENT);
+        const LONG textLeft = frame.left + px(12.0F);
+        const LONG textWidth = std::max(1L, frame.right - textLeft - px(12.0F));
+        LONG y = frame.top + px(10.0F);
+        const DWORD flags = DT_LEFT | DT_WORDBREAK | DT_NOPREFIX;
+
+        ::SetTextColor(dc, theme::colorRef(palette.textPrimary));
+        if (fonts[0] != nullptr) ::SelectObject(dc, fonts[0]);
+        RECT headline{textLeft, y, textLeft + textWidth, y + px(20.0F)};
+        const std::wstring headlineText = toWide(state.headline);
+        (void)::DrawTextW(dc, headlineText.c_str(), -1, &headline, flags);
+        y = headline.bottom + px(4.0F);
+
+        ::SetTextColor(dc, theme::colorRef(palette.textSecondary));
+        if (fonts[1] != nullptr) ::SelectObject(dc, fonts[1]);
+        for (const std::string* line : {&state.reason, &state.action}) {
+            const std::wstring wide = toWide(*line);
+            RECT area{textLeft, y, textLeft + textWidth, frame.bottom};
+            (void)::DrawTextW(dc, wide.c_str(), -1, &area, flags | DT_CALCRECT);
+            const LONG height = std::max(area.bottom, y + px(16.0F)) - y;
+            area.bottom = y + height;
+            (void)::DrawTextW(dc, wide.c_str(), -1, &area, flags);
+            y = area.bottom + px(2.0F);
+            if (y > frame.bottom) break;
+        }
+    }
+
     LRESULT paintMap() {
         PAINTSTRUCT paint{};
         HDC dc = ::BeginPaint(map, &paint);
+        // Пустая карта рисуется GDI, а не Direct2D — и это не запасной путь, а
+        // требование задачи: подпись «устройства не прочитаны» обязана быть
+        // видна всегда. Обмен с DXGI на дочернем окне (карта — child хоста
+        // содержимого) presents не всегда: проверено снимком, окно карты
+        // оставалось белым при живом рендерере, то есть текст, нарисованный
+        // блендером, просто не доезжал до экрана. GDI пишет прямо в DC окна и
+        // доезжает всегда; когда диски есть, карта по-прежнему рисуется
+        // рендерером (ADR-003: полосы пропорционально размеру).
+        if (mapLayoutNow().bars.empty() || !mapHasContent(mapLayoutNow())) {
+            paintMapEmptyWithGdi(dc, theme::metricsForDpi(static_cast<unsigned>(dpi)));
+            ::EndPaint(map, &paint);
+            return 0;
+        }
         ensureRenderer();
         if (renderer.ready() && mapResources.complete()) {
             // GDI-путь сам выводит кадр в клиентскую область, поэтому там
@@ -2380,6 +2607,70 @@ struct ViewState {
         if (!controlsReady) return;
         syncListSelection();
         refreshCardAndMap();
+    }
+
+    // ------------------------------------------------------------------------
+    // Приём кадров из фонового потока
+    // ------------------------------------------------------------------------
+    //
+    // Экран подписан на раздачу сам, в своём create(), и больше ни от кого не
+    // зависит: обход дисков (2 с на устройство, §4 FR-1) идёт в фоне, а сюда
+    // приезжает уже готовый неизменяемый снимок (§6.4). Раньше подписки не было
+    // ни у одного экрана, и модель молча оставалась пустой — это и есть «экран
+    // умеет рисовать пустоту».
+    void attachFeed() {
+        if (feed != nullptr || window == nullptr) return;
+        feed = mv::StartupFeed::instance().subscribe(window);
+        // Если снимок успел приехать до подписки (окно пересоздали), берём его
+        // сразу: ждать следующего обхода ради уже известных данных нельзя.
+        if (const std::shared_ptr<const core::DiskInventory> ready = mv::StartupFeed::instance().inventory()) {
+            model.publishInventory(ready);
+        }
+        mv::StartupFeed::instance().start();
+    }
+
+    void detachFeed() noexcept {
+        if (feed == nullptr) return;
+        mv::StartupFeed::instance().unsubscribe(feed);
+        feed.reset();
+    }
+
+    // Вызывается из обработчика mv::kFeedMessage. Один кадр за раз: очередь
+    // короткая, а на каждый кадр пересобирать весь список рано.
+    void applyFeedFrames() {
+        if (feed == nullptr) return;
+        bool changed = false;
+        mv::Event event;
+        while (feed->take(event)) {
+            switch (event.kind()) {
+            case mv::EventKind::Inventory: {
+                if (const auto inventory = event.as<core::DiskInventory>()) {
+                    model.publishInventory(inventory);
+                    changed = true;
+                }
+                break;
+            }
+            case mv::EventKind::Disks: {
+                if (const auto disks = event.as<std::vector<core::PhysicalDisk>>()) {
+                    model.publishDisks(*disks);
+                    changed = true;
+                }
+                break;
+            }
+            case mv::EventKind::Notice:
+            case mv::EventKind::Error: {
+                const std::shared_ptr<const std::string> text = event.as<std::string>();
+                if (text) {
+                    setChildText(status, *text);
+                    changed = true;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        if (changed) refreshAll();
     }
 
     // Только содержимое выбранного узла. Вызывается прямо из LVN_ITEMCHANGED —
@@ -2854,6 +3145,12 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         case kMsgSyncModel:
             state->refreshAll();
             return 0;
+        case mv::kFeedMessage:
+            // Кадр из фонового обхода: снимок инвентаризации или причина, по
+            // которой её нет. Разбор здесь, а не в наблюдателе: модель меняется
+            // только в UI-потоке (§6.1).
+            state->applyFeedFrames();
+            return 0;
         case WM_ERASEBKGND:
             // Дети перекрывают окно целиком; стирать собственную поверхность
             // незачем.
@@ -2914,6 +3211,7 @@ DisksScreen::~DisksScreen() { destroy(); }
 HWND DisksScreen::create(HWND parent, int dpi) {
     auto& state = *impl_;
     if (parent == nullptr) return nullptr;
+    ensureStrings();
     if (state.window != nullptr) return state.window;
     if (dpi > 0) state.dpi = dpi;
     state.theme.setDpi(static_cast<unsigned>(state.dpi));
@@ -2963,6 +3261,8 @@ HWND DisksScreen::create(HWND parent, int dpi) {
     state.applyPalette();
     state.applyFonts();
     state.refreshAll();
+    state.attachFeed();
+    state.refreshAll();
     return state.window;
 }
 
@@ -2980,6 +3280,7 @@ void DisksScreen::destroy() noexcept {
     ::DestroyWindow(window);
     state.rowKeys.clear();
     state.children.clear();
+    state.detachFeed();
     state.map = nullptr;
     state.list = nullptr;
     state.status = nullptr;

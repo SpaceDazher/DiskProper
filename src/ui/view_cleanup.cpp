@@ -14,11 +14,15 @@
 #include <cstddef>
 #include <exception>
 #include <map>
+#include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "core/log.hpp"
+#include "locale.hpp"
+#include "mv_bridge.hpp"
 #include "theme.hpp"
 
 namespace mrproper::ui::cleanup {
@@ -46,6 +50,15 @@ void logWin32(std::string_view event, std::string_view where, unsigned long code
     fields.push_back(core::logField("where", where));
     fields.push_back(core::logField("code", code));
     core::Logger::instance().write(core::LogLevel::Warn, event, "Win32 call failed", std::move(fields));
+}
+
+// Каталог строк грузит оболочка при старте (locale.hpp:456: «до создания
+// окон»), но вызова initialize() в проекте нет вообще — проверено поиском по
+// src/. Без него подписи экранов остаются ключами («cleanup.tree»,
+// «units.byte»), поэтому экран поднимает каталог сам. Идемпотентно и дёшево:
+// повторный вызов не нужен, проверяется флаг.
+void ensureStrings() noexcept {
+    if (!mrproper::ui::isInitialized()) (void)mrproper::ui::initialize();
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +228,13 @@ std::string categoryTitle(std::string_view categoryId) {
     const std::string key = categoryKey(categoryId);
     if (!key.empty()) return tr(key);
     return std::string(categoryId);
+}
+
+// Двуязычный выбор для слов, которых нет в каталоге строк (ui::locale — файл
+// чужой). Тот же приём, что у экрана «Диски»: интерфейс остаётся
+// двуязычным, а ключи для владельца каталога перечислены в отчёте по задаче.
+std::string_view pick(std::string_view ru, std::string_view en) {
+    return currentLanguage() == core::Language::English ? en : ru;
 }
 
 const char* toString(CheckState state) noexcept {
@@ -1435,6 +1455,7 @@ enum : UINT_PTR {
     kChildDryRunList,
     kChildDryRunClose,
     kChildFirstButton,
+    kChildHint,
 };
 
 // Три состояния чекбокса на «можно» и на «нельзя». Выключенные нужны узлам,
@@ -1484,6 +1505,7 @@ struct ViewState {
     HWND status{nullptr};
     HWND details{nullptr};
     HWND tree{nullptr};
+    HWND hint{nullptr};
     HWND dryRunTitle{nullptr};
     HWND dryRunList{nullptr};
     HWND dryRunClose{nullptr};
@@ -1494,6 +1516,8 @@ struct ViewState {
     std::vector<NodeRef> nodeRefs;
     std::vector<HTREEITEM> nodeHandles;
     std::vector<ChildProc> children;
+    std::shared_ptr<mv::ScreenEndpoint> feed;
+    std::shared_ptr<const core::RuleSet> ruleSet;
     bool syncing{false};
     bool controlsReady{false};
     bool marquee{false};
@@ -1825,6 +1849,100 @@ struct ViewState {
         ::ShowWindow(child, show);
     }
 
+    // Пояснение поверх дерева — ровно тогда, когда дерево пусто. Показывать его
+    // всегда нельзя: закрытый текстом скан это хуже, чем дерево.
+    void placeHint(const CleanupLayout& layout) {
+        if (hint == nullptr) return;
+        const bool empty = model.categories().empty();
+        const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
+        const int pad = std::max(2, scale.dip(8.0));
+        const CleanupRect treeRect = layout.treeRect();
+        int height = treeRect.height;
+        if (empty) {
+            // Пояснению нужна высота. Дерево без скана занимает полосу в 120 px,
+            // а текста в нём четыре строки: рамка оставалась нарисованной, но
+            // пустой (проверено снимком окна). Нижняя граница — клиентская
+            // область, иначе рамка уезжает под нижние кнопки.
+            RECT client{};
+            if (::GetClientRect(window, &client) == FALSE) return;
+            height = std::max(height, static_cast<int>(scale.dip(150.0)));
+            height = std::min(height, std::max(0, static_cast<int>(client.bottom) - treeRect.y - pad));
+        }
+        const CleanupRect box{treeRect.x + pad, treeRect.y + pad,
+                              std::max(treeRect.x + pad, treeRect.x + treeRect.width - pad),
+                              treeRect.y + pad + std::max(0, height - 2 * pad)};
+        if (empty && !box.empty()) {
+            ::SetWindowPos(hint, HWND_TOP, box.x, box.y, box.width, box.height, SWP_NOACTIVATE);
+            ::ShowWindow(hint, SW_SHOW);
+        } else {
+            ::ShowWindow(hint, SW_HIDE);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Набор правил и статусы из фонового потока
+    // ------------------------------------------------------------------------
+    //
+    // Экран «Очистки» получает кандидатов только после скана, а скан запускает
+    // человек. Пока скана не было, дерево пусто — и оно обязано объяснять это и
+    // называть, что будет искать набор правил (FR-3/FR-4), иначе экран выглядит
+    // как «ничего не нашлось».
+    void attachFeed() {
+        if (feed != nullptr || window == nullptr) return;
+        feed = mv::StartupFeed::instance().subscribe(window);
+        if (const std::shared_ptr<const core::RuleSet> ready = mv::StartupFeed::instance().ruleSet()) {
+            ruleSet = ready;
+        }
+        mv::StartupFeed::instance().start();
+    }
+
+    void detachFeed() noexcept {
+        if (feed == nullptr) return;
+        mv::StartupFeed::instance().unsubscribe(feed);
+        feed.reset();
+    }
+
+    void applyFeedFrames() {
+        if (feed == nullptr) return;
+        bool changed = false;
+        mv::Event event;
+        while (feed->take(event)) {
+            switch (event.kind()) {
+            case mv::EventKind::RuleSet: {
+                if (const auto rules = event.as<core::RuleSet>()) {
+                    ruleSet = rules;
+                    changed = true;
+                }
+                break;
+            }
+            case mv::EventKind::Notice:
+            case mv::EventKind::Error: {
+                if (const std::shared_ptr<const std::string> text = event.as<std::string>()) {
+                    setChildText(status, *text);
+                    changed = true;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        if (changed) refreshAll();
+    }
+
+    // Сколько правил и сколько категорий в наборе — для текста пояснения. Ноль
+    // означает «набор ещё читается», и тогда текст об этом и говорит.
+    [[nodiscard]] std::size_t ruleCount() const noexcept {
+        return ruleSet ? ruleSet->rules.size() : 0U;
+    }
+
+    [[nodiscard]] std::size_t ruleCategoryCount() const noexcept {
+        if (!ruleSet) return 0U;
+        std::set<std::string> categories;
+        for (const core::Rule& rule : ruleSet->rules) categories.insert(rule.category);
+        return categories.size();
+    }
+
     void layout() {
         const CleanupLayout layout = currentLayout();
         const int gap = theme::metricsForDpi(static_cast<unsigned>(dpi)).dip(6.0);
@@ -1836,6 +1954,7 @@ struct ViewState {
                                        std::max(0, layout.dryRunRect().width / 3), 20},
               layout.dryRunVisible());
         place(dryRunClose, layout.dryRunCloseRect(), layout.dryRunVisible());
+        placeHint(layout);
 
         // Полоса прогресса и подпись состояния делят одну строку: подпись важнее
         // точной ширины полосы, а «Отмена запрошена…» человек должен прочитать,
@@ -2091,6 +2210,11 @@ struct ViewState {
                                        nullptr);
         dryRunClose = ::CreateWindowExW(0, L"BUTTON", nullptr, childVisible | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 0, 0,
                                         window, reinterpret_cast<HMENU>(kChildDryRunClose), instance, nullptr);
+        // Пояснение вместо пустого дерева категорий. Создаётся всегда, показывается
+        // только когда дерево пусто: «скана не было» и «дерево сломалось» — это
+        // разные ситуации, и без слов они выглядят одинаково.
+        hint = ::CreateWindowExW(0, L"STATIC", nullptr, childVisible | SS_OWNERDRAW, 0, 0, 0, 0, window,
+                                 reinterpret_cast<HMENU>(kChildHint), instance, nullptr);
         const std::array<ControlId, 7> ids{ControlId::Clean,        ControlId::Cancel,      ControlId::Rescan,
                                            ControlId::ShowAll,      ControlId::SelectAll,   ControlId::ClearSelection,
                                            ControlId::Undo};
@@ -2100,8 +2224,8 @@ struct ViewState {
                                            reinterpret_cast<HMENU>(static_cast<UINT_PTR>(ids[i])), instance,
                                            nullptr);
         }
-        const std::array<HWND, 12> created{summary, progress, status, details, tree,  dryRunTitle, dryRunList,
-                                           dryRunClose, buttons[0], buttons[1], buttons[2], buttons[3]};
+        const std::array<HWND, 13> created{summary, progress, status, details, tree,  dryRunTitle, dryRunList,
+                                           dryRunClose, hint, buttons[0], buttons[1], buttons[2], buttons[3]};
         for (const HWND child : created) {
             if (child == nullptr) {
                 logWin32("ui.cleanup.create", "CreateWindowExW(child)", ::GetLastError());
@@ -2114,6 +2238,7 @@ struct ViewState {
             // навигация, фокус», §7.2). Панель агрегатов и полоса прогресса
             // фокуса не получают (у них нет WS_TABSTOP), им подкласс не нужен.
             if (child == summary || child == progress) continue;
+            if (child == hint) continue;  // подпись без клавиш: подкласс ей не нужен
             createChild(child);
         }
         for (const HWND button : buttons) {
@@ -2242,6 +2367,76 @@ LRESULT drawSummary(ViewState& state, const DRAWITEMSTRUCT& draw) {
     return TRUE;
 }
 
+// Пояснение вместо пустого дерева категорий: заголовок, причина, что будет
+// искать набор правил и куда нажать.
+//
+// Слова берутся из двух источников и это важно: «скан ещё не выполнялся» — из
+// состояния модели, «правил N по M категориям» — из набора, который пришёл из
+// фонового потока. Человек видит, что приложение знает, что искать, и жмёт
+// одну кнопку, вместо того чтобы гадать, не сломалось ли что-то.
+LRESULT drawHint(ViewState& state, const DRAWITEMSTRUCT& draw) {
+    const theme::Palette& palette = state.theme.palette();
+    const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(state.dpi));
+    HDC dc = draw.hDC;
+    RECT box = draw.rcItem;
+
+    HBRUSH surface = ::CreateSolidBrush(theme::colorRef(palette.surface));
+    ::FillRect(dc, &box, surface);
+    ::DeleteObject(surface);
+    HBRUSH border = ::CreateSolidBrush(theme::colorRef(palette.border));
+    ::FrameRect(dc, &box, border);
+    ::DeleteObject(border);
+
+    const int pad = std::max(2, scale.dip(12.0));
+    const int titleHeight = std::max(10, scale.dip(22.0));
+    RECT inner{box.left + pad, box.top + pad, box.right - pad, box.bottom - pad};
+    if (inner.bottom <= inner.top) return TRUE;
+
+    const bool scanning = state.model.progress().busy();
+    const std::size_t rules = state.ruleCount();
+    const std::size_t categories = state.ruleCategoryCount();
+
+    std::vector<std::wstring> lines;
+    lines.push_back(toWide(pick("Скан ещё не выполнялся", "No scan has run yet")));
+    if (scanning) {
+        lines.push_back(toWide(pick("Идёт обход: файлы и кэши считаются в фоне, дерево появится само.",
+                                    "The walk is running: files and caches are counted in the background, the "
+                                    "tree appears on its own.")));
+    } else {
+        lines.push_back(toWide(pick("Дерево категорий заполняется результатами скана. Ничего не удаляется без "
+                                    "вашего выбора.",
+                                    "The category tree is filled from the scan results. Nothing is deleted "
+                                    "without your selection.")));
+    }
+    if (rules > 0) {
+        lines.push_back(toWide("Набор правил: " + std::to_string(rules) + " правил, " +
+                               std::to_string(categories) + " категорий — по ним и будет искаться мусор."));
+    } else {
+        lines.push_back(toWide(pick("Набор правил ещё читается с диска (фоновый поток).",
+                                    "The rule set is still being read from disk (background thread).")));
+    }
+    lines.push_back(toWide(std::string("Нажмите «") + tr(StringId::kActionRescan) + "»."));
+
+    ::SetBkMode(dc, TRANSPARENT);
+    if (state.fonts[0] != nullptr) ::SelectObject(dc, state.fonts[0]);
+    ::SetTextColor(dc, theme::colorRef(palette.textPrimary));
+    RECT title{inner.left, inner.top, inner.right, std::min(inner.bottom, inner.top + titleHeight)};
+    ::DrawTextW(dc, lines.front().c_str(), -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+
+    if (state.fonts[2] != nullptr) ::SelectObject(dc, state.fonts[2]);
+    ::SetTextColor(dc, theme::colorRef(palette.textSecondary));
+    constexpr DWORD wrap = DT_LEFT | DT_WORDBREAK | DT_NOPREFIX;
+    int y = title.bottom + scale.dip(4.0);
+    for (std::size_t i = 1; i < lines.size(); ++i) {
+        RECT line{inner.left, y, inner.right, inner.bottom};
+        (void)::DrawTextW(dc, lines[i].c_str(), -1, &line, wrap | DT_CALCRECT);
+        if (line.bottom <= y) break;
+        (void)::DrawTextW(dc, lines[i].c_str(), -1, &line, wrap);
+        y = line.bottom + scale.dip(4.0);
+        if (y >= inner.bottom) break;
+    }
+    return TRUE;
+}
 
 
 // Обработчик окна экрана. Исключение не пересекает границу Win32 (§5): ловим
@@ -2395,6 +2590,10 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
                 draw->hwndItem == state->summary) {
                 return drawSummary(*state, *draw);
             }
+            if (draw->CtlType == ODT_STATIC && draw->CtlID == kChildHint &&
+                draw->hwndItem == state->hint) {
+                return drawHint(*state, *draw);
+            }
             break;
         }
         case WM_CTLCOLORSTATIC: {
@@ -2418,10 +2617,33 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         case kMsgSyncModel:
             state->refreshAll();
             return 0;
+        case mv::kFeedMessage:
+            // Набор правил или причина отказа. Модель экрана не трогаем: до скана
+            // ей нечего знать, текст пояснения строится из набора (§6.1).
+            state->applyFeedFrames();
+            return 0;
         case WM_ERASEBKGND: {
             // Дети перекрывают окно целиком; стирать собственную поверхность
             // незачем, а лишнее стирание мигает при перерисовке дерева.
             return 1;
+        }
+        case WM_PAINT: {
+            // Фон окна — из темы. Раньше WM_PAINT у экрана «Очистка» не
+            // обрабатывался вовсе, а WM_ERASEBKGND отвечал «стёрто», так что
+            // область между контролами оставалась тем цветом, что закрасила
+            // системная кисть класса окна: в тёмной теме это белый прямоугольник
+            // во всю страницу (проверено снимком окна).
+            PAINTSTRUCT paint{};
+            HDC dc = ::BeginPaint(window, &paint);
+            if (dc != nullptr) {
+                RECT client{};
+                ::GetClientRect(window, &client);
+                if (state->surfaceBrush != nullptr) {
+                    ::FillRect(dc, &client, state->surfaceBrush);
+                }
+            }
+            (void)::EndPaint(window, &paint);
+            return 0;
         }
         case WM_DESTROY:
             state->controlsReady = false;
@@ -2481,6 +2703,7 @@ CleanupScreen::~CleanupScreen() { destroy(); }
 HWND CleanupScreen::create(HWND parent, int dpi) {
     auto& state = *impl_;
     if (parent == nullptr) return nullptr;
+    ensureStrings();
     if (state.window != nullptr) return state.window;
     if (dpi > 0) state.dpi = dpi;
 
@@ -2513,6 +2736,7 @@ HWND CleanupScreen::create(HWND parent, int dpi) {
     }
     state.applyPalette();
     state.applyFonts();
+    state.attachFeed();
     state.refreshAll();
     return state.window;
 }
@@ -2529,6 +2753,7 @@ void CleanupScreen::destroy() noexcept {
     // исходную процедуру. Список children здесь не чистим — иначе подкласс
     // остался бы на уничтоженном контроле.
     ::DestroyWindow(window);
+    state.detachFeed();
     state.nodeRefs.clear();
     state.nodeHandles.clear();
     state.children.clear();
@@ -2537,6 +2762,7 @@ void CleanupScreen::destroy() noexcept {
     state.status = nullptr;
     state.details = nullptr;
     state.tree = nullptr;
+    state.hint = nullptr;
     state.dryRunTitle = nullptr;
     state.dryRunList = nullptr;
     state.dryRunClose = nullptr;
@@ -2603,3 +2829,521 @@ void CleanupScreen::setUndoAvailable(bool available) {
 
 
 }  // namespace mrproper::ui::cleanup
+
+// ---------------------------------------------------------------------------
+// Экран «Обзор»
+// ---------------------------------------------------------------------------
+//
+// Почему он здесь, объяснено в заголовке (view_cleanup.hpp). Здесь только
+// рисование: четыре плитки с числами, версия набора правил и — когда скана не
+// было — прямое указание, что нажать.
+//
+// Рисование целиком на GDI в WM_PAINT по одной причине: этот экран не должен
+// зависеть от Direct2D. В отличие от карты разделов у него нет графики собственной
+// природы, а §7 ADR-003 прямо запрещает рисовать интерфейс целиком вручную там,
+// где хватает контролов. Здесь контролов нет по существу (плитки и текст), но
+// Direct2D-рендерер поднимается один на процесс и принадлежит экрану «Диски» —
+// завязывать на него сводку значило бы получить пустую страницу там, где
+// рендерер не поднялся (нет D3D11), а §5 требует обратного.
+namespace mrproper::ui::overview {
+namespace {
+
+constexpr wchar_t kOverviewViewClass[] = L"MrProper.OverviewView";
+
+// Идентификаторы кнопок. Диапазон свой (§7.1), чтобы WM_COMMAND экрана «Диски»
+// или «Очистки» не пришёл сюда под тем же номером.
+enum : int { kOverviewScanButton = 1, kOverviewDisksButton = 2 };
+
+struct ViewState {
+    OverviewScreen::Callbacks callbacks;
+    OverviewSnapshot snapshot;
+    theme::Theme theme;
+    int dpi{96};
+
+    HWND window{nullptr};
+    HWND scanButton{nullptr};
+    HWND disksButton{nullptr};
+    std::array<HFONT, 5> fonts{};
+    HBRUSH surfaceBrush{nullptr};
+    std::shared_ptr<mv::ScreenEndpoint> feed;
+    bool controlsReady{false};
+    bool syncing{false};
+
+    ~ViewState() {
+        for (HFONT& font : fonts) {
+            if (font != nullptr) ::DeleteObject(font);
+        }
+        if (surfaceBrush != nullptr) ::DeleteObject(surfaceBrush);
+    }
+
+    [[nodiscard]] theme::Metrics scale() const {
+        return theme::metricsForDpi(static_cast<unsigned>(dpi > 0 ? dpi : 96));
+    }
+
+    void applyFonts() {
+        const theme::Typography typography = theme::makeTypography(static_cast<unsigned>(dpi));
+        const std::array<theme::FontRole, 5> roles{theme::FontRole::Title, theme::FontRole::Metric,
+                                                   theme::FontRole::BodyStrong, theme::FontRole::Body,
+                                                   theme::FontRole::Caption};
+        for (std::size_t i = 0; i < fonts.size(); ++i) {
+            if (fonts[i] != nullptr) ::DeleteObject(fonts[i]);
+            const LOGFONTW logFont = typography.forRole(roles[i]).toLogFont(static_cast<unsigned>(dpi));
+            fonts[i] = ::CreateFontIndirectW(&logFont);
+        }
+    }
+
+    void applyPalette() {
+        if (surfaceBrush != nullptr) ::DeleteObject(surfaceBrush);
+        surfaceBrush = ::CreateSolidBrush(theme::colorRef(theme.palette().surface));
+    }
+
+    // --- Раскладка ----------------------------------------------------------
+    //
+    // Сетка из двух рядов по две плитки, потом пояснение. Числа не «плавают»:
+    // ширина плитки фиксирована, а текст внутри выровнен по левому краю, чтобы
+    // десятки гигабайт и единицы не прыгали при обновлении (SPEC §12).
+    struct Tile {
+        RECT rect;
+        std::wstring name;    // что это за число: «Диски», «Свободно», ...
+        std::wstring value;
+        std::wstring caption;
+    };
+
+    [[nodiscard]] std::vector<Tile> tiles() const {
+        const bool en = currentLanguage() == core::Language::English;
+        const theme::Metrics metrics = scale();
+        RECT client{};
+        if (window == nullptr || ::GetClientRect(window, &client) == FALSE) return {};
+        const int pad = std::max(4, metrics.dip(12.0));
+        const int gap = std::max(2, metrics.dip(8.0));
+        const int tileHeight = std::max(24, metrics.dip(64.0));
+        const int columnWidth = (client.right - pad * 2 - gap) / 2;
+
+        // Четыре плитки в фиксированном порядке: диски, свободно, кандидаты,
+        // освободится. «Нет данных» и «нет скана» — это разные надписи, а не
+        // ноль: ноль после скана и ноль без скана значат разное (§4 FR-3).
+        const std::string disks = snapshot.inventoryKnown ? std::to_string(snapshot.diskCount)
+                                                          : (en ? "reading..." : "читаем...");
+        const std::string freeText = snapshot.inventoryKnown ? formatBytes(snapshot.freeBytes) : (en ? "-" : "—");
+        const std::string candidates =
+            snapshot.scanned ? std::to_string(snapshot.candidates) : (en ? "no scan" : "скана не было");
+        const std::string reclaim = snapshot.scanned ? formatBytes(snapshot.reclaimableBytes) : (en ? "-" : "—");
+
+        std::vector<Tile> out;
+        const int top = pad + std::max(10, metrics.dip(24.0)) + std::max(2, metrics.dip(8.0));
+        out.push_back(Tile{{pad, top, pad + columnWidth, top + tileHeight},
+                           toWide(en ? "Disks" : "Диски"), toWide(disks),
+                           toWide(snapshot.inventoryKnown
+                                      ? std::to_string(snapshot.diskCount) + " · " + formatBytes(snapshot.totalBytes)
+                                      : (en ? "disks: read in the background" : "дисков: читается в фоне"))});
+        out.push_back(Tile{{pad + columnWidth + gap, top, client.right - pad, top + tileHeight},
+                           toWide(en ? "Free" : "Свободно"), toWide(freeText),
+                           toWide(en ? "free on all volumes" : "свободно на всех томах")});
+        out.push_back(Tile{{pad, top + tileHeight + gap, pad + columnWidth, top + tileHeight * 2 + gap},
+                           toWide(en ? "Candidates" : "Кандидаты"), toWide(candidates),
+                           toWide(en ? "candidates found" : "кандидатов найдено")});
+        out.push_back(Tile{{pad + columnWidth + gap, top + tileHeight + gap, client.right - pad,
+                            top + tileHeight * 2 + gap},
+                           toWide(en ? "Reclaimable" : "Освободится"), toWide(reclaim),
+                           toWide(en ? "can be freed" : "можно освободить")});
+        return out;
+    }
+
+    [[nodiscard]] std::vector<std::wstring> notes() const {
+        const bool en = currentLanguage() == core::Language::English;
+        std::vector<std::wstring> out;
+        if (snapshot.scanned) {
+            out.push_back(toWide(en ? "Scan is done. Choose what to delete on the Cleanup page — nothing is deleted "
+                                      "without your selection."
+                                  : "Скан выполнен. Выберите, что удалить, на странице «Очистка»: без вашего выбора "
+                                    "ничего не удаляется."));
+        } else {
+            out.push_back(toWide(en ? "Nothing is deleted and nothing is counted until you scan: press Scan and the "
+                                      "categories appear with real sizes."
+                                  : "Пока вы не просканируете, ничего не считается и ничего не удаляется: нажмите "
+                                    "«Сканировать», и категории появятся с реальными размерами."));
+        }
+        if (snapshot.ruleCount > 0) {
+            out.push_back(toWide(en ? "Rule set: " + std::to_string(snapshot.ruleCount) + " rules, version " +
+                                          snapshot.ruleVersion
+                                      : "Набор правил: " + std::to_string(snapshot.ruleCount) + " правил, версия " +
+                                            snapshot.ruleVersion));
+        } else {
+            out.push_back(toWide(en ? "The rule set is still being read from disk (background thread)."
+                                  : "Набор правил ещё читается с диска (фоновый поток)."));
+        }
+        return out;
+    }
+
+    // --- Данные -------------------------------------------------------------
+
+    void attachFeed() {
+        if (feed != nullptr || window == nullptr) return;
+        feed = mv::StartupFeed::instance().subscribe(window);
+        if (const std::shared_ptr<const core::DiskInventory> inventory = mv::StartupFeed::instance().inventory()) {
+            applyInventory(*inventory);
+        }
+        if (const std::shared_ptr<const core::RuleSet> rules = mv::StartupFeed::instance().ruleSet()) {
+            applyRules(*rules);
+        }
+        mv::StartupFeed::instance().start();
+    }
+
+    void detachFeed() noexcept {
+        if (feed == nullptr) return;
+        mv::StartupFeed::instance().unsubscribe(feed);
+        feed.reset();
+    }
+
+    void applyInventory(const core::DiskInventory& inventory) {
+        // Агрегаты берёт core::disk_model, а не экран: те же числа показывает
+        // страница «Диски» и пишет отчёт (§11.4 — одно число на все поверхности).
+        const core::InventoryUsage& usage = inventory.usage();
+        snapshot.diskCount = inventory.disks().size();
+        snapshot.totalBytes = usage.totalBytes;
+        snapshot.freeBytes = usage.freeBytes;
+        snapshot.inventoryKnown = true;
+    }
+
+    void applyRules(const core::RuleSet& rules) {
+        snapshot.ruleCount = rules.rules.size();
+        snapshot.ruleVersion = rules.version;
+    }
+
+    void applyFeedFrames() {
+        if (feed == nullptr) return;
+        bool changed = false;
+        mv::Event event;
+        while (feed->take(event)) {
+            switch (event.kind()) {
+            case mv::EventKind::Inventory: {
+                if (const auto inventory = event.as<core::DiskInventory>()) {
+                    applyInventory(*inventory);
+                    changed = true;
+                }
+                break;
+            }
+            case mv::EventKind::RuleSet: {
+                if (const auto rules = event.as<core::RuleSet>()) {
+                    applyRules(*rules);
+                    changed = true;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        if (changed) refresh();
+    }
+
+    // --- Рисование ----------------------------------------------------------
+
+    void draw(HDC dc) {
+        const theme::Palette& palette = theme.palette();
+        const theme::Metrics metrics = scale();
+        RECT client{};
+        (void)::GetClientRect(window, &client);
+        HBRUSH surface = ::CreateSolidBrush(theme::colorRef(palette.surface));
+        (void)::FillRect(dc, &client, surface);
+        ::DeleteObject(surface);
+
+        ::SetBkMode(dc, TRANSPARENT);
+        constexpr DWORD single = DT_LEFT | DT_SINGLELINE | DT_NOPREFIX;
+        constexpr DWORD wrap = DT_LEFT | DT_WORDBREAK | DT_NOPREFIX;
+
+        int y = std::max(2, metrics.dip(10.0));
+        const int pad = std::max(2, metrics.dip(12.0));
+        if (fonts[0] != nullptr) ::SelectObject(dc, fonts[0]);
+        ::SetTextColor(dc, theme::colorRef(palette.textPrimary));
+        const std::wstring title =
+            toWide(currentLanguage() == core::Language::English ? "Overview" : "Обзор");
+        RECT titleRect{pad, y, client.right - pad, y + std::max(10, metrics.dip(24.0))};
+        (void)::DrawTextW(dc, title.c_str(), -1, &titleRect, single | DT_VCENTER);
+        y = titleRect.bottom + metrics.dip(6.0);
+
+        for (const Tile& tile : tiles()) {
+            HBRUSH fill = ::CreateSolidBrush(theme::colorRef(palette.surfaceAlt));
+            (void)::FillRect(dc, &tile.rect, fill);
+            ::DeleteObject(fill);
+            HBRUSH border = ::CreateSolidBrush(theme::colorRef(palette.border));
+            (void)::FrameRect(dc, &tile.rect, border);
+            ::DeleteObject(border);
+
+            const int inset = std::max(2, pad / 2);
+            // Название плитки — той же вторичной краской, что и подпись: плитка
+            // читается как «подпись · число · детали», и без названия «1» и «0 Б»
+            // не о чем.
+            if (fonts[3] != nullptr) ::SelectObject(dc, fonts[3]);
+            ::SetTextColor(dc, theme::colorRef(palette.textSecondary));
+            RECT name{tile.rect.left + inset, tile.rect.top + metrics.dip(4.0), tile.rect.right - inset,
+                      tile.rect.top + metrics.dip(18.0)};
+            (void)::DrawTextW(dc, tile.name.c_str(), -1, &name, single | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+            // Число — основным цветом, а не акцентом: на тёмной теме акцент
+            // тёмный, и «0 Б» читалось как серое пятно (проверено снимком).
+            if (fonts[1] != nullptr) ::SelectObject(dc, fonts[1]);
+            ::SetTextColor(dc, theme::colorRef(palette.textPrimary));
+            RECT value{tile.rect.left + inset, name.bottom, tile.rect.right - inset,
+                       tile.rect.top + metrics.dip(44.0)};
+            (void)::DrawTextW(dc, tile.value.c_str(), -1, &value, single | DT_VCENTER | DT_END_ELLIPSIS);
+
+            if (fonts[4] != nullptr) ::SelectObject(dc, fonts[4]);
+            ::SetTextColor(dc, theme::colorRef(palette.textSecondary));
+            RECT caption{tile.rect.left + inset, value.bottom, tile.rect.right - inset, tile.rect.bottom};
+            (void)::DrawTextW(dc, tile.caption.c_str(), -1, &caption, single | DT_END_ELLIPSIS);
+        }
+        y += std::max(24, metrics.dip(64.0)) * 3 + std::max(2, metrics.dip(8.0)) * 2;
+
+        if (fonts[3] != nullptr) ::SelectObject(dc, fonts[3]);
+        ::SetTextColor(dc, theme::colorRef(palette.textSecondary));
+        for (const std::wstring& note : notes()) {
+            RECT line{pad, y, client.right - pad, client.bottom};
+            (void)::DrawTextW(dc, note.c_str(), -1, &line, wrap | DT_CALCRECT);
+            if (line.bottom <= y) break;
+            (void)::DrawTextW(dc, note.c_str(), -1, &line, wrap);
+            y = line.bottom + metrics.dip(4.0);
+            if (y >= client.bottom) break;
+        }
+    }
+
+    // --- Раскладка контролов -------------------------------------------------
+
+    void layout() {
+        if (window == nullptr) return;
+        RECT client{};
+        (void)::GetClientRect(window, &client);
+        const theme::Metrics metrics = scale();
+        const int pad = std::max(2, metrics.dip(12.0));
+        const int gap = std::max(2, metrics.dip(8.0));
+        const int height = std::max(16, metrics.dip(30.0));
+        const int width = std::max(60, metrics.dip(150.0));
+        const int y = client.bottom - pad - height;
+        if (scanButton != nullptr) {
+            ::SetWindowPos(scanButton, nullptr, pad, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+            ::ShowWindow(scanButton, SW_SHOW);
+        }
+        if (disksButton != nullptr) {
+            ::SetWindowPos(disksButton, nullptr, pad + width + gap, y, width, height,
+                           SWP_NOZORDER | SWP_NOACTIVATE);
+            ::ShowWindow(disksButton, SW_SHOW);
+        }
+    }
+
+    void refresh() {
+        if (!controlsReady) return;
+        layout();
+        (void)::InvalidateRect(window, nullptr, FALSE);
+    }
+};
+
+void logOverview(core::LogLevel level, std::string_view event, std::string_view message) noexcept {
+    core::Logger::instance().write(level, event, message, core::LogFields{});
+}
+
+void logOverviewWin32(std::string_view event, std::string_view where, unsigned long code) noexcept {
+    core::LogFields fields;
+    fields.push_back(core::logField("where", where));
+    fields.push_back(core::logField("code", code));
+    core::Logger::instance().write(core::LogLevel::Warn, event, "Win32 call failed", std::move(fields));
+}
+
+// Тот же предостерегающий вызов каталога, что и на экране «Очистка»: он живёт в
+// том же файле, и подписи обзора обязаны быть подписями, а не ключами.
+void ensureOverviewStrings() noexcept {
+    if (!mrproper::ui::isInitialized()) (void)mrproper::ui::initialize();
+}
+
+std::wstring toWideOverview(std::string_view text) {
+    if (text.empty()) return {};
+    const int needed = ::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    if (needed <= 0) return {};
+    std::wstring wide(static_cast<std::size_t>(needed), L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), wide.data(), needed);
+    return wide;
+}
+
+ViewState* stateOf(HWND window) {
+    return reinterpret_cast<ViewState*>(::GetWindowLongPtrW(window, GWLP_USERDATA));
+}
+
+LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    ViewState* state = nullptr;
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        state = create != nullptr ? static_cast<ViewState*>(create->lpCreateParams) : nullptr;
+        ::SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        if (state != nullptr) state->window = window;
+    } else {
+        state = stateOf(window);
+    }
+
+    try {
+        switch (message) {
+        case WM_CREATE:
+            return 0;
+        case WM_SIZE:
+            if (state != nullptr) state->refresh();
+            return 0;
+        case WM_ERASEBKGND:
+            // Свою поверхность закрашиваем в WM_PAINT целиком.
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            HDC dc = ::BeginPaint(window, &paint);
+            if (dc != nullptr && state != nullptr) state->draw(dc);
+            (void)::EndPaint(window, &paint);
+            return 0;
+        }
+        case WM_COMMAND: {
+            if (state == nullptr) break;
+            const WORD id = LOWORD(wParam);
+            const WORD notification = HIWORD(wParam);
+            if (notification != BN_CLICKED) break;
+            if (id == kOverviewScanButton && state->callbacks.onScan) state->callbacks.onScan();
+            if (id == kOverviewDisksButton && state->callbacks.onShowDisks) state->callbacks.onShowDisks();
+            return 0;
+        }
+        case mv::kFeedMessage:
+            if (state != nullptr) state->applyFeedFrames();
+            return 0;
+        case WM_SETTINGCHANGE:
+        case WM_THEMECHANGED:
+        case WM_SYSCOLORCHANGE: {
+            if (state == nullptr) break;
+            if (theme::classifyMessage(message, wParam, lParam) == theme::Change::None) break;
+            state->theme.reload();
+            state->applyPalette();
+            state->applyFonts();
+            state->refresh();
+            return 0;
+        }
+        case WM_DESTROY:
+            if (state != nullptr) state->controlsReady = false;
+            return 0;
+        case WM_NCDESTROY:
+            ::SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            break;
+        default:
+            break;
+        }
+    } catch (const std::exception& error) {
+        logOverview(core::LogLevel::Error, "ui.overview.exception", error.what());
+        return message == WM_CREATE ? -1 : 0;
+    }
+    return ::DefWindowProcW(window, message, wParam, lParam);
+}
+
+}  // namespace
+
+struct OverviewScreen::Impl : ViewState {
+    Impl() { dpi = static_cast<int>(theme.metrics().dpi); }
+};
+
+OverviewScreen::OverviewScreen(Callbacks callbacks) : impl_(std::make_unique<Impl>()) {
+    impl_->callbacks = std::move(callbacks);
+}
+
+OverviewScreen::~OverviewScreen() { destroy(); }
+
+HWND OverviewScreen::create(HWND parent, int dpi) {
+    auto& state = *impl_;
+    if (parent == nullptr) return nullptr;
+    ensureOverviewStrings();
+    if (state.window != nullptr) return state.window;
+    if (dpi > 0) state.dpi = dpi;
+
+    INITCOMMONCONTROLSEX controls{};
+    controls.dwSize = sizeof(controls);
+    controls.dwICC = ICC_STANDARD_CLASSES;
+    if (::InitCommonControlsEx(&controls) == FALSE) {
+        logOverviewWin32("ui.overview.create", "InitCommonControlsEx", ::GetLastError());
+    }
+
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.style = 0;
+    windowClass.lpfnWndProc = &viewProc;
+    windowClass.hInstance = ::GetModuleHandleW(nullptr);
+    windowClass.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hbrBackground = ::GetSysColorBrush(COLOR_BTNFACE);
+    windowClass.lpszClassName = kOverviewViewClass;
+    if (::RegisterClassExW(&windowClass) == 0 && ::GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        logOverviewWin32("ui.overview.create", "RegisterClassExW", ::GetLastError());
+        return nullptr;
+    }
+    state.window = ::CreateWindowExW(0, kOverviewViewClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, parent,
+                                     nullptr, windowClass.hInstance, &state);
+    if (state.window == nullptr) {
+        logOverviewWin32("ui.overview.create", "CreateWindowExW(view)", ::GetLastError());
+        return nullptr;
+    }
+
+    const bool en = currentLanguage() == core::Language::English;
+    state.scanButton = ::CreateWindowExW(0, L"BUTTON", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0,
+                                         0, 0, 0, state.window,
+                                         reinterpret_cast<HMENU>(static_cast<UINT_PTR>(kOverviewScanButton)),
+                                         windowClass.hInstance, nullptr);
+    state.disksButton = ::CreateWindowExW(0, L"BUTTON", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0,
+                                          0, 0, 0, state.window,
+                                          reinterpret_cast<HMENU>(static_cast<UINT_PTR>(kOverviewDisksButton)),
+                                          windowClass.hInstance, nullptr);
+    if (state.scanButton == nullptr || state.disksButton == nullptr) {
+        logOverviewWin32("ui.overview.create", "CreateWindowExW(button)", ::GetLastError());
+        return nullptr;
+    }
+    ::SetWindowTextW(state.scanButton, toWideOverview(en ? "Scan" : "Сканировать").c_str());
+    ::SetWindowTextW(state.disksButton, toWideOverview(en ? "Open disks" : "Открыть диски").c_str());
+    state.applyPalette();
+    state.applyFonts();
+    state.controlsReady = true;
+    state.attachFeed();
+    state.refresh();
+    return state.window;
+}
+
+HWND OverviewScreen::window() const noexcept { return impl_->window; }
+
+void OverviewScreen::destroy() noexcept {
+    auto& state = *impl_;
+    if (state.window == nullptr) return;
+    HWND window = state.window;
+    state.window = nullptr;
+    state.controlsReady = false;
+    ::DestroyWindow(window);
+    state.detachFeed();
+    state.scanButton = nullptr;
+    state.disksButton = nullptr;
+}
+
+void OverviewScreen::setDpi(int dpi) {
+    auto& state = *impl_;
+    if (dpi > 0) state.dpi = dpi;
+    state.theme.setDpi(static_cast<unsigned>(state.dpi));
+    if (state.window == nullptr) return;
+    state.applyPalette();
+    state.applyFonts();
+    state.refresh();
+}
+
+void OverviewScreen::reloadTheme() {
+    auto& state = *impl_;
+    state.theme.reload();
+    state.applyPalette();
+    state.applyFonts();
+    state.refresh();
+}
+
+void OverviewScreen::refresh() { impl_->refresh(); }
+
+void OverviewScreen::publishScanSummary(std::size_t candidates, std::uint64_t reclaimableBytes, bool scanned) {
+    auto& state = *impl_;
+    state.snapshot.candidates = candidates;
+    state.snapshot.reclaimableBytes = reclaimableBytes;
+    state.snapshot.scanned = scanned;
+    state.refresh();
+}
+
+const OverviewSnapshot& OverviewScreen::snapshot() const noexcept { return impl_->snapshot; }
+
+}  // namespace mrproper::ui::overview

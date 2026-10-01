@@ -57,7 +57,7 @@
 // Границы слоёв
 // ---------------------------------------------------------------------------
 //
-// Зависимость ровно одна и только вниз: core::log. Ни engine, ни scanner, ни
+// Зависимость ровно одна и только вниз: core. Ни engine, ни scanner, ни
 // platform в заголовке нет, и это не перестраховка:
 //
 //   * src/ui линкуется только с core и platform (см. src/ui/CMakeLists.txt),
@@ -69,6 +69,11 @@
 //   * поэтому приведение типов движка в кадры моста делает вызывающий (тот,
 //     кто и так линкует engine) обычным postSnapshot(...) — см. таблицу ниже.
 //
+// Исключение из «только core::log» — StartupFeed в конце файла: его payload'ы
+// по определению core::DiskInventory и core::RuleSet, и подменить их собственными
+// типами моста нельзя (их читают экраны и отчёт). platform и engine там по-прежнему
+// не нужны: обход дисков и чтение набора правил живут в .cpp.
+//
 // Таблица «кто что читает» (для вызывающего, который публикует):
 //
 //   EventKind::Inventory        → DisksScreen::publishInventory
@@ -78,6 +83,7 @@
 //   EventKind::OperationResult  → CleanupScreen::publishOperationResult
 //   EventKind::Phase            → CleanupScreen::beginScan/endScan/fail
 //   EventKind::UndoAvailable    → CleanupScreen::setUndoAvailable
+//   EventKind::RuleSet          → SettingsScreen::publishRuleSet
 //   EventKind::Notice, Error    → строка состояния любого экрана
 //
 // Наблюдатель достаёт payload через Event::as<T>(): тип проверяется, чужой тип
@@ -104,12 +110,16 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <typeindex>
 #include <utility>
 #include <vector>
+
+#include "core/disk_model.hpp"
+#include "core/rules.hpp"
 
 namespace mrproper::ui::mv {
 
@@ -146,6 +156,7 @@ enum class EventKind : std::uint8_t {
     UndoAvailable,    ///< появилась или исчезла возможность отмены (FR-7)
     Notice,           ///< строка в строку состояния
     Error,            ///< отказ, который обязан быть виден (§5, §12)
+    RuleSet,          ///< набор правил очистки (FR-4, ADR-008)
 };
 
 // Имя вида для журнала: читается глазами в логе и не переводится.
@@ -512,6 +523,127 @@ private:
     // секунду, иначе засоряет лог быстрее, чем его читает человек.
     static void logOnce(std::string_view event, std::string_view message, std::atomic<int>& flag) noexcept;
 
+    std::unique_ptr<Impl> impl_;
+};
+
+// ---------------------------------------------------------------------------
+// Стартовая раздача: кому вообще есть что показать
+// ---------------------------------------------------------------------------
+//
+// Проблема, которую эта часть решает, не в мосте, а в окне: пять экранов
+// написаны, но данные на них приходят из фонового потока, а этот поток
+// никто не поднимал. Модель молча остаётся пустой, и «экран умеет рисовать
+// состояние» превращается в «экран умеет рисовать пустоту» — ровно тот отказ,
+// который в этой волне и чинился.
+//
+// Поэтому раздача данных на старте живёт здесь, а не в оболочке:
+//
+//   1) StartupFeed поднимает ОДИН фоновый поток на процесс: он читает набор
+//      правил с диска и обходит устройства (оба шага — I/O, а §6.1 запрещает
+//      I/O в UI-потоке);
+//   2) результат уходит в тот же ModelViewBridge одним снимком на вид данных —
+//      то есть тем же путём «фон → UI», который уже описан в шапке файла;
+//   3) экран, подписанный через ScreenEndpoint, получает сообщение kFeedMessage
+//      в своё окно и разбирает кадр уже в UI-потоке.
+//
+// Экран подписывается сам в своём create() и не зависит ни от оболочки, ни от
+// того, вызвали ли её: пять экранов, созданных в любом порядке, получают данные
+// одинаково. Оболочке (владелец app_shell.*) остаётся только создать экраны.
+//
+// Чего раздача не делает намеренно: она НЕ запускает скан очистки и НЕ удаляет
+// ничего. Скан — это минута работы по всему диску, и запускать его без
+// человека нельзя; «Очистка» поэтому показывает состояние «скан ещё не
+// выполнялся» и кнопку, а не выдуманные кандидаты.
+
+// Сообщение, которым экран забирает кадр из очереди раздачи. WM_APP == 0x8000
+// (тот же диапазон, что у kMsgSyncModel в экранах), номер не совпадает ни с
+// одним из них: сообщения адресны окну, но одинаковый номер у пяти экранов
+// означал бы, что «перерисовать из модели» и «пришёл кадр из фона» —
+// одно и то же событие, а это разные вещи с разными последствиями.
+inline constexpr std::uint32_t kFeedMessage = 0x8000u + 0x65u;  // WM_APP + 101
+
+// Приёмник кадров на стороне экрана.
+//
+// Наблюдатель не трогает экран напрямую: он кладёт кадр в свою очередь и
+// просит окно сообщением kFeedMessage. Причина — время жизни, а не
+// осторожность: мост держит наблюдателя shared_ptr и может доставлять кадр в
+// любой момент, а экран в этот момент уже уничтожен (пользователь закрыл
+// вкладку между PostMessage и обработкой). Сообщение окну, которое исчезло,
+// просто не придёт — и это дешевле, чем разыменование висящего указателя.
+class ScreenEndpoint final : public Observer {
+public:
+    explicit ScreenEndpoint(void* window, std::uint32_t message = kFeedMessage) noexcept;
+    ~ScreenEndpoint() override;
+
+    ScreenEndpoint(const ScreenEndpoint&) = delete;
+    ScreenEndpoint& operator=(const ScreenEndpoint&) = delete;
+    ScreenEndpoint(ScreenEndpoint&&) = delete;
+    ScreenEndpoint& operator=(ScreenEndpoint&&) = delete;
+
+    [[nodiscard]] void* window() const noexcept { return window_; }
+
+    // Забрать накопленные кадры. Только UI-поток, из обработчика сообщения.
+    // Возвращает false, когда кадров нет или окно уже не наше: экран в этом
+    // случае просто ничего не перерисовывает.
+    bool take(Event& out);
+
+    // Сколько кадров пришло, а сколько забрать не удалось (окно исчезло).
+    [[nodiscard]] std::uint64_t received() const noexcept;
+    [[nodiscard]] std::uint64_t lost() const noexcept;
+
+private:
+    void onFrame(const Event& event) override;
+    void onProgress(const ProgressFrame& frame) override;
+    void onTick(const BridgeStats& stats) override;
+
+    void* window_{nullptr};
+    std::uint32_t message_{kFeedMessage};
+    // Счётчики читаются константными методами, а правится очередь — из
+    // наблюдателя; блокировка поэтому mutable (иначе const-метод не смог бы её
+    // взять, и счётчики пришлось бы отдавать копией).
+    mutable std::mutex mutex_;
+    std::vector<Event> queue_;
+    std::uint64_t received_{0};
+    std::uint64_t lost_{0};
+};
+
+// Одна раздача на процесс. Экземпляр один: два фоновых обхода дисков были бы
+// двумя минутами работы и двумя наборами чисел на экране, а §11.4 требует
+// одного.
+class StartupFeed {
+public:
+    static StartupFeed& instance() noexcept;
+
+    StartupFeed(const StartupFeed&) = delete;
+    StartupFeed& operator=(const StartupFeed&) = delete;
+    StartupFeed(StartupFeed&&) = delete;
+    StartupFeed& operator=(StartupFeed&&) = delete;
+    ~StartupFeed();
+
+    // Подписать окно экрана. Только UI-поток. Мост и окно-приёмник создаются
+    // здесь же, в первом вызове: мост обязан быть создан в UI-потоке, иначе он
+    // не знает, куда доставлять (см. «Жизненный цикл моста»).
+    [[nodiscard]] std::shared_ptr<ScreenEndpoint> subscribe(void* window, std::uint32_t message = kFeedMessage);
+
+    // Отписать экран. Только UI-поток.
+    void unsubscribe(const std::shared_ptr<ScreenEndpoint>& endpoint) noexcept;
+
+    // Поднять фоновую работу. Идемпотентно и безопасно из любого потока:
+    // повторный вызов не заводит второго потока.
+    void start() noexcept;
+
+    // Что уже приехало, — чтобы экран нарисовал данные сразу, не дожидаясь
+    // сообщения. Снимок неизменяемый; nullptr означает «ещё не приехало».
+    [[nodiscard]] std::shared_ptr<const core::DiskInventory> inventory() const noexcept;
+    [[nodiscard]] std::shared_ptr<const core::RuleSet> ruleSet() const noexcept;
+
+    // Диагностика для журнала и «О программе»: откуда взят набор правил, что с
+    // обходом дисков, сколько кадров доставлено. Одна строка, читаемая глазами.
+    [[nodiscard]] std::string toText() const;
+
+private:
+    StartupFeed();
+    struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 

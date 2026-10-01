@@ -36,14 +36,36 @@
 // Чего здесь нет и кто это должен сделать
 // ---------------------------------------------------------------------------
 //
-//   * Шрифты, цвета, переключение темы — задача 68 (theme.*): сейчас фон берётся
-//     из GetSysColorBrush(COLOR_WINDOW), то есть следует системной теме, но не
-//     перерисовывается по WM_SETTINGCHANGE.
-//   * Тексты интерфейса из ресурсов — задача 69 (locale.*): строки здесь
-//     литералы, и это осознанная заглушка.
-//   * Меню, рельс и страницы — задача 70 (nav.*).
+//   * Шрифты, цвета, переключение темы — задача 68 (theme.*): цвета рельса уже
+//     берутся оттуда, но окно целиком ещё не перерисовывается по
+//     WM_SETTINGCHANGE.
+//   * Тексты интерфейса из ресурсов — задача 69 (locale.*): подписи рельса
+//     идут через резолвер Navigator с запасным вариантом ru/en.
+//   * Меню приложения — его нет и пока не предсказано, зато рельс навигации
+//     (SPEC §7.1) рисуется здесь, GDI, без Direct2D: см. «Рельс» ниже.
 //   * Сохранение геометрии окна между запусками (реестр, FR-9) — задача 74:
 //     каркас снимает WINDOWPLACEMENT в lastPlacement() и отдаёт его наверх.
+//
+// ---------------------------------------------------------------------------
+// Рельс навигации: почему его рисует оболочка, а не рендерер
+// ---------------------------------------------------------------------------
+//
+// Рельс — узкая полоса с пятью подписями. Рисовать её Direct2D было бы
+// дороже: рельс должен быть нарисован ПЕРВЫМ кадром, до того как рендерер
+// экранов создал swap chain, — иначе окно, в котором D2D ещё не готов, снова
+// окажется пустым (ровно тот отказ, который закрывает ui-smoke.ps1). Поэтому
+// рельс рисуется обычным GDI прямо в WM_PAINT главного окна, а экран —
+// содержимое хоста содержимого. Пока Direct2D не нужен, минимальный путь
+// «создал окно → нарисовал пять подписей» не зависит ни от одного модуля
+// волны W15 и работает сам по себе.
+//
+// Цвета и шрифты приходят из ui::theme (Палитра, Типографика): констант в
+// этом файле нет. Геометрия и попадания мыши — из ui::nav (RailLayout,
+// Navigator), который про Win32 не знает и потому проверяем без окна.
+// Оговорка о фактах: набор тестов на RailLayout/Navigator в tests/unit ещё
+// не написан (все 320 тестов проходят, но ни одного на ui::nav там нет), так
+// что «проверяем» здесь пока означает «отделено от окна и потому проверяемо».
+// Добавление теста требует правки tests/unit/CMakeLists.txt — чужой файл.
 //
 // ---------------------------------------------------------------------------
 // Правила этого файла
@@ -60,7 +82,15 @@
 #include <windows.h> // NOLINT(bugprone-suspicious-include) — слой UI, по SPEC §7 это законное место
 
 #include <cstdint>
+#include <optional>
 #include <string>
+
+#include "nav.hpp"
+#include "view_cleanup.hpp"
+#include "view_disks.hpp"
+#include "view_report.hpp"
+#include "view_settings.hpp"
+#include "theme.hpp"
 
 // NMHDR живёт в commctrl.h, а подключать его ради одного указателя в хуке
 // событий незачем: здесь достаточно знать, что указатель передаётся на неизменность.
@@ -231,6 +261,39 @@ public:
     // смене монитора, и в обоих случаях раскладку трогать нельзя.
     void restoreFrom(const WINDOWPLACEMENT& placement) noexcept;
 
+    // --- Рельс навигации (SPEC §7.1) ------------------------------------------
+    //
+    // Модель страниц живёт в ui::nav и не знает про окно; оболочка держит её
+    // и переводит её в пиксели. Наружу отдаётся ровно то, что нужно экранам и
+    // будущим настройкам (FR-9: «какая страница была открыта» — постоянное
+    // свойство, как положение разделителя).
+    [[nodiscard]] Navigator& navigator() noexcept { return navigator_; }
+    [[nodiscard]] const Navigator& navigator() const noexcept { return navigator_; }
+    [[nodiscard]] PageId currentPage() const noexcept { return navigator_.current(); }
+
+    // Переключение из кода (экран, настройки, восстановление сессии). true —
+    // страница действительно сменилась. Повторный переход на ту же страницу
+    // возвращает false, но фокус рельса всё равно переезжает на неё: клик по
+    // уже открытому пункту не должен выглядеть как «ничего не произошло».
+    bool showPage(PageId page);
+
+    // Геометрия рельса под текущие DPI и клиентский прямоугольник. Значение
+    // копируется по значению и обязано им быть: обработчик WM_PAINT держит его
+    // на стеке, а сообщение может прийти после смены DPI.
+    [[nodiscard]] RailLayout railLayout() const noexcept { return railLayout_; }
+    [[nodiscard]] int railWidthPx() const noexcept { return railLayout_.railWidthPx(); }
+
+    // Пункт рельса под точкой клиентской области или nullopt. Промах мимо
+    // пунктов (зазор, отступ, область содержимого) даёт nullopt, а не
+    // «ближайший»: иначе щелчок рядом с пунктом переключал бы страницу.
+    [[nodiscard]] std::optional<PageId> railHitTest(POINT clientPoint) const noexcept;
+
+    // Перерисовать рельс и хост содержимого. Вызывается после смены страницы,
+    // темы, DPI, языка и наведения мыши: без неё окно осталось бы со старым
+    // кадром, а «перерисовка» была бы надеждой на то, что что-то другое
+    // протухнет раньше.
+    void invalidateChrome() noexcept;
+
 protected:
     // Хуки для волн W14-W15. Сейчас пустые: их переопределит слой экранов.
     // Все вызываются в UI-потоке и внутри обработчика окна, поэтому здесь
@@ -271,6 +334,14 @@ protected:
     // DefWindowProc, поэтому ускорители меню и фокус в контролах не ломаются.
     virtual bool onKeyDown(HWND /*window*/, UINT /*virtualKey*/, LPARAM /*keyData*/) { return false; }
 
+    // Смена страницы рельса. Оболочка зовёт его сразу после того, как
+    // Navigator сменил current_, и ДО перерисовки, чтобы экран успел
+    // подготовить содержимое хоста к первому кадру (экран подменяет содержимое
+    // хоста здесь, а не в своём WM_PAINT: перерисовка на тот же кадр и есть
+    // видимое переключение). Исключения ловит windowProc.
+    virtual void onPageChanged(PageId /*from*/, PageId /*to*/) {}
+    virtual void onDestroy() {}
+
     // Разрешение закрытия. false отменяет закрытие пользователя (окно остаётся)
     // и возвращает FALSE в WM_QUERYENDSESSION (система не гасит сеанс).
     virtual bool onCloseRequested(CloseReason /*reason*/) { return true; }
@@ -290,6 +361,10 @@ private:
     static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     [[nodiscard]] LRESULT handleMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     [[nodiscard]] LRESULT handleCreate(HWND window, const CREATESTRUCTW* create);
+    // Отдельная ветка WM_CREATE для хоста содержимого: он создан тем же классом
+    // и той же windowProc, поэтому без неё сборка главного окна запускалась бы
+    // на хосте и тот завёл бы себе ещё один хост (см. комментарий в .cpp).
+    [[nodiscard]] LRESULT handleContentHostCreate(HWND window);
     void handleSize(HWND window, WPARAM sizeType);
     void handleGetMinMaxInfo(MINMAXINFO* info) noexcept;
     void handleDpiChanged(HWND window, UINT dpiX, UINT dpiY, const RECT* suggested);
@@ -303,8 +378,36 @@ private:
     void handleNcDestroy(HWND window) noexcept;
     void paintContentHost(HWND window) noexcept;
 
+    // --- Рельс: ввод, отрисовка, раскладка -----------------------------------
+    //
+    // Функции отрисовки и подписей НЕ помечены noexcept намеренно: они берут
+    // строки (std::wstring) и зовут Navigator::item, а std::bad_alloc обязан
+    // дойти до try/catch в windowProc и стать записью в журнал, а не
+    // std::terminate посреди WM_PAINT (§5 «ни один отказ не роняет процесс»).
+    // Обработчики ввода — наоборот, noexcept не несут ничего, кроме чисел.
+    void paintMainWindow(HWND window);
+    void paintRail(HDC dc, const RECT& client, int clientWidth, int clientHeight);
+    void layoutRail() noexcept;
+    void handlePageChanged(PageId from, PageId to);
+    [[nodiscard]] bool handleRailMouseMove(HWND window, int x, int y) noexcept;
+    [[nodiscard]] bool handleRailClick(HWND window, int x, int y);
+    void handleRailRelease(HWND window, int x, int y);
+    [[nodiscard]] bool handleNavKey(HWND window, UINT virtualKey);
+    void trackRailMouseLeave(HWND window) noexcept;
+    [[nodiscard]] std::wstring railLabel(PageId page) const;
+    [[nodiscard]] std::wstring railShortcutHint(PageId page) const;
+    static void fillWithColor(HDC dc, const RECT& rect, const theme::Color& color) noexcept;
+
     // Служебное.
     void layoutContentHost() noexcept;
+    // Применить тёмный режим окна с защитой от реентерабельности. Отдельный
+    // метод, а не прямой вызов theme::enableDarkModeForWindow в трёх местах:
+    // внутри есть RefreshImmersiveColorPolicy(), а он рассылает WM_SETTINGCHANGE
+    // с ImmersiveColorSet — в том числе самому этому окну. Без замка обработчик
+    // WM_SETTINGCHANGE вызывал бы enableDarkModeForWindow снова, тот — снова
+    // рассылал бы сообщение, и приложение падало бы со STATUS_STACK_OVERFLOW
+    // (0xC00000FD) ещё до первого WM_PAINT. Подробности — в .cpp.
+    void applyWindowDarkMode(HWND window) noexcept;
     void rememberPlacement(HWND window) noexcept;
     void centerOnPrimary(int width, int height, int& x, int& y) const noexcept;
     [[nodiscard]] bool isMainWindow(HWND window) const noexcept;
@@ -321,6 +424,41 @@ private:
     WINDOWPLACEMENT lastPlacement_{};
     bool closeRequested_{false};
     bool classesRegistered_{false};
+
+    // --- Рельс (SPEC §7.1) --------------------------------------------------
+    // Состояние живёт рядом с каркасом, потому что окно одно и переживает все
+    // сообщения; Navigator при этом остаётся чистой моделью и не знает ни про
+    // HWND, ни про GDI.
+    Navigator navigator_;
+    theme::Theme theme_;
+    RailMetrics railMetrics_{};
+    RailLayout railLayout_{};
+    std::optional<PageId> railHover_{};    // пункт под курсором
+    std::optional<PageId> railPressed_{};  // пункт, нажатый и ещё не отпущенный
+
+    // --- Экраны (SPEC §7.1) -------------------------------------------------
+    // Пять экранов живут в хостe содержимого. До этой правки они были написаны,
+    // слинкованы и никогда не создавались: окно показывало рельс и пустоту.
+    // Экраны некопируемы и нетривиально перемещаемы, поэтому живут за указателями.
+    std::unique_ptr<disks::DisksScreen> disksScreen_;
+    std::unique_ptr<cleanup::CleanupScreen> cleanupScreen_;
+    std::unique_ptr<overview::OverviewScreen> overviewScreen_;
+    std::unique_ptr<report::ReportScreen> reportScreen_;
+    std::unique_ptr<settings::SettingsScreen> settingsScreen_;
+    bool screensReady_{false};
+
+    // Создать все пять и показать стартовую страницу. Вызывается один раз, когда
+    // хост содержимого уже создан и размеры известны.
+    void mountScreens();
+    // Показать окно только активной страницы; остальные скрыть. Вызывается при
+    // каждой смене страницы и после пересоздания экранов.
+    void showActiveScreen(PageId page);
+    void refreshActiveScreen();
+    [[nodiscard]] HWND screenWindow(PageId page) const noexcept;
+    [[nodiscard]] bool screenDpi(PageId page) noexcept;
+    bool railFocused_{false};              // клавиатурный фокус на рельсе
+    bool railMouseTracked_{false};         // WM_MOUSELEAVE уже подписан
+    bool darkModeApplying_{false};         // applyWindowDarkMode уже внутри (антирекурсия)
 };
 
 // Тело wWinMain: DPI → COM → общие контролы → окно → цикл → выход.

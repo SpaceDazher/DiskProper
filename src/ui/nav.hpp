@@ -65,7 +65,9 @@ namespace mrproper::ui {
 
 // --- Страницы (SPEC §7.1) ----------------------------------------------------
 
-// Порядок enum = порядок пунктов в рельсе сверху вниз и порядок Alt+1..Alt+5.
+// Порядок enum = порядок пунктов в рельсе сверху вниз и порядок горячих
+// клавиш Ctrl+1..Ctrl+5 (см. AppShell::handleNavKey в app_shell.cpp: это тот
+// слой, который ловит WM_KEYDOWN; сам модуль о Win32 не знает).
 enum class PageId : std::uint8_t {
     Overview = 0,  // Обзор: дашборд, карта дисков, быстрые действия
     Disks,         // Диски: дерево дисков/разделов/томов, карточка, экспорт карты
@@ -85,15 +87,30 @@ struct PageDescriptor {
     std::string_view titleKey;  // "nav.page.overview" — ключ каталога строк
     std::string_view titleRu;   // запасная подпись, если каталог не загружен
     std::string_view titleEn;
-    std::string_view shortcut;  // "Alt+1" — подсказка и AcceleratorKey для UIA
+    std::string_view shortcut;  // "Ctrl+1" — подсказка в рельсе и AcceleratorKey для UIA
 };
 
+// Горячие клавиши страниц. Решено здесь, потому что рельс — единственное
+// место, где «какая цифра открывает какую страницу» должно быть написано один
+// раз, а пять экранных файлов читают подпись отсюда.
+//
+//   Ctrl+1..Ctrl+5  — основной вариант. Основной потому, что Alt в Windows
+//                     занят ускорителями меню (Alt+F и далее появятся вместе с
+//                     меню), а Ctrl+цифра в Win32 свободна и привычна по
+//                     VS Code, Word и «Фото».
+//   Alt+1..Alt+5    — принимается оболочкой как второй вариант (см. также
+//                     Navigator::selectByAccessKey), пока меню не заняло цифры;
+//                     он не документируется в интерфейсе, чтобы две подсказки
+//                     не расходились после появления меню.
+inline constexpr bool kCtrlDigitSwitchesPage = true;
+inline constexpr bool kAltDigitSwitchesPage = true;
+
 inline constexpr std::array<PageDescriptor, 5> kPages{{
-    {PageId::Overview, "overview", "nav.page.overview", "Обзор", "Overview", "Alt+1"},
-    {PageId::Disks, "disks", "nav.page.disks", "Диски", "Disks", "Alt+2"},
-    {PageId::Cleanup, "cleanup", "nav.page.cleanup", "Очистка", "Cleanup", "Alt+3"},
-    {PageId::Report, "report", "nav.page.report", "Отчёт", "Report", "Alt+4"},
-    {PageId::Settings, "settings", "nav.page.settings", "Настройки", "Settings", "Alt+5"},
+    {PageId::Overview, "overview", "nav.page.overview", "Обзор", "Overview", "Ctrl+1"},
+    {PageId::Disks, "disks", "nav.page.disks", "Диски", "Disks", "Ctrl+2"},
+    {PageId::Cleanup, "cleanup", "nav.page.cleanup", "Очистка", "Cleanup", "Ctrl+3"},
+    {PageId::Report, "report", "nav.page.report", "Отчёт", "Report", "Ctrl+4"},
+    {PageId::Settings, "settings", "nav.page.settings", "Настройки", "Settings", "Ctrl+5"},
 }};
 
 inline constexpr std::size_t kPageCount = kPages.size();
@@ -138,7 +155,7 @@ std::string_view pageKey(PageId page) noexcept;           // "cleanup"
 std::string_view pageTitleKey(PageId page) noexcept;      // "nav.page.cleanup"
 std::string_view pageTitleFallback(PageId page, core::Language lang) noexcept;
 
-int pageOrdinal(PageId page) noexcept;                    // 1..5 — «Alt+N»
+int pageOrdinal(PageId page) noexcept;                    // 1..5 — номер «Ctrl+N»
 std::optional<PageId> pageByOrdinal(int ordinal) noexcept;
 char pageAccessKey(PageId page) noexcept;                 // '1'..'5'
 // Свёрка с кодом клавиши Win32: у цифр код совпадает с символом, поэтому
@@ -331,6 +348,10 @@ public:
     // запасного варианта, поэтому нужен перерисовывающий revision.
     void setLanguage(core::Language lang);
     void setTitleResolver(TitleResolver resolver);
+    // Подписка на смену страницы. Оболочка (app_shell) вешает сюда
+    // перерисовку рельса и хоста содержимого, поэтому без этого метода
+    // переключение меняло бы current_, но никто бы не узнал.
+    void setPageChangedHandler(PageChangedHandler handler);
 
     // --- Переключение страниц ------------------------------------------------
     // false — перехода не было: страница уже открыта или значение неверное.
