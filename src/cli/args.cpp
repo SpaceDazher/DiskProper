@@ -27,6 +27,7 @@
 #include "cmd_disks.hpp"
 #include "cmd_rules.hpp"
 #include "cmd_scan.hpp"
+#include "cmd_undo.hpp"
 
 namespace mrproper::cli {
 
@@ -102,6 +103,10 @@ const std::vector<CommandDescription> kCommands{
      ""},
     {Command::Report, "report", "отчёт scan/plan/apply в нормализованный JSON или самодостаточный HTML (FR-8)",
      ""},
+    // Команда отмены (FR-7, §7.2): список транзакций корзины и возврат файлов по
+    // идентификатору. Стоит рядом с apply, потому что отменяет именно его:
+    // apply кладёт в корзину, undo возвращает.
+    {Command::Undo, "undo", "отмена очистки: транзакции корзины и возврат файлов (FR-7, §7.2)", ""},
     // Подкоманды rules перечисляет сама команда (её справка печатается из
     // cmd_rules.cpp), здесь — только то, что человек видит в общем списке.
     // «update» в списке не было никогда реализовано, и объявлять его значило
@@ -181,6 +186,13 @@ int dispatchCommand(const CommandLine& parsed, const CliStreams& streams) {
             return runPlanOrApply(parsed, streams);
         case Command::Report:
             return cmdReport(parsed.args, streams.out, streams.err);
+        case Command::Undo: {
+            // Отмена подключается к своему движку здесь и только здесь: движок
+            // восстановления (engine::undo_service) нужен слою cli для одной
+            // команды, и подключать его в каркасе для всех нельзя.
+            const UndoIo io{streams.out, streams.err, streams.in};
+            return runUndoCommand(parsed.args, io, makeFileUndoEnvironment());
+        }
         case Command::Rules:
             return cmdRules(parsed.args, streams.out, streams.err);
         // Сюда попадает только команда, объявленная, но не подключённая: каркас
@@ -230,6 +242,7 @@ Command commandByName(std::string_view name) noexcept {
     if (name == "plan") return Command::Plan;
     if (name == "apply") return Command::Apply;
     if (name == "report") return Command::Report;
+    if (name == "undo") return Command::Undo;
     if (name == "rules") return Command::Rules;
     if (name == "disks") return Command::Disks;
     if (name == "help") return Command::Help;
@@ -374,7 +387,8 @@ std::string usageText() {
             "  2   команда не задана, неизвестна или ещё не подключена\n"
             "  70  необработанное исключение на границе процесса (EX_SOFTWARE)\n"
             "  Коды команд каркас не переводит: scan — 0/2/3/4/130, plan и apply —\n"
-            "  0/2/3/4/5/6, report и rules — 0/64/65/66/69/70. Подробности — в справке\n"
+            "  0/2/3/4/5/6, undo — 0/2/3/4/5/6/7 (4 — отменять нечего, 5 — корень\n"
+            "  корзины неизвестен), report и rules — 0/64/65/66/69/70. Подробности — в справке\n"
             "  самой команды: CI обязан отличать «отчёт напечатан» от «набор правил\n"
             "  недоступен», иначе упавший скан выглядит как «мусора нет».\n"
             "\n"
@@ -437,6 +451,7 @@ int runCli(const std::vector<std::string>& argv, const CliStreams& streams) {
         case Command::Plan:
         case Command::Apply:
         case Command::Report:
+        case Command::Undo:
         case Command::Rules:
         case Command::Disks:
         case Command::Unknown:

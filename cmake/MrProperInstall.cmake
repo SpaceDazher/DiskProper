@@ -194,3 +194,112 @@ if(MRPROPER_ENABLE_CPACK)
     message(STATUS "[MrProper] CPack: генераторы ${_mrproper_cpack_generators}, "
         "установщик собирается явно: cpack -C Release --config CPackConfig.cmake")
 endif()
+
+# --- Установщик Inno Setup (владелец: J2) -----------------------------------
+# Почему не через CPack: у CPack есть генераторы NSIS, WiX, IFW, ZIP, 7Z, TGZ,
+# но генератора Inno Setup у него нет и не предвиден. Поэтому .iss
+# компилируется собственным вызовом ISCC, а цель mrproper-installer даёт ту же
+# «сборку установщика одной командой», о которой говорит SPEC §8 Этап 5:
+#
+#   tools\build.bat Release a12
+#   cmake --build build\a12 --config Release --target mrproper-installer
+#
+# В сборку по умолчанию цель не входит: ISCC — внешний инструмент, и его
+# отсутствие не должно ломать ни build.bat, ни test.bat.
+#
+# Источник истины по составу установки один: packaging/mrproper.iss. Формат
+# WiX (.wxs) в репозитории нет и не добавляется — обоснование в шапке .iss.
+option(MRPROPER_ENABLE_INSTALLER
+    "Объявлять цель mrproper-installer (сборка установщика через Inno Setup)" ON)
+set(MRPROPER_INNO_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/packaging/mrproper.iss"
+    CACHE FILEPATH "Скрипт Inno Setup: единственный источник истины по составу установки")
+set(MRPROPER_ISCC_EXE "" CACHE FILEPATH
+    "Путь к ISCC.exe (Inno Setup 6.3+); пусто = найти в Program Files и в PATH")
+set(MRPROPER_INSTALLER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/dist" CACHE PATH
+    "Каталог, куда кладётся готовый MrProper-<версия>-win64.exe")
+set(MRPROPER_INSTALLER_FALLBACK_CONFIG "Release" CACHE STRING
+    "Конфигурация сборки, если генератор не сообщил (--config не передан)")
+
+# Поиск компилятора. find_program считывает переменные окружения, которые
+# WSL/cmd не всегда пробрасывают одинаково, поэтому каталоги установки Inno
+# Setup перечислены явно: дефолтный каталог — «%ProgramFiles%\Inno Setup 6».
+if(NOT MRPROPER_ISCC_EXE)
+    find_program(_mrproper_iscc_found
+        NAMES ISCC ISCC.exe
+        PATHS
+            "$ENV{ProgramFiles}/Inno Setup 6"
+            "$ENV{ProgramW6432}/Inno Setup 6"
+            "$ENV{LOCALAPPDATA}/Programs/Inno Setup 6"
+            "$ENV{LOCALAPPDATA}/Programs/Inno Setup 6 (x64)"
+        DOC "Inno Setup 6 command line compiler (ISCC.exe)")
+    if(_mrproper_iscc_found)
+        # FORCE здесь уместен: значение по умолчанию, а не выбор человека —
+        # если человек задал путь, он попал в MRPROPER_ISCC_EXE и эта ветка
+        # не выполняется вовсе.
+        set(MRPROPER_ISCC_EXE "${_mrproper_iscc_found}"
+            CACHE FILEPATH "Путь к ISCC.exe (Inno Setup 6.3+)" FORCE)
+    endif()
+    unset(_mrproper_iscc_found)
+endif()
+
+if(NOT MRPROPER_ENABLE_INSTALLER)
+    message(STATUS
+        "[MrProper] установщик: выключен опцией MRPROPER_ENABLE_INSTALLER=OFF")
+elseif(NOT EXISTS "${MRPROPER_INNO_SCRIPT}")
+    message(STATUS
+        "[MrProper] установщик: ${MRPROPER_INNO_SCRIPT} не найден, "
+        "цель mrproper-installer не объявляется")
+elseif(MRPROPER_ISCC_EXE AND EXISTS "${MRPROPER_ISCC_EXE}")
+    # Цели программы в DEPENDS: без них установщик собрался бы из того, что
+    # лежит в build\ на момент вызова, и мог бы уехать на сборку позже.
+    set(_mrproper_installer_deps "")
+    foreach(_mrproper_installer_target mrproper mrproper_cli)
+        if(TARGET ${_mrproper_installer_target})
+            list(APPEND _mrproper_installer_deps ${_mrproper_installer_target})
+        endif()
+    endforeach()
+
+    # /V2 — уровень подробности 2: в вывод попадает строка «Compressing: …»
+    # на каждый файл, то есть перечень установки виден прямо в логе сборки.
+    # /V0 молчит, /V3-V4 засоряют вывод построчным разбором .iss.
+    add_custom_target(mrproper-installer
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${MRPROPER_INSTALLER_OUTPUT_DIR}"
+        COMMAND "${MRPROPER_ISCC_EXE}"
+            "/V2"
+            "/DMrVersion=${PROJECT_VERSION}"
+            "/DMrVersionFull=${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}.0"
+            "/DMrSourceRoot=${CMAKE_CURRENT_SOURCE_DIR}"
+            "/DMrBuildRoot=${CMAKE_BINARY_DIR}"
+            "/DMrBuildConfig=$<IF:$<BOOL:$<CONFIG>>,$<CONFIG>,${MRPROPER_INSTALLER_FALLBACK_CONFIG}>"
+            "/DMrOutputDir=${MRPROPER_INSTALLER_OUTPUT_DIR}"
+            "/O${MRPROPER_INSTALLER_OUTPUT_DIR}"
+            "/F${PROJECT_NAME}-${PROJECT_VERSION}-win64"
+            "${MRPROPER_INNO_SCRIPT}"
+        DEPENDS ${_mrproper_installer_deps} "${MRPROPER_INNO_SCRIPT}"
+        COMMENT "MrProper: установщик (Inno Setup, неподписанный — ADR-009) -> ${MRPROPER_INSTALLER_OUTPUT_DIR}"
+        VERBATIM)
+    unset(_mrproper_installer_deps)
+
+    message(STATUS "[MrProper] установщик: цель mrproper-installer, ISCC ${MRPROPER_ISCC_EXE}")
+else()
+    # ISCC не найден. Цель всё равно объявляется — иначе «нет такой цели» в
+    # выводе cmake --build выглядит как опечатка в команде, а не как
+    # «поставьте Inno Setup». Ошибка с инструкцией выдаётся в момент сборки.
+    set(_mrproper_installer_hint "${CMAKE_BINARY_DIR}/mrproper-installer-noiscc.cmake")
+    file(WRITE "${_mrproper_installer_hint}" [==[
+# Пишется cmake/MrProperInstall.cmake при configure, когда ISCC.exe не найден.
+# Запускается целью mrproper-installer: -P исполняет файл и превращает
+# message(FATAL_ERROR) в ненулевой код возврата цели.
+set(_msg "MrProper: цель mrproper-installer требует ISCC.exe — компилятора Inno Setup 6.3 или новее.")
+string(APPEND _msg "\n  Скачать:        https://jrsoftware.org/isdl.php")
+string(APPEND _msg "\n  Указать путь:   cmake -S . -B build\\a12 -DMRPROPER_ISCC_EXE=\"C:\\Program Files\\Inno Setup 6\\ISCC.exe\"")
+string(APPEND _msg "\n  Отключить цель: cmake -S . -B build\\a12 -DMRPROPER_ENABLE_INSTALLER=OFF")
+message(FATAL_ERROR "${_msg}")
+]==])
+    add_custom_target(mrproper-installer
+        COMMAND "${CMAKE_COMMAND}" -P "${_mrproper_installer_hint}"
+        VERBATIM)
+    message(STATUS
+        "[MrProper] установщик: ISCC.exe не найден, цель mrproper-installer "
+        "объявлена и упадёт с инструкцией (см. -DMRPROPER_ISCC_EXE=...)")
+endif()

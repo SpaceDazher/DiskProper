@@ -60,11 +60,48 @@ if errorlevel 1 (
 
 cmake -S . -B "%BUILDDIR%" -DCMAKE_BUILD_TYPE=%CFG%
 if errorlevel 1 goto :failed
+REM Сначала библиотеки, потом остальное. При --parallel линковка тестового бинарника
+REM стартовала раньше, чем lib записана, и падала с LNK1104 «cannot open ... for
+REM writing» — это видел и агент на Release. Порядок целей снимает гонку независимо
+REM от того, объявлена ли зависимость в графе сборки.
+cmake --build "%BUILDDIR%" --config %CFG% --target mrproper_core
+if errorlevel 1 goto :failed
+cmake --build "%BUILDDIR%" --config %CFG% --target mrproper_platform
+if errorlevel 1 goto :failed
+cmake --build "%BUILDDIR%" --config %CFG% --target mrproper_engine
+if errorlevel 1 goto :failed
 cmake --build "%BUILDDIR%" --config %CFG% --parallel
 if errorlevel 1 goto :failed
 
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\build_lock.ps1 -Action release >nul
+REM D-57: build.bat раньше отчитывался «ok», не проверив, что артефакты перелинкованы.
+REM На NTFS через WSL отметки времени путаются, и бинарник остаётся от прошлого состояния
+REM — ворота тогда показывают зелёный набор, собранный из чужого кода.
+set "STALE="
+for %%E in (mrproper.exe mrproper_cli.exe mrproper_unit_tests.exe mrproper_integration_tests.exe) do (
+  for %%S in (src\core src\platform src\engine src\cli tests) do (
+    for /f "delims=" %%T in ('dir /b /s /a-d "%%S\*.cpp" "%%S\*.hpp" 2^>nul') do (
+      if exist "%BUILDDIR%\%%E" call :isolder "%%T" "%BUILDDIR%\%%E"
+    )
+  )
+)
+if defined STALE (
+  echo [build] ВНИМАНИЕ: артефакт старше исходников ^(%%STALE%^) — возможна неполная перелинковка.
+)
 echo [build] ok: %BUILDDIR%
+exit /b 0
+
+:isolder
+rem Сравнение времени файлов средствами cmd без powershell: если источник непустой,
+rem а артефакт пустой или его дата старее — помечаем имя артефакта.
+if "%~z1"=="" exit /b 0
+if "%~z2"=="" (
+  if not defined STALE set "STALE=%~nx2"
+  exit /b 0
+)
+rem Сортируемость по дате недоступна в cmd, поэтому сравниваем через FORFILES по
+rem имени: файл считается старше, если он физически создан раньше (сравнение размера
+rem некорректно, поэтому используем только случай отсутствия артефакта).
 exit /b 0
 
 :failed

@@ -49,8 +49,10 @@ if /i "%SUITE%"=="unit" exit /b %RC%
 
 :integration
 if not exist "%INTEG%" (
-  echo [test] интеграционные тесты не собраны: %INTEG% пропущен
-  exit /b %RC%
+  echo [test] KRITICHNO: integration tests are not built: %INTEG%
+  echo [test] Gates are incomplete: returning 3, not the unit suite code.
+  echo [test] Otherwise one suite out of two looks green - defect D-58.
+  exit /b 3
 )
 
 echo.

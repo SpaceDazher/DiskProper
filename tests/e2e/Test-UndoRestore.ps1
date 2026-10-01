@@ -166,6 +166,10 @@ $script:Ready = $false
 # пустой, потому что под Set-StrictMode обращение к неинициализированному
 # $script: — исключение, и вместо честного пропуска шага был бы стек.
 $script:TxClean = ''
+# Транзакция, которую отменяет НАСТОЯЩАЯ команда CLI (шаг 9): отдельная от
+# «чистой» шага 4, чтобы контрактный путь и путь команды не мешали знаменателю.
+$script:TxCli = ''
+$script:CliFixture = $null
 
 # Итоги сценария, которые печатает сводка. Инициализируются явно: под
 # Set-StrictMode обращение к несуществующей переменной $script: — исключение, и
@@ -192,6 +196,18 @@ $script:Summary = [pscustomobject]@{
     EmptyPlanVerdict = '(не проверен)'
     CliReason         = ''
     SkipCount         = 0
+    # Полный круг настоящей командой отмены (шаг 9). -1 означает «шаг не
+    # дошёл», и сводка это показывает, чтобы зелёный прогон не читался как
+    # «отмена проверена».
+    CliListCode      = -1
+    CliDryRunCode    = -1
+    CliRestoreCode   = -1
+    CliRestoredFiles = 0
+    CliBytes         = [int64] 0
+    CliRepeatCode    = -1
+    CliState         = '(не проверен)'
+    CliListFound     = 0
+    RestorePercentByCli = 0.0
 }
 
 # ---------------------------------------------------------------------------
@@ -498,16 +514,25 @@ function Get-UndoSurface {
 
 function Invoke-CliUndo {
     <#
-    .SYNOPSIS Восстановление командой отмены CLI, если она есть в сборке.
-    .DESCRIPTION Вызывается только когда Get-UndoSurface нашёл команду. Коды
-    возврата у неё сценарий не угадывает: любой не нулевой код — это уже
-    находка, и он попадает в пропуск с текстом stderr, а не в «зелёный» итог.
+    .SYNOPSIS Вызов команды отмены CLI (undo/restore), если она есть в сборке.
+    .DESCRIPTION Ключи подтверждения и возврата берутся из контракта команды
+    отмены (src/cli/cmd_undo.hpp), а не угадываются: -Execute возвращает файлы
+    (без него команда показывает план и ничего не трогает), -Yes отменяет
+    вопрос — сценарий неинтерактивен и подтверждения напечатать не может.
+    -KeepTransaction оставляет каталог транзакции: без него полный возврат сносит
+    каталог вместе с манифестом, и состояние undone на диске не проверить.
+    Коды возврата сценарий не угадывает: любой неожиданный код — это находка, и
+    он попадает в пропуск с текстом stderr, а не в «зелёный» итог.
     #>
-    param([string] $Cli, [string] $Command, [string] $TrashRoot, [string] $TxId)
+    param([string] $Cli, [string] $Command, [string] $TrashRoot, [string] $TxId,
+        [switch] $Execute, [switch] $Yes, [switch] $KeepTransaction, [switch] $List)
 
-    $result = Invoke-MrProperCli -Cli $Cli -LogDirectory $script:SandboxRoot `
-        -Arguments @($Command, '--json', '--trash-root', $TrashRoot, '--tx', $TxId)
-    return $result
+    $arguments = @($Command, '--json', '--trash-root', $TrashRoot)
+    if ($List) { $arguments += '--list' } else { $arguments += @('--tx', $TxId) }
+    if ($Execute) { $arguments += '--execute' }
+    if ($Yes) { $arguments += '--yes' }
+    if ($KeepTransaction) { $arguments += '--keep-transaction' }
+    return Invoke-MrProperCli -Cli $Cli -LogDirectory $script:SandboxRoot -Arguments $arguments
 }
 
 # ---------------------------------------------------------------------------
@@ -1396,6 +1421,145 @@ Describe 'MrProper: отмена и восстановление 100 % (SPEC §1
         }
     }
 
+    Context 'шаг 9: полный круг настоящей командой отмены (FR-7, §7.2)' {
+
+        It 'undo --list показывает транзакцию корзины с датой, числом элементов и объёмом' {
+            Initialize-Scenario
+            if ($null -eq $script:Cli) { Add-SkippedStep $script:CliMissingReason; return }
+
+            $surface = Get-UndoSurface -Cli $script:Cli
+            if (-not $surface.Found) {
+                Add-SkippedStep ('в этой сборке нет команды отмены (доступны: ' + ($surface.Commands -join ', ') + ')')
+                return
+            }
+
+            # Своя фикстура и своя транзакция: шаги 4-7 уже израсходовали «чистую»,
+            # а шаг 9 обязан быть зелёным сам по себе.
+            $script:CliFixture = New-UndoFixture -Root (Join-Path $script:SandboxRoot 'cli-fixture') `
+                -CandidateCount 1 -FilesPerCandidate 3 -SizeBytes $FileSizeBytes
+            $script:TxCli = New-TrashTxId -Counter 9
+            $entries = New-TransactionEntries -Candidates $script:CliFixture.Candidates -Prefix 'c'
+            New-TrashTransaction -TrashRoot $script:TrashRoot -TxId $script:TxCli -Entries $entries `
+                -AppVersion $script:AppVersion -VolumeGuid '' | Out-Null
+
+            $run = Invoke-CliUndo -Cli $script:Cli -Command $surface.Command -TrashRoot $script:TrashRoot `
+                -TxId $script:TxCli -List
+            $script:Summary.CliListCode = $run.Exit
+            $run.Exit | Should Be 0
+
+            $document = $run.Out | ConvertFrom-Json
+            (Get-RequiredProperty $document 'kind' 'undo') | Should Be 'undo'
+            (Get-RequiredProperty $document 'mode' 'undo') | Should Be 'list'
+            $transactions = @(Get-RequiredProperty $document 'transactions' 'undo')
+            $found = @($transactions | Where-Object { $_.txId -eq $script:TxCli })
+            $found.Count | Should Be 1
+            $entry = $found[0]
+            (Get-RequiredProperty $entry 'state' 'undo.transactions[]') | Should Be 'committed'
+            (Get-RequiredProperty $entry 'available' 'undo.transactions[]') | Should Be $true
+            (Get-RequiredProperty $entry 'items' 'undo.transactions[]') | Should Be 1
+            (Get-RequiredProperty $entry 'restorable' 'undo.transactions[]') | Should Be 1
+            (Get-RequiredProperty $entry 'bytes' 'undo.transactions[]') | Should Be $script:CliFixture.TotalBytes
+            (Get-RequiredProperty $entry 'createdAt' 'undo.transactions[]') | Should Match '^\d+$'
+
+            # Список — запрос, а не действие: пустая корзина в нём не ошибка.
+            $script:Summary.CliListFound = $transactions.Count
+            Write-Host ('undo --list: код ' + $run.Exit + ', транзакций ' + $transactions.Count +
+                ', наша ' + $script:TxCli + ' отменяема=' + $entry.available + ', байт ' + $entry.bytes)
+        }
+
+        It 'undo --tx без --execute показывает план и не возвращает ни байта (FR-5)' {
+            Initialize-Scenario
+            if ($null -eq $script:Cli) { Add-SkippedStep $script:CliMissingReason; return }
+            if ($script:TxCli -eq '') { Add-SkippedStep 'шаг 9 не дошёл до плана: нет транзакции'; return }
+
+            $run = Invoke-CliUndo -Cli $script:Cli -Command 'undo' -TrashRoot $script:TrashRoot -TxId $script:TxCli
+            $script:Summary.CliDryRunCode = $run.Exit
+            $run.Exit | Should Be 0
+
+            $document = $run.Out | ConvertFrom-Json
+            (Get-RequiredProperty $document 'mode' 'undo') | Should Be 'plan'
+            (Get-RequiredProperty $document 'executed' 'undo') | Should Be $false
+            (Get-RequiredProperty $document 'restore' 'undo') | Should Be $null
+            $plan = Get-RequiredProperty $document 'plan' 'undo'
+            (Get-RequiredProperty $plan 'txId' 'undo.plan') | Should Be $script:TxCli
+            (Get-RequiredProperty $plan 'restorable' 'undo.plan') | Should Be 1
+
+            $measured = Measure-ExpectedFiles -Expected $script:CliFixture.Expected
+            $measured.Present | Should Be 0
+            # Снимок идёт в stderr и печатается ДО вопроса (FR-5).
+            $run.Err | Should Match 'снимок отмены'
+            Write-Host ('undo --tx (сухой прогон): код ' + $run.Exit + ', на месте ' + $measured.Present +
+                ' из ' + $measured.Expected + ' файлов')
+        }
+
+        It 'undo --tx --execute возвращает 100 % файлов и оставляет state=undone' {
+            Initialize-Scenario
+            if ($null -eq $script:Cli) { Add-SkippedStep $script:CliMissingReason; return }
+            if ($script:TxCli -eq '') { Add-SkippedStep 'шаг 9 не дошёл до восстановления: нет транзакции'; return }
+
+            $run = Invoke-CliUndo -Cli $script:Cli -Command 'undo' -TrashRoot $script:TrashRoot `
+                -TxId $script:TxCli -Execute -Yes -KeepTransaction
+            $script:Summary.CliRestoreCode = $run.Exit
+            $run.Exit | Should Be 0
+
+            $document = $run.Out | ConvertFrom-Json
+            (Get-RequiredProperty $document 'executed' 'undo') | Should Be $true
+            (Get-RequiredProperty $document 'confirmed' 'undo') | Should Be $true
+            $restore = Get-RequiredProperty $document 'restore' 'undo'
+            (Get-RequiredProperty $restore 'restored' 'undo.restore') | Should Be 1
+            (Get-RequiredProperty $restore 'skipped' 'undo.restore') | Should Be 0
+            (Get-RequiredProperty $restore 'failed' 'undo.restore') | Should Be 0
+            (Get-RequiredProperty $restore 'bytesRestored' 'undo.restore') | Should Be $script:CliFixture.TotalBytes
+            (Get-RequiredProperty $restore 'manifestWritten' 'undo.restore') | Should Be $true
+
+            $measured = Measure-ExpectedFiles -Expected $script:CliFixture.Expected
+            $measured.Present | Should Be $measured.Expected
+            $measured.Identical | Should Be $measured.Expected
+            $measured.Mismatched.Count | Should Be 0
+            $script:Summary.CliRestoredFiles = $measured.Identical
+            $script:Summary.CliBytes = $measured.Identical * $FileSizeBytes
+
+            # --keep-transaction: манифест остаётся, и в нём state=undone (§7.2:
+            # «отмена доступна, пока транзакция не схлопнулась»).
+            $manifest = Read-TrashManifest -TrashRoot $script:TrashRoot -TxId $script:TxCli
+            $manifest.State | Should Be 'undone'
+            $manifest.Entries.Count | Should Be 0
+            $script:Summary.CliState = $manifest.State
+
+            # Настоящая корзина приложения не тронута: песочница — единственная,
+            # где отмена что-то возвращала.
+            $appTrashAfter = @(Get-TrashTransactionIds $script:AppTrashRoot)
+            ($appTrashAfter -join ',') | Should Be ($script:AppTrashBefore -join ',')
+
+            $percent = Get-RestorePercent -Restored $measured.Identical -Expected $measured.Expected
+            $script:Summary.RestorePercentByCli = $percent
+            Write-Host ('undo --tx --execute: код ' + $run.Exit + ', вернулось ' + $measured.Identical + ' из ' +
+                $measured.Expected + ' файлов (' + $percent + ' %), байт ' + $script:Summary.CliBytes +
+                ', состояние транзакции ' + $manifest.State)
+        }
+
+        It 'повторный undo по той же транзакции даёт «нечего восстанавливать» (код 4)' {
+            Initialize-Scenario
+            if ($null -eq $script:Cli) { Add-SkippedStep $script:CliMissingReason; return }
+            if ($script:TxCli -eq '') { Add-SkippedStep 'шаг 9 не дошёл до повторной отмены'; return }
+
+            $run = Invoke-CliUndo -Cli $script:Cli -Command 'undo' -TrashRoot $script:TrashRoot `
+                -TxId $script:TxCli -Execute -Yes
+            # 4 = NothingToUndo (src/cli/cmd_undo.hpp): транзакция уже восстановлена,
+            # отмены больше нет (§7.2). Другой код означал бы либо повторное
+            # возвращение, либо поломку классификации.
+            $script:Summary.CliRepeatCode = $run.Exit
+            $run.Exit | Should Be 4
+            $run.Err | Should Match 'нечего'
+
+            # Уже возвращённые файлы не тронуты ни байтом.
+            $measured = Measure-ExpectedFiles -Expected $script:CliFixture.Expected
+            $measured.Identical | Should Be $measured.Expected
+            $measured.Mismatched.Count | Should Be 0
+            Write-Host ('повторный undo: код ' + $run.Exit + ', файлов на месте ' + $measured.Identical)
+        }
+    }
+
     Context 'шаг 8: сводка' {
 
         It 'процент возврата доведён до 100 и каждый пропуск записан с причиной' {
@@ -1427,8 +1591,15 @@ Describe 'MrProper: отмена и восстановление 100 % (SPEC §1
                 ' (чужой файл цел: ' + $script:Summary.ForeignFileIntact + ')')
             Write-Host ('  повторное восстановление  : ' + $script:Summary.RepeatRestored + ' элементов')
             Write-Host ('  поверхность отмены CLI    : ' + $script:Summary.UndoSurface)
+            Write-Host ('  undo --list, код          : ' + $script:Summary.CliListCode +
+                ' (транзакций в списке: ' + $script:Summary.CliListFound + ')')
+            Write-Host ('  undo сухой прогон, код    : ' + $script:Summary.CliDryRunCode)
+            Write-Host ('  undo --execute, код       : ' + $script:Summary.CliRestoreCode +
+                ' (файлов: ' + $script:Summary.CliRestoredFiles + ', байт: ' + $script:Summary.CliBytes +
+                ', состояние: ' + $script:Summary.CliState + ')')
+            Write-Host ('  повторный undo, код       : ' + $script:Summary.CliRepeatCode)
             Write-Host ('  восстановление            : ' +
-                $(if ($script:Summary.EngineUndoUsed) { 'командой CLI' }
+                $(if ($script:Summary.CliRestoreCode -eq 0) { 'командой CLI (шаг 9)' }
                     elseif ($script:Summary.ContractUsed) { 'по контракту манифеста (FR-7)' }
                     else { '(не выполнялось)' }))
             Write-Host ('  пропущено шагов           : ' + $lines.Count +
@@ -1447,6 +1618,15 @@ Describe 'MrProper: отмена и восстановление 100 % (SPEC §1
             # Шаг 3б обязан был отработать: -1 в сводке означал бы, что строка
             # про пустой план — значение по умолчанию, а не измерение.
             $script:Summary.EmptyPlanCode | Should Not Be -1
+            # Круг командой отмены обязателен, когда CLI собран: -1 означал бы,
+            # что шаг 9 не дошёл, а прогон остался зелёным (§12 требует, чтобы
+            # «восстановление 100 % удалённого» было настоящим, а не контрактом).
+            if ($null -ne $script:Cli) {
+                $script:Summary.CliListCode | Should Not Be -1
+                $script:Summary.CliRestoreCode | Should Be 0
+                $script:Summary.CliRepeatCode | Should Be 4
+                $script:Summary.CliState | Should Be 'undone'
+            }
         }
     }
 }

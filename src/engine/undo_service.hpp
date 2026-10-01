@@ -314,6 +314,15 @@ public:
     // выдуманный путь: %ProgramData% может быть недоступен сервисной сессии.
     [[nodiscard]] std::string root() const;
     void setRoot(std::string trashRoot);
+    // Сносить ли каталог транзакции после полного успешного восстановления.
+    // Прямая установка нужна вызывающему, который хочет ПРОВЕРИТЬ состояние
+    // транзакции после отмены (state=undone в manifest.json, FR-7): по умолчанию
+    // каталог сносится вместе с манифестом, и доказать состояние на диске после
+    // полного возврата уже нечем. Смена действует на следующий restore() и
+    // ничего не отменяет: возвращённые файлы уже на месте.
+    void setPurgeAfterFullRestore(bool purgeAfterFullRestore) noexcept {
+        options_.purgeAfterFullRestore = purgeAfterFullRestore;
+    }
     // Можно ли вообще что-то восстанавливать (корень известен).
     [[nodiscard]] bool available() const noexcept { return !root().empty(); }
 
