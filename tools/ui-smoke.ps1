@@ -719,8 +719,15 @@ function Invoke-Smoke {
         [void][MrWin]::ClientToScreen($hwnd, [ref]$origin)
         $cx = $origin.X - $rect.L
         $cy = $origin.Y - $rect.T
-        $cw = $w - 2 * [Math]::Max(0, $cx)
-        $ch = $h - 2 * [Math]::Max(0, $cy)
+        # D-65: размеры клиентской области берём у GetClientRect, а НЕ выводим из размеров
+        # окна вычитанием симметричной рамки. Рамка у Windows несимметрична: при окне 1136x795
+        # сверху 27, снизу 8, то есть прежняя арифметика давала клиент 1120x741 вместо
+        # настоящих 1120x760 — на 19 px меньше. Именно эта ошибка породила ложный вывод про
+        # срезанные кнопки «Очистки» (D-62).
+        $clientRect = New-Object MrWin+RECT
+        [void][MrWin]::GetClientRect($hwnd, [ref]$clientRect)
+        $cw = $clientRect.R - $clientRect.L
+        $ch = $clientRect.B - $clientRect.T
         if ($cw -le 0 -or $ch -le 0) { $cx = 0; $cy = 0; $cw = $w; $ch = $h }
 
         $data = $bmp.LockBits((New-Object System.Drawing.Rectangle(0, 0, $w, $h)),
