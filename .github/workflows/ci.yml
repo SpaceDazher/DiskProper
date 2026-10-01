@@ -415,7 +415,7 @@ jobs:
       # Только релизная сборка: SBOM описывает то, что получает пользователь.
       # Ноги Debug и Debug+ASan не публикуются — это проверочные сборки.
       - name: Забрать бинарники Release
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: mrproper-release
           path: bin
