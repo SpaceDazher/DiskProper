@@ -2341,6 +2341,7 @@ struct ViewState {
     // строки карточки (обычный), заголовок карточки (крупный).
     std::array<HFONT, 3> fonts{};
     HBRUSH surfaceBrush{nullptr};
+    HBRUSH headerBrush{nullptr};
     std::vector<ChildProc> children;
 
     // Последняя неудача сохранения. Показывается в строке состояния, а не в
@@ -2364,6 +2365,7 @@ struct ViewState {
             if (font != nullptr) ::DeleteObject(font);
         }
         if (surfaceBrush != nullptr) ::DeleteObject(surfaceBrush);
+        if (headerBrush != nullptr) ::DeleteObject(headerBrush);
     }
 
     // --- Текст в контролы ---------------------------------------------------
@@ -2507,13 +2509,17 @@ struct ViewState {
         const theme::Palette& palette = theme.palette();
         if (surfaceBrush != nullptr) ::DeleteObject(surfaceBrush);
         surfaceBrush = ::CreateSolidBrush(theme::colorRef(palette.surface));
+        if (headerBrush != nullptr) ::DeleteObject(headerBrush);
+        // Шапка столбцов — отдельное окно, и её фон приходит ответом на
+        // WM_CTLCOLORHDR из окна списка (см. childProc).
+        headerBrush = ::CreateSolidBrush(theme::colorRef(theme::nativeHeader(palette, false).background));
         if (list != nullptr) {
-            ListView_SetBkColor(list, theme::colorRef(palette.surface));
-            ListView_SetTextColor(list, theme::colorRef(palette.textPrimary));
-            // Подтемы «тёмного» у нативных контролов нет в документированном
-            // API (ADR-003); модуль темы делает это через безопасные вызовы
-            // uxtheme, а отказ — не повод оставлять список белым.
-            (void)theme::enableDarkModeForWindow(list, theme.scheme());
+            // Фон и подписи нативного списка — из модуля темы, решение одно для
+            // всех экранов (D-75): свой фон, поставленный ДО включения тёмного
+            // режима, подтема перекрывала системным, а подпись NM_CUSTOMDRAW
+            // оставалась белой — белым по белому.
+            theme::applyNativeColors(list, theme::NativeControl::List, palette);
+            theme::applyNativeHeaderTheme(list, theme.scheme());
         }
     }
 
@@ -3140,27 +3146,40 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
                 case CDDS_PREPAINT:
                     return CDRF_NOTIFYITEMDRAW;
                 case CDDS_ITEMPREPAINT: {
+                    const std::size_t index = static_cast<std::size_t>(draw->nmcd.dwItemSpec);
                     const JournalRow* row = state->rowAt(static_cast<int>(draw->nmcd.dwItemSpec));
-                    const bool selected = (draw->nmcd.uItemState & CDIS_SELECTED) != 0;
-                    const bool zebra = (static_cast<int>(draw->nmcd.dwItemSpec) % 2) == 1;
-                    // Цвет подписи и фона — из темы, а не системный: на тёмной
-                    // палитре системный чёрный текст нечитаем, а «зелёная полоса
-                    // выделения» посреди тёмной темы выглядит дырой. Строка об
-                    // ошибке и предупреждении подкрашивается сама — иначе
-                    // «журнал ошибок» пришлось бы вычитывать глазами построчно.
-                    theme::Color background = zebra ? palette.surfaceAlt : palette.surface;
-                    theme::Color foreground = palette.textPrimary;
+                    // Выделение — по индексу в модели, а не по CDIS_SELECTED:
+                    // comctl32 в этой версии присылает этот флаг всем строкам
+                    // (проверено на списке «Дисков»), и «фон выделенной строки»
+                    // покрасил бы весь журнал.
+                    const bool selected = index == state->model.selectedIndex();
+                    const bool zebra = (index % 2) == 1;
+                    // Фон строки — из темы («зебра» нечётных строк), и подпись
+                    // считается ПРОТИВ этого фона: на тёмной палитре системный
+                    // чёрный текст нечитаем, а «зелёная полоса выделения» посреди
+                    // тёмной темы выглядит дырой. Строка об ошибке и
+                    // предупреждении подкрашивается сама — иначе «журнал ошибок»
+                    // пришлось бы вычитывать глазами построчно, — но и её
+                    // контраст доводится до фона, а не берётся вслепую.
+                    const theme::NativeRow style = theme::nativeRow(palette, selected, zebra, false);
+                    theme::Color wanted = palette.textPrimary;
                     if (!selected && row != nullptr) {
                         if (row->level >= core::LogLevel::Error) {
-                            foreground = palette.danger;
+                            wanted = palette.danger;
                         } else if (row->level == core::LogLevel::Warn) {
-                            foreground = palette.warning;
+                            wanted = palette.warning;
                         }
                     }
                     HDC dc = draw->nmcd.hdc;
                     ::SetBkMode(dc, TRANSPARENT);
-                    ::SetBkColor(dc, theme::colorRef(selected ? palette.surfaceSelected : background));
-                    ::SetTextColor(dc, theme::colorRef(selected ? palette.textOnAccent : foreground));
+                    ::SetBkColor(dc, theme::colorRef(style.background));
+                    ::SetTextColor(dc, theme::colorRef(theme::nativeTextOn(wanted, style.background)));
+                    // Фон заливаем по прямоугольнику строки из LVM_GETITEMRECT:
+                    // nmcd.rc на этой стадии — мусор (см. theme::nativeListItemRect).
+                    RECT box{};
+                    if (theme::nativeListItemRect(state->list, static_cast<int>(draw->nmcd.dwItemSpec), box)) {
+                        theme::fillNativeRow(dc, box, style.background);
+                    }
                     return CDRF_NOTIFYSUBITEMDRAW;
                 }
                 case kSubItemPrePaint: {
@@ -3244,6 +3263,25 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             // Дети перекрывают окно целиком; стирать собственную поверхность
             // незачем.
             return 1;
+        case WM_PAINT: {
+            // Фон экрана — из темы, а не из системной кисти класса окна: список
+            // журнала не красит свою клиентскую область (у SysListView32 стоит
+            // WS_EX_TRANSPARENT), и сквозь неё было видно COLOR_BTNFACE —
+            // светлую полосу посреди тёмной страницы (D-75).
+            PAINTSTRUCT paint{};
+            HDC dc = ::BeginPaint(window, &paint);
+            if (dc != nullptr) {
+                RECT client{};
+                ::GetClientRect(window, &client);
+                if (state->surfaceBrush != nullptr) {
+                    ::FillRect(dc, &client, state->surfaceBrush);
+                } else {
+                    ::FillRect(dc, &client, ::GetSysColorBrush(COLOR_BTNFACE));
+                }
+            }
+            (void)::EndPaint(window, &paint);
+            return 0;
+        }
         case WM_DESTROY:
             state->stopTimer();
             state->controlsReady = false;
@@ -3265,6 +3303,20 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
 // клавиши едят, и Ctrl+H на кнопке молча пропадал бы.
 LRESULT CALLBACK childProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     auto* state = stateOf(window);
+    if (message == theme::WM_CTLCOLORHDR && state->headerBrush != nullptr) {
+        // Шапка столбцов — дочернее окно списка, и её фон задаётся ответом на
+        // WM_CTLCOLORHDR из окна списка. Других путей на этой Windows нет:
+        // NM_CUSTOMDRAW шапки до родителя списка не доходит (замер: ноль
+        // уведомлений за обход страниц), а подтема «тёмного» оставляет её
+        // системной — в тёмной схеме это светлая полоса поперёк тёмного
+        // списка (D-75).
+        const theme::NativeRow header = theme::nativeHeader(state->theme.palette(), false);
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        ::SetBkColor(dc, theme::colorRef(header.background));
+        ::SetTextColor(dc, theme::colorRef(header.text));
+        return reinterpret_cast<LRESULT>(state->headerBrush);
+    }
+
     if (state == nullptr) return ::DefWindowProcW(window, message, wParam, lParam);
     if (message == WM_NCDESTROY) {
         state->removeChild(window);

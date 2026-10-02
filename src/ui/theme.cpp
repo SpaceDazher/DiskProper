@@ -47,6 +47,10 @@
 #include <cstddef>
 #include <cwchar>
 
+// commctrl.h — из-за NMCUSTOMDRAW в контракте (шапка столбцов, D-75). Модуль
+// не создаёт контролов, но рисует их шапку по сообщению от SysHeader32.
+#include <commctrl.h>
+
 #include "core/log.hpp"
 #include "platform/win_handle.hpp"
 
@@ -281,6 +285,11 @@ constexpr Color kBlack{0x00, 0x00, 0x00, 0xFF};
 // Акцент Windows 10/11 по умолчанию. Используется, только когда не ответил ни
 // DWM, ни реестр, — то есть в самом худшем случае.
 constexpr Color kDefaultAccent{0x00, 0x78, 0xD4, 0xFF};
+
+// Минимум контраста подписи нативного контрола. WCAG AA для обычного текста,
+// то же число, что у ensureContrast по умолчанию, — названо явно, потому что
+// здесь контраст проверяется не «на глаз», а функцией.
+constexpr double kTextContrast = 4.5;
 
 // Смешивание: t = 0 отдаёт первый цвет, t = 1 — второй. Округление — до
 // ближайшего целого, иначе восемь смешиваний дают заметную потерю точности в
@@ -573,6 +582,126 @@ Color riskColor(const Palette& palette, core::SafetyLevel level) noexcept {
         return palette.riskRisky;
     }
     return palette.riskReview;  // неизвестный уровень риска показываем как «проверь»
+}
+
+// ---------------------------------------------------------------------------
+// Нативные списки и деревья
+// ---------------------------------------------------------------------------
+
+Color nativeTextOn(const Color& foreground, const Color& background) noexcept {
+    return ensureContrast(foreground, background, kTextContrast);
+}
+
+NativeRow nativeRow(const Palette& palette, bool selected, bool distinct, bool muted) noexcept {
+    NativeRow row{};
+    if (selected) {
+        row.background = palette.surfaceSelected;
+        // Подпись выделенной строки — тот же контраст, только против ЕЁ фона.
+        // «Выделение» в тёмной схеме светлое, а в светлой тёмное, и подпись,
+        // взятая вслепую, оказывается белым по белому ровно на той строке,
+        // которую человек выбрал.
+        row.text = nativeTextOn(palette.textOnAccent, row.background);
+        return row;
+    }
+    row.background = distinct ? palette.surfaceAlt : palette.surface;
+    // muted — это textSecondary, а НЕ textDisabled: у контраста WCAG для
+    // недоступного элемента исключение («элемент недоступен по определению»),
+    // а здесь недоступна строка, а не список, и смысл строки прочесть надо —
+    // иначе в тёмной схеме она исчезает из ворот «текст в области строк»
+    // ровно тем же способом, каким исчезала до этого (D-75).
+    const Color wanted = muted ? palette.textSecondary : palette.textPrimary;
+    row.text = nativeTextOn(wanted, row.background);
+    return row;
+}
+
+NativeRow nativeHeader(const Palette& palette, bool pressed) noexcept {
+    NativeRow header{};
+    header.background = pressed ? palette.surfaceHover : palette.surfaceAlt;
+    header.text = nativeTextOn(palette.textPrimary, header.background);
+    return header;
+}
+
+void applyNativeColors(HWND control, NativeControl kind, const Palette& palette) noexcept {
+    if (control == nullptr) return;
+    // Тёмный режим нативному списку и дереву здесь НЕ включается — см. договор
+    // в theme.hpp: подтема DarkMode_Explorer перекрывает фон, заданный
+    // сообщением, и возвращает контролу системный цвет. Цвет фона строки при
+    // этом всё равно задаётся один раз и для всех экранов — здесь, а не в
+    // каждом view_*.cpp.
+    const NativeRow base = nativeRow(palette, false, false, false);
+    // Цвет идёт в lParam, а не в wParam: так его передают макросы
+    // ListView_SetBkColor/SetTextColor/SetTextBkColor и TreeView_Set*Color в
+    // commctrl.h. Отправка цвета в wParam — не «не сработало», а худший
+    // вариант: lParam=0 это CLR_BLACK, и контрол честно заливал строки чёрным
+    // (проверено: в тёмной и в светлой схеме область строк становилась
+    // 0,0,0, а подпись — невидимой).
+    if (kind == NativeControl::List) {
+        ::SendMessageW(control, LVM_SETBKCOLOR, 0, static_cast<LPARAM>(colorRef(base.background)));
+        // Фон ПОД ТЕКСТОМ — отдельное сообщение, и без него comctl32 рисует
+        // подложку подписи системным цветом окна: в тёмной схеме это белая
+        // полоса под каждой подписью поверх тёмных строк.
+        ::SendMessageW(control, LVM_SETTEXTBKCOLOR, 0, static_cast<LPARAM>(colorRef(base.background)));
+        ::SendMessageW(control, LVM_SETTEXTCOLOR, 0, static_cast<LPARAM>(colorRef(base.text)));
+    } else {
+        ::SendMessageW(control, TVM_SETBKCOLOR, 0, static_cast<LPARAM>(colorRef(base.background)));
+        ::SendMessageW(control, TVM_SETTEXTCOLOR, 0, static_cast<LPARAM>(colorRef(base.text)));
+        // Линии дерева — тоже из палитры: иначе в тёмной схеме они остаются
+        // серыми системными и выглядят как чужая сетка поверх тёмной панели.
+        ::SendMessageW(control, TVM_SETLINECOLOR, 0, static_cast<LPARAM>(colorRef(palette.divider)));
+    }
+    ::InvalidateRect(control, nullptr, FALSE);
+}
+
+void fillNativeRow(HDC dc, const RECT& box, const Color& background) noexcept {
+    if (dc == nullptr) return;
+    if (box.right <= box.left || box.bottom <= box.top) return;
+    // Цвет фона строки на DC и цвет фона, заданный контролу сообщением, —
+    // одно и то же число (nativeRow), поэтому заливка не может разойтись с
+    // тем, что потом нарисует сам comctl32.
+    HBRUSH brush = ::CreateSolidBrush(static_cast<COLORREF>(colorRef(background)));
+    if (brush == nullptr) return;
+    ::FillRect(dc, &box, brush);
+    ::DeleteObject(brush);
+}
+
+void applyNativeHeaderTheme(HWND list, Scheme scheme) noexcept {
+    if (list == nullptr) return;
+    // В светлой схеме шапка системная и правильная: DarkMode_Explorer здесь
+    // только сломал бы её, поэтому вызова нет.
+    if (scheme != Scheme::Dark) return;
+    HWND header =
+        reinterpret_cast<HWND>(::SendMessageW(list, LVM_GETHEADER, static_cast<WPARAM>(0), static_cast<LPARAM>(0)));
+    if (header == nullptr) return;
+    // Шапка под темой и под подтемой «тёмного» рисуется через DrawThemeBackground
+    // и не смотрит ни на WM_CTLCOLORHDR, ни на цвета DC — замерено: полоса
+    // шапки оставалась 240,240,240 и при подтеме, и при ответе на
+    // WM_CTLCOLORHDR. Единственный документированный рычаг — снять тему с самой
+    // шапки (SetWindowTheme с пустой подтемой), после чего она рисуется
+    // классически и берёт фон из ответа на WM_CTLCOLORHDR (см. childProc
+    // экранов). В СВЕТЛОЙ схеме этого не делаем: там шапка системная, читаемая
+    // и выглядит как у остальных окон Windows.
+    const UxthemeApi api = uxthemeApi();
+    if (api.setWindowTheme == nullptr) return;
+    // Снятие темы — через тот же динамический uxtheme, что и остальные вызовы
+    // модуля: статический импорт uxtheme.dll означал бы требование «эта DLL
+    // есть» в каждом бинарнике (см. раздел 2 в шапке файла).
+    (void)api.setWindowTheme(header, L"", L"");
+}
+
+bool nativeListItemRect(HWND list, int index, RECT& box) noexcept {
+    if (list == nullptr || index < 0) return false;
+    // LVM_GETITEMRECT: код «что вернуть» (LVIR_BOUNDS) макрос кладёт в
+    // RECT.left, поэтому у ListView_GetItemRect четыре аргумента. Список
+    // спрашиваем именно об этом прямоугольнике: у CDDS_ITEMPREPAINT он и есть
+    // границы строки на экране.
+    RECT request{};
+    request.left = LVIR_BOUNDS;
+    if (::SendMessageW(list, LVM_GETITEMRECT, static_cast<WPARAM>(index),
+                       reinterpret_cast<LPARAM>(&request)) == FALSE) {
+        return false;
+    }
+    box = request;
+    return box.right > box.left && box.bottom > box.top;
 }
 
 // ---------------------------------------------------------------------------

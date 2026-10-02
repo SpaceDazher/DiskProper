@@ -1712,6 +1712,7 @@ struct ViewState {
     std::array<HFONT, 4> fonts{};
     HIMAGELIST indentImages{nullptr};
     HBRUSH surfaceBrush{nullptr};
+    HBRUSH headerBrush{nullptr};
     std::vector<std::string> rowKeys;
     std::vector<ChildProc> children;
     std::shared_ptr<mv::ScreenEndpoint> feed;
@@ -1730,6 +1731,7 @@ struct ViewState {
         }
         if (indentImages != nullptr) ::ImageList_Destroy(indentImages);
         if (surfaceBrush != nullptr) ::DeleteObject(surfaceBrush);
+        if (headerBrush != nullptr) ::DeleteObject(headerBrush);
     }
 
     // --- Текст в контролы ---------------------------------------------------
@@ -2142,13 +2144,18 @@ struct ViewState {
         const theme::Palette& palette = theme.palette();
         if (surfaceBrush != nullptr) ::DeleteObject(surfaceBrush);
         surfaceBrush = ::CreateSolidBrush(theme::colorRef(palette.surface));
+        if (headerBrush != nullptr) ::DeleteObject(headerBrush);
+        // Шапка столбцов — отдельное окно, и её фон приходит ответом на
+        // WM_CTLCOLORHDR из окна списка (см. childProc).
+        headerBrush = ::CreateSolidBrush(theme::colorRef(theme::nativeHeader(palette, false).background));
         if (list != nullptr) {
-            ListView_SetBkColor(list, theme::colorRef(palette.surface));
-            ListView_SetTextColor(list, theme::colorRef(palette.textPrimary));
-            // Подтема «тёмного» у нативных контролов нет в документированном API
-            // (ADR-003); модуль темы делает это через безопасные вызовы uxtheme, а
-            // отказ — не повод оставлять список белым.
-            (void)theme::enableDarkModeForWindow(list, theme.scheme());
+            // Фон и подписи нативного списка задаёт модуль темы, и решение одно
+            // для всех экранов (D-75): раньше здесь сначала ставился свой фон, а
+            // затем включался тёмный режим, и подтема возвращала контролу
+            // СИСТЕМННЫЙ фон — подпись NM_CUSTOMDRAW при этом оставалась белой,
+            // то есть в тёмной схеме список был белым по белому.
+            theme::applyNativeColors(list, theme::NativeControl::List, palette);
+            theme::applyNativeHeaderTheme(list, theme.scheme());
         }
         if (indentImages != nullptr) ::ImageList_Destroy(indentImages);
         // Высота строки оценивается в DIP, а не измеряется по шрифту: список
@@ -3171,17 +3178,31 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
                 case CDDS_ITEMPREPAINT: {
                     const int index = static_cast<int>(draw->nmcd.dwItemSpec);
                     const TreeRow* row = state->rowAt(index);
-                    const bool selected = (draw->nmcd.uItemState & CDIS_SELECTED) != 0;
+                    // Выделение берём из модели, а не из CDIS_SELECTED: comctl32
+                    // в этой версии присылает CDIS_SELECTED ВСЕМ строкам
+                    // (проверено замером: uItemState&CDIS_SELECTED != 0 у всех
+                    // десяти строк списка при LVS_SINGLESEL), и фон «выделенной
+                    // строки» покрасил бы весь список. Модель — единственный
+                    // источник истины о выборе, как и в LVN_ITEMCHANGED выше.
+                    const std::string key = state->model.keyAt(static_cast<std::size_t>(index));
+                    const bool selected = !key.empty() && key == state->model.selectedKey();
                     const bool unavailable = row != nullptr && row->unavailable;
                     HDC dc = draw->nmcd.hdc;
-                    // Цвет подписи и фона — из темы, а не системный: на тёмной
-                    // палитре системный чёрный текст нечитаем, а «зелёная полоса
-                    // выделения» посреди тёмной темы выглядит дырой.
+                    // Фон строки и её подпись — пара из модуля темы: подпись
+                    // всегда контрастна ФАКТИЧЕСКОМУ фону, который сейчас будет
+                    // залит, а не «цвету темы», который может оказаться того же
+                    // цвета (D-75: белым по белому читался весь список).
+                    const theme::NativeRow style = theme::nativeRow(palette, selected, unavailable, unavailable);
                     ::SetBkMode(dc, TRANSPARENT);
-                    ::SetBkColor(dc, theme::colorRef(unavailable ? palette.surfaceAlt : palette.surface));
-                    const theme::Color text = selected ? palette.textOnAccent
-                                                       : (unavailable ? palette.textDisabled : palette.textPrimary);
-                    ::SetTextColor(dc, theme::colorRef(text));
+                    ::SetBkColor(dc, theme::colorRef(style.background));
+                    ::SetTextColor(dc, theme::colorRef(style.text));
+                    // Фон заливаем по ПРЯМОУГОЛЬНИКУ СТРОКИ из LVM_GETITEMRECT:
+                    // nmcd.rc на этой стадии — мусор (см. theme::nativeListItemRect),
+                    // и заливка по нему не рисует ничего.
+                    RECT box{};
+                    if (theme::nativeListItemRect(state->list, index, box)) {
+                        theme::fillNativeRow(dc, box, style.background);
+                    }
                     return CDRF_NOTIFYSUBITEMDRAW;
                 }
                 case kSubItemPrePaint: {
@@ -3203,8 +3224,7 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
                     ::DrawTextW(dc, wide.c_str(), -1, &box,
                                 DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
                     return CDRF_SKIPDEFAULT;
-                }
-                case CDDS_ITEMPOSTPAINT:
+                }                case CDDS_ITEMPOSTPAINT:
                     paintRowBadges(*state, draw->nmcd.hdc, static_cast<int>(draw->nmcd.dwItemSpec));
                     return CDRF_DODEFAULT;
                 default: break;
@@ -3284,6 +3304,20 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
 // клавиши едят, и Ctrl+E на кнопке молча пропадал бы.
 LRESULT CALLBACK childProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     auto* state = stateOf(window);
+    if (message == theme::WM_CTLCOLORHDR && state->headerBrush != nullptr) {
+        // Шапка столбцов — дочернее окно списка, и её фон задаётся ответом на
+        // WM_CTLCOLORHDR из окна списка. Других путей на этой Windows нет:
+        // NM_CUSTOMDRAW шапки до родителя списка не доходит (замер: ноль
+        // уведомлений за обход страниц), а подтема «тёмного» оставляет её
+        // системной — в тёмной схеме это светлая полоса поперёк тёмного
+        // списка (D-75).
+        const theme::NativeRow header = theme::nativeHeader(state->theme.palette(), false);
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        ::SetBkColor(dc, theme::colorRef(header.background));
+        ::SetTextColor(dc, theme::colorRef(header.text));
+        return reinterpret_cast<LRESULT>(state->headerBrush);
+    }
+
     if (state == nullptr) return ::DefWindowProcW(window, message, wParam, lParam);
     if (message == WM_NCDESTROY) {
         state->removeChild(window);

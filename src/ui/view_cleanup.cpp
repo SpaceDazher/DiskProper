@@ -2181,12 +2181,11 @@ struct ViewState {
         if (surfaceBrush != nullptr) ::DeleteObject(surfaceBrush);
         surfaceBrush = ::CreateSolidBrush(theme::colorRef(palette.surface));
         if (tree != nullptr) {
-            TreeView_SetBkColor(tree, theme::colorRef(palette.surface));
-            TreeView_SetTextColor(tree, theme::colorRef(palette.textPrimary));
-            // Подтема «тёмного» у нативных контролов нет в документированном
-            // API (ADR-003), и модуль темы делает это через безопасные вызовы
-            // uxtheme; отказ — не повод оставлять контрол белым.
-            (void)theme::enableDarkModeForWindow(tree, theme.scheme());
+            // Фон и подписи нативного дерева — из модуля темы, решение одно для
+            // всех экранов (D-75): свой фон, поставленный ДО включения тёмного
+            // режима, подтема перекрывала системным, а подпись NM_CUSTOMDRAW
+            // оставалась белой.
+            theme::applyNativeColors(tree, theme::NativeControl::Tree, palette);
         }
         if (stateImages != nullptr) ::ImageList_Destroy(stateImages);
         stateImages = buildStateImages();
@@ -2678,10 +2677,20 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
                     switch (draw->nmcd.dwDrawStage) {
                     case CDDS_PREPAINT: return CDRF_NOTIFYITEMDRAW;
                     case CDDS_ITEMPREPAINT: {
-                        // Цвет подписи — из темы, а не системный: на тёмной
-                        // палитре системный чёрный текст нечитаем.
-                        ::SetTextColor(draw->nmcd.hdc, theme::colorRef(palette.textPrimary));
-                        ::SetBkMode(draw->nmcd.hdc, TRANSPARENT);
+                        // Фон узла и его подпись — пара из модуля темы: подпись
+                        // всегда контрастна фону, который сейчас будет залит. На
+                        // выделенном узле это ровно тот случай, где «цвет темы
+                        // вслепую» давал белый по белому (D-75). Выделение берём
+                        // из модели (focusKey), а не из CDIS_SELECTED.
+                        const auto handle = reinterpret_cast<HTREEITEM>(draw->nmcd.dwItemSpec);
+                        const std::string key = state->keyFor(handle);
+                        const bool selected = !key.empty() && key == state->model.focusKey();
+                        const theme::NativeRow style = theme::nativeRow(palette, selected, false, false);
+                        HDC dc = draw->nmcd.hdc;
+                        ::SetBkMode(dc, TRANSPARENT);
+                        ::SetBkColor(dc, theme::colorRef(style.background));
+                        ::SetTextColor(dc, theme::colorRef(style.text));
+                        theme::fillNativeRow(dc, draw->nmcd.rc, style.background);
                         return CDRF_NEWFONT;
                     }
                     case CDDS_ITEMPOSTPAINT: {
