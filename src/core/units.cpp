@@ -9,19 +9,6 @@
 namespace mrproper::core {
 namespace {
 
-// Русские единицы с правильными окончаниями — их придётся менять вместе с локализацией.
-const char* pluralRu(std::uint64_t n, const char* one, const char* few, const char* many) {
-    const std::uint64_t mod100 = n % 100;
-    if (mod100 >= 11 && mod100 <= 14) return many;
-    switch (n % 10) {
-        case 1: return one;
-        case 2:
-        case 3:
-        case 4: return few;
-        default: return many;
-    }
-}
-
 std::string fixed(double value, int decimals) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%.*f", decimals, value);
@@ -57,26 +44,31 @@ std::string formatBytes(std::uint64_t bytes, int decimals, bool binaryUnits) {
     return text;
 }
 
-// Существительное здесь ЗАШИТО: «файл». Это не мелочь, а ловушка, на которую
-// уже наступили (D-70). Счёт правил, томов, дисков, разделов и решений,
-// выведенный через formatCount, печатает слово «файлов» — сводка настроек
-// показывала «Правил: 138 файлов» о ста тридцати восьми правилах. Правило
-// множественного числа тут работает честно, но не для того существительного,
-// о котором думает вызывающий.
-//
-// Что делать вызывающему:
-//   * считаешь файлы — formatCount здесь единственно правильный;
-//   * существительное уже названо в подписи рядом («Правил:», «Дисков:») —
-//     печатай голое число (core::formatInteger с локалью из core/i18n);
-//   * существительное в шаблоне есть, и оно не «файл» — формат берётся из
-//     каталога строк с правилом множественного числа: core::trPlural(ключ, n)
-//     или ui::trPlural(...) в слое интерфейса.
-//
-// Общий API с существительным параметром (formatCount(n, «правило», ...))
-// требует объявления в units.hpp — файл не входит в список моей задачи, см.
-// отчёт по Q3 (D-70).
+// Форму даёт core::pluralFormIndex — то же правило CLDR, что и в каталоге строк
+// (i18n.cpp), поэтому «2 файла» здесь и «2 файла» в переводе получаются из одного
+// кода, а не из двух, которые однажды разъедутся.
+std::string formatCount(std::uint64_t count, const CountNoun& noun, Language lang) {
+    const std::size_t form = pluralFormIndex(lang, count);
+    const std::string_view word = (lang == Language::English)
+                                       ? ((form == 0) ? noun.enOne : noun.enPlural)
+                                       : ((form == 0) ? noun.ruOne : (form == 1 ? noun.ruFew : noun.ruMany));
+    // Слово приклеивается по длине, а не как const char*: CountNoun можно собрать
+    // и из std::string, а у такой строки data() не оканчивается нулём.
+    std::string out = std::to_string(count);
+    out += ' ';
+    out.append(word.data(), word.size());
+    return out;
+}
+
+// Обратная совместимость с вызовами без существительного: слово «файл» здесь
+// зашито, и это по-прежнему ловушка (D-70) для того, кто считает не файлы.
+// Таких мест осталось одиннадцать в четырёх чужих файлах (trash.cpp,
+// sizing.cpp, scan_coordinator.cpp, ui/view_report.cpp); из них корректен
+// sizing.cpp — он действительно считает файлы. Остальным правильный вызов —
+// formatCount с существительным или голое число, если подпись рядом уже называет
+// предмет. См. комментарий в units.hpp.
 std::string formatCount(std::uint64_t count) {
-    return std::to_string(count) + " " + pluralRu(count, "файл", "файла", "файлов");
+    return formatCount(count, nouns::kFile);
 }
 
 std::string formatPercent(double fraction, int decimals) {
@@ -89,7 +81,7 @@ std::string formatAge(std::int64_t seconds) {
     if (seconds < 3600) return std::to_string(seconds / 60) + " мин";
     if (seconds < 86400) return std::to_string(seconds / 3600) + " ч";
     const std::int64_t days = seconds / 86400;
-    if (days < 31) return std::to_string(days) + " " + pluralRu(static_cast<std::uint64_t>(days), "день", "дня", "дней");
+    if (days < 31) return formatCount(static_cast<std::uint64_t>(days), nouns::kDay);
     if (days < 365) return std::to_string(days / 30) + " мес";
     return std::to_string(days / 365) + " г";
 }

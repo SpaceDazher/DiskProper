@@ -1,0 +1,36 @@
+
+== MrProper integration ==
+  [ ok ] executor_manifest_listedFileIsDeletedAndNothingElse
+  [ ok ] executor_manifest_unlistedNeighbourSurvives
+  [ ok ] executor_manifest_partialDirectoryRemovesOnlyListedFiles
+  [корень] checklist=[C:\Users\Daniil\AppData\Local\Temp\MrProper-exec-25036-3\rule] manifest=[C:\Users\Daniil\AppData\Local\Temp\MrProper-exec-25036-3\rule] entry=[C:\Users\Daniil\AppData\Local\Temp\MrProper-exec-25036-3\foreign\outside.txt] verdict(с корнем чек-листа)=2 verdict(с корнем манифеста)=2
+  [состояние] item idx=0 outcome=failed code=failed hr=-2147024891 files=1 dirs=0 probs=1 root=[C:\Users\Daniil\AppData\Local\Temp\MrProper-exec-25036-3\rule] удалено по списку разрешённого: файлов 1, каталогов 0, пропущено 1; причина пропуска: путь вне корня правила (allowedRoot не задан или не содержит путь)
+  [ ok ] executor_manifest_listEntryOutsideRuleRootIsRefused
+  [ ok ] executor_manifest_candidateOutsideRuleRootIsRefused
+  [ ok ] executor_manifest_trashTransactionIsRestorable
+  [ ok ] trashBoundary_refusesPurgeOutsideRuleRoot
+  [ ok ] trashBoundary_allowsPurgeInsideRuleRoot
+  [ ok ] trashBoundary_junctionInsideRootLeavesOutsideDataIntact
+  [ ok ] trashBoundary_emptyRootKeepsServiceBehaviour
+  [ ok ] trashBoundary_unresolvableRootFailsClosed
+  [ ok ] vfsEdge_longPath_tree_beyond_max_path_is_visible
+  [ ok ] vfsEdge_longPath_delete_inside_root_and_refuses_outside
+  [ ok ] vfsEdge_unicode_names_survive_round_trip
+  [ ok ] vfsEdge_reparse_junction_is_reported_but_not_followed
+  [ ok ] vfsEdge_walk_root_reparse_point_is_not_expanded
+  [ ok ] vfsEdge_short_name_resolves_to_the_same_directory
+  [ ok ] vfsEdge_long_unicode_tree_with_reparse_backlink
+  [ ok ] walk_visits_created_tree
+  [ ok ] walk_dot_and_dotdot_never_reach_the_visitor
+  [ ok ] walk_logical_sum_matches_raw_listing
+  [ ok ] walk_allocated_sum_matches_get_compressed_file_size
+  [ ok ] walk_root_is_normalized_and_every_path_inside_it
+  [ ok ] walk_empty_directory_reports_nothing
+  [ ok ] walk_missing_root_is_error_not_crash
+  [ ok ] walk_file_as_root_is_reported_as_directory_error
+  [ ok ] walk_max_depth_stops_descent
+  [ ok ] walk_visitor_skip_directory
+  [ ok ] walk_visitor_stop_returns_partial_result
+  [ ok ] walk_pre_canceled_stop_token_stops_immediately
+  [ ok ] walk_unicode_names_survive_unchanged
+ALL PASS: 31 проверок, провалов 0

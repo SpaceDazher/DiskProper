@@ -1477,6 +1477,13 @@ enum : int {
 inline constexpr int kColumnCount = 3;
 inline constexpr int kIndentLevels = 3;
 
+// Нижние границы ширин столбцов в пикселях, когда DPI ещё неизвестен (окно
+// создано, WM_DPICHANGED не пришёл). Ровно те же числа, что дают метрики при
+// 96 dpi, иначе первый кадр на 150 % был бы уже узким, чем все следующие.
+inline constexpr int kNumericColumnFloorPx = 72;
+inline constexpr int kNameColumnFloorPx = 160;
+inline constexpr int kBadgeColumnFloorPx = 16;
+
 // Подстадии отрисовки подпункта в NM_CUSTOMDRAW списка. В commctrl.h этого SDK
 // объявлены только CDDS_PREPAINT/CDDS_ITEMPREPAINT/CDDS_ITEMPOSTPAINT, а
 // comctl32 подстадии подпункта шлёт и документирует их (MSDN, Custom Draw
@@ -1766,11 +1773,8 @@ struct ViewState {
 
     void syncColumns() {
         if (list == nullptr) return;
-        RECT client{};
-        if (::GetClientRect(list, &client) == FALSE) return;
         const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
-        const int numeric = std::max(40, scale.dip(metrics.numericColumnDip));
-        const int badges = std::max(16, scale.dip(28.0));
+        const int numeric = std::max(kNumericColumnFloorPx, scale.dip(metrics.numericColumnDip));
         if (!columnsReady) {
             // Столбцы создаются один раз: LVM_INSERTITEM без столбца не вставит
             // строку, а создавать их заново на каждый щелчок — лишняя работа
@@ -1788,9 +1792,119 @@ struct ViewState {
             }
             columnsReady = true;
         }
-        ListView_SetColumnWidth(list, 0, std::max(60, static_cast<int>(client.right) - 2 * numeric - badges - 8));
-        ListView_SetColumnWidth(list, 1, numeric);
-        ListView_SetColumnWidth(list, 2, numeric);
+        syncColumnWidths();
+    }
+
+    // Ширина, на которой список РИСУЕТ столбцы. У SysListView32 в режиме отчёта
+    // это клиентская область окна заголовка, а не самого списка: вертикальная
+    // полоса прокрутки лежит в клиентской области списка, и панель столбцов её не
+    // занимает. Бюджет по GetClientRect(list) шире на целую полосу, и последний
+    // столбец уезжал за правый край ровно на неё — при том что ворота
+    // Measure-ListColumns меряют именно заголовок.
+    [[nodiscard]] int columnRoomPx() const noexcept {
+        if (list == nullptr) return 0;
+        const HWND header = ListView_GetHeader(list);
+        if (header != nullptr) {
+            RECT room{};
+            if (::GetClientRect(header, &room) == TRUE) {
+                const int width = room.right - room.left;
+                if (width > 0) return width;
+            }
+        }
+        RECT client{};
+        if (::GetClientRect(list, &client) == FALSE) return 0;
+        return client.right - client.left;
+    }
+
+    // Раскладка ширин трёх столбцов в полосе roomPx. Чистая функция без окна и
+    // без DPI: единственное её требование — сумма ширин не больше полосы, а
+    // правило «сумма равна полосе» проверяется глазами и не зависит от того,
+    // откуда пришла полоса: из заголовка, из клиентской области или из теста.
+    [[nodiscard]] static std::array<int, kColumnCount> fitColumnWidths(int roomPx, int numericWantPx,
+                                                                        int numericMinPx, int nameMinPx,
+                                                                        int badgeReservePx) noexcept {
+        if (roomPx <= 0) return {0, 0, 0};
+        // (1) Числовой столбец — по метрике, но не больше трети полосы: два
+        //     таких столбца не должны съесть имя узла, ради которого список и
+        //     нужен (при минимальном окне полоса 648 px — это 216 на столбец).
+        int numeric = std::max(1, std::min(std::max(numericMinPx, numericWantPx), std::max(1, roomPx / 3)));
+        int name = roomPx - 2 * numeric;
+        // (2) Значки строки рисуются справа от последнего столбца, значит им
+        //     нужен свободный край. Резерв берётся только если после
+        //     минимально читаемого имени он ещё помещается: имя важнее значка.
+        if (name - badgeReservePx >= nameMinPx) name -= badgeReservePx;
+        // (3) Имя ниже читаемого минимума: числовые столбцы уступают ему место,
+        //     но сами не опускаются ниже своего минимума.
+        if (name < nameMinPx) {
+            const int debt = nameMinPx - name;
+            const int spare = 2 * (numeric - numericMinPx);
+            numeric = std::max(numericMinPx, numeric - std::min(spare, (debt + 1) / 2));
+            name = roomPx - 2 * numeric;
+        }
+        // (4) Полосы не хватает даже на минимумы (окно меньше минимального):
+        //     дробим её в долях. Читаемость здесь уже не предмет торга — подпись
+        //     получит многоточие, но столбцы останутся в пределах полосы: иначе
+        //     список включит горизонтальную прокрутку, и последний столбец
+        //     уедет за край вместе с ней.
+        if (name <= 0) {
+            numeric = std::max(1, roomPx / 5);
+            name = roomPx - 2 * numeric;
+        }
+        return {std::max(0, name), numeric, numeric};
+    }
+
+    // Ширины столбцов — по полосе, которая есть СЕЙЧАС. Раньше ширины считались
+    // один раз, из GetClientRect списка, и больше не трогались: список получал
+    // размер позже (WM_SIZE → layout()), поэтому столбцы оставались от прошлого
+    // размера окна. На переходе с окна 1600x900 на минимальные 900x600 первый
+    // столбец оставался 656 px при полосе 428 — сумма 848 при полосе 648, то
+    // есть третий столбец целиком уезжал за правый край (D-72).
+    void syncColumnWidths() {
+        if (list == nullptr || !columnsReady) return;
+        const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
+        const int room = columnRoomPx();
+        if (room <= 0) return;  // список ещё не получил размер — считать не по чему
+        const int numericMin = std::max(kNumericColumnFloorPx, scale.dip(metrics.numericColumnMinDip));
+        const int nameMin = std::max(kNameColumnFloorPx, scale.dip(metrics.nameColumnMinDip));
+        const int reserve = std::max(kBadgeColumnFloorPx, scale.dip(metrics.badgeColumnDip));
+        const std::array<int, kColumnCount> widths = fitColumnWidths(
+            room, std::max(numericMin, scale.dip(metrics.numericColumnDip)), numericMin, nameMin, reserve);
+        for (int i = 0; i < kColumnCount; ++i) {
+            ListView_SetColumnWidth(list, i, widths[static_cast<std::size_t>(i)]);
+        }
+    }
+
+    // Ширина текста тем шрифтом, которым нарисован список. Без неё подпись в
+    // столбце не сократить, а обрезанный заголовок не меняет ни размер окна, ни
+    // размер элементов — поэтому проверка прямоугольников его не видит, и
+    // ворота Measure-ListColumns видят (tools/ui-smoke.ps1, D-71).
+    [[nodiscard]] int textWidthPx(const std::wstring& text) const {
+        if (text.empty() || window == nullptr) return 0;
+        HDC dc = ::GetDC(window);
+        if (dc == nullptr) return 0;
+        if (fonts[0] != nullptr) ::SelectObject(dc, fonts[0]);
+        SIZE measured{};
+        ::GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &measured);
+        ::ReleaseDC(window, dc);
+        return measured.cx;
+    }
+
+    // Подпись, которая помещается в столбец целиком. Многоточие, а не обрезка:
+    // обрезанная посередине буква читается как другая буква, и «Свобо» вместо
+    // «Свободно» молчит о том, что столбец стал уже, чем нужно (§12).
+    [[nodiscard]] std::string ellipsized(std::string_view text, int columnPx) const {
+        if (text.empty()) return {};
+        const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
+        const int room = columnPx - std::max(2, scale.dip(4.0));
+        if (room <= 0) return {};
+        const std::wstring wide = toWide(text);
+        if (textWidthPx(wide) <= room) return std::string(text);
+        const std::wstring dots = L"…";  // многоточие, а не три точки: одна буква
+        for (std::size_t length = wide.size(); length > 0; --length) {
+            const std::wstring cut = wide.substr(0, length - 1) + dots;
+            if (textWidthPx(cut) <= room) return toUtf8(cut);
+        }
+        return {};
     }
 
     void syncHeaders() {
@@ -1806,7 +1920,9 @@ struct ViewState {
                 // языках и не требует ключа в каталоге строк.
                 text += order.direction == SortDirection::Ascending ? " \xE2\x96\xB2" : " \xE2\x96\xBC";
             }
-            setColumnText(i, text);
+            // Подпись приходит по итоговой ширине столбца и не должна вылезать
+            // за неё: системный контрол обрезает её молча, без многоточия.
+            setColumnText(i, ellipsized(text, ListView_GetColumnWidth(list, i)));
         }
     }
 
@@ -2012,6 +2128,12 @@ struct ViewState {
             place(actionButtons[i], layout.actionButtonRect(static_cast<int>(i)),
                   i < static_cast<std::size_t>(layout.actionButtonCount()));
         }
+        // Ширины столбцов и подписи заголовков — ПОСЛЕ раскладки: только сейчас
+        // у списка есть окончательный размер, и только теперь известно, сколько
+        // места на самом деле останется на столбцы. Раньше это делалось до
+        // layout(), то есть по размеру списка от прошлого кадра.
+        syncColumnWidths();
+        syncHeaders();
     }
 
     // --- Тема ----------------------------------------------------------------
@@ -2579,12 +2701,11 @@ struct ViewState {
 
     void refreshAll() {
         if (!controlsReady) return;
-        syncColumns();
+        syncColumns();  // создать столбцы (один раз) и подогнать их под текущий размер
         syncList();
-        syncHeaders();
         syncButtons();
         syncTexts();
-        layout();
+        layout();  // в конце раскладки пересчитываются ширины столбцов и подписи
         if (card != nullptr) ::InvalidateRect(card, nullptr, FALSE);
         if (map != nullptr) ::InvalidateRect(map, nullptr, FALSE);
     }

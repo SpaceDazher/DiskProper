@@ -269,16 +269,20 @@ std::string UndoService::detailText(const ItemResult& result) {
     return platform::formatStatus(result.status, result.win32Error);
 }
 
+// Подписи рядом уже называют предмет («транзакций», «элементов», «конфликтов»),
+// поэтому число печатается голым: с существительным здесь получалось «корзина:
+// транзакций 5 файлов» (D-70). Существительное нужно там, где его нет в
+// подписи, — там зовут core::formatCount с формой.
 std::string UndoService::describe(const Snapshot& snapshot) {
-    std::string text = "корзина: транзакций " + core::formatCount(snapshot.transactions.size()) +
-                       ", отменяемых " + core::formatCount(snapshot.availableTransactions) + ", элементов " +
-                       core::formatCount(snapshot.restorableItems) + ", " +
+    std::string text = "корзина: транзакций " + std::to_string(snapshot.transactions.size()) +
+                       ", отменяемых " + std::to_string(snapshot.availableTransactions) + ", элементов " +
+                       std::to_string(snapshot.restorableItems) + ", " +
                        core::formatBytes(snapshot.totalBytes, 1, true);
     if (snapshot.expiredTransactions > 0) {
-        text += ", просрочено " + core::formatCount(snapshot.expiredTransactions);
+        text += ", просрочено " + std::to_string(snapshot.expiredTransactions);
     }
     if (!snapshot.brokenDirs.empty()) {
-        text += ", битых каталогов " + core::formatCount(snapshot.brokenDirs.size());
+        text += ", битых каталогов " + std::to_string(snapshot.brokenDirs.size());
     }
     return text;
 }
@@ -287,17 +291,17 @@ std::string UndoService::describe(const RestorePlanResult& result) {
     if (!result.ok) return "восстановление невозможно: " + result.problem;
     const std::size_t total = result.plan.entries.size();
     const std::size_t skipped = std::min(static_cast<std::size_t>(result.plan.skippedCount), total);
-    std::string text = "план восстановления " + result.txId + ": вернуть " + core::formatCount(total - skipped) +
-                       " из " + core::formatCount(total) + ", " + core::formatBytes(result.plan.bytesPlanned, 1, true);
+    std::string text = "план восстановления " + result.txId + ": вернуть " + std::to_string(total - skipped) +
+                       " из " + std::to_string(total) + ", " + core::formatBytes(result.plan.bytesPlanned, 1, true);
     if (result.plan.conflictCount > 0) {
-        text += ", конфликтов " + core::formatCount(result.plan.conflictCount);
+        text += ", конфликтов " + std::to_string(result.plan.conflictCount);
     }
     if (result.plan.requiresUserDecision) {
-        text += ", вопросов " + core::formatCount(result.plan.questions.size());
+        text += ", вопросов " + std::to_string(result.plan.questions.size());
     }
     if (result.plan.cost.crossVolume) text += ", копирование между томами";
     if (result.plan.cost.slowEnoughToWarn) {
-        text += ", это займёт время (около " + core::formatCount(result.plan.cost.seconds) + " с)";
+        text += ", это займёт время (около " + std::to_string(result.plan.cost.seconds) + " с)";
     }
     return text;
 }

@@ -42,31 +42,10 @@ void mixText(std::uint64_t& hash, std::string_view text) noexcept {
     }
 }
 
-// Русские окончания. core::units::formatCount жёстко зашит на «файл», а здесь
-// считаются кандидаты («элемент») и категории, поэтому форма своя.
-// Временная мера: когда core::units получит plural с параметром (pluralRu там
-// приватная), эти три строки удаляются, а вызовы переходят на core::units.
-const char* pluralEnding(std::uint64_t count, const char* one, const char* few, const char* many) {
-    const std::uint64_t mod100 = count % 100;
-    if (mod100 >= 11 && mod100 <= 14) return many;
-    switch (count % 10) {
-        case 1:
-            return one;
-        case 2:
-        case 3:
-        case 4:
-            return few;
-        default:
-            return many;
-    }
-}
-
-std::string countWith(std::uint64_t count, const char* one, const char* few, const char* many) {
-    return std::to_string(count) + " " + pluralEnding(count, one, few, many);
-}
-
-std::string itemsText(std::uint64_t count) { return countWith(count, "элемент", "элемента", "элементов"); }
-std::string categoriesText(std::uint64_t count) { return countWith(count, "категория", "категории", "категорий"); }
+// Формы множественного числа считает core::units. Локальные копии правил CLDR
+// (pluralEnding, countWith) и обёртки itemsText/categoriesText удалены вместе
+// с местом, которое они занимали: core::units получил форму с существительным,
+// и форма в сводке теперь одна на весь проект, а не по копии на файл (D-70).
 
 // Длительность прогона. Для значений меньше секунды core::units::formatAge
 // («0 с») обманывает: скан, который занял 40 мс, выглядит как мгновенный.
@@ -437,8 +416,10 @@ std::string ScanResult::headline() const {
     }
     // «по аллоцированному размеру» — FR-4 и §7.2: большая цифра всегда с этим
     // уточнением, иначе она читается как «столько данных лежит на диске».
-    std::string text = "Освободится " + core::formatBytes(totals.allocatedBytes) + " — " + itemsText(totals.candidateCount) +
-                       " в " + categoriesText(totals.categories.size()) + " (по аллоцированному размеру)";
+    std::string text = "Освободится " + core::formatBytes(totals.allocatedBytes) + " — " +
+                       core::formatCount(totals.candidateCount, core::nouns::kItem) + " в " +
+                       core::formatCount(static_cast<std::uint64_t>(totals.categories.size()), core::nouns::kCategory) +
+                       " (по аллоцированному размеру)";
     if (stats.cancelled) {
         text += "; скан прерван";
     } else if (stats.degraded) {
@@ -469,7 +450,7 @@ std::string ScanResult::toText() const {
     }
     out += "\nПравила: " + (rulesVersion.empty() ? std::string("(не указана версия)") : rulesVersion) +
            "; потоков в пуле: " + std::to_string(stats.workerThreads) + "; правил: " + std::to_string(stats.ruleCount);
-    out += "\nОбход: файлов " + core::formatCount(stats.filesScanned) + ", каталогов " +
+    out += "\nОбход: файлов " + std::to_string(stats.filesScanned) + ", каталогов " +
            std::to_string(stats.directoriesScanned) + ", байт (аллоцированных) " + core::formatBytes(stats.bytesScanned) +
            ", байт (логических) " + core::formatBytes(stats.logicalBytesScanned);
     out += "\nОтказы: ошибок " + std::to_string(stats.errorCount) + ", пропущено " + std::to_string(stats.skippedCount) +
@@ -818,8 +799,9 @@ std::vector<std::string> validateScanResult(const ScanResult& result) {
         }
         if (found->second != category.candidateCount) {
             problems.push_back("категория " + category.category + ": в totals " +
-                               std::to_string(category.candidateCount) + " кандидатов, среди кандидатов " +
-                               std::to_string(found->second));
+                               core::formatCount(static_cast<std::uint64_t>(category.candidateCount),
+                                                 core::nouns::kCandidate) +
+                               ", среди кандидатов " + std::to_string(found->second));
         }
     }
     for (std::size_t index = 1; index < result.totals.categories.size(); ++index) {

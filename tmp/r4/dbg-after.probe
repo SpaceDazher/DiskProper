@@ -1,0 +1,1 @@
+PROBE walks=405 walkMs=68926 walkNs=68926159600 listCalls=33301 listMs=44970 statCalls=1476 statMs=1316 convertCalls=352706 convertMs=37981 allocCalls=297581 allocMs=31639 allocUs=106 visitCalls=352706 visitMs=8666 entries=352706 files=297673 dirsListed=33301 statsRead=410 allocMeasured=297583 allocUnknown=211964 rootRefused=1122 elementErrors=74 pathRefused=0

@@ -878,7 +878,7 @@ std::string describeDisk(const PhysicalDisk& disk) {
     appendFlag(flags, disk.smartAvailable, "SMART");
     if (!flags.empty()) out += " [" + flags + "]";
     if (usage.spanningVolumeCount > 0) {
-        out += ", томов через несколько дисков: " + formatCount(usage.spanningVolumeCount);
+        out += ", томов через несколько дисков: " + std::to_string(usage.spanningVolumeCount);
     }
     if (disk.partitions.empty()) {
         out += "\n  разделы не перечислены";
@@ -900,16 +900,19 @@ std::string describeIssue(const DiskIssue& issue) {
     return out;
 }
 
+// Счётчики карты разделов идут подписями («Дисков:», «разделов:», «томов:»),
+// поэтому числа голые: подпись уже называет предмет, а существительное после
+// числа было бы вторым словом о том же самом («Дисков: 2 файлов», D-70).
 std::string toText(const std::vector<PhysicalDisk>& disks) {
     const InventoryUsage usage = inventoryUsage(disks);
     std::string out = "MrProper: карта разделов\n";
-    out += "Дисков: " + formatCount(usage.diskCount) + ", разделов: " + formatCount(usage.partitionCount) +
-           ", томов: " + formatCount(usage.volumeCount);
+    out += "Дисков: " + std::to_string(usage.diskCount) + ", разделов: " + std::to_string(usage.partitionCount) +
+           ", томов: " + std::to_string(usage.volumeCount);
     if (usage.spanningVolumeCount > 0) {
-        out += " (через несколько дисков: " + formatCount(usage.spanningVolumeCount) + ")";
+        out += " (через несколько дисков: " + std::to_string(usage.spanningVolumeCount) + ")";
     }
     if (usage.unknownVolumeCount > 0) {
-        out += ", размер не получен у: " + formatCount(usage.unknownVolumeCount);
+        out += ", размер не получен у: " + std::to_string(usage.unknownVolumeCount);
     }
     out += "\n";
     out += "Диски: " + formatBytes(usage.totalBytes) + ", из них в файловых системах: " +
@@ -930,7 +933,7 @@ std::string toText(const std::vector<PhysicalDisk>& disks) {
     }
     const std::vector<DiskIssue> issues = validateInventory(disks);
     if (!issues.empty()) {
-        out += "Замечания к инвентаризации: " + formatCount(static_cast<std::uint64_t>(issues.size())) + "\n";
+        out += "Замечания к инвентаризации: " + std::to_string(issues.size()) + "\n";
         for (const DiskIssue& issue : issues) {
             out += "  " + describeIssue(issue) + "\n";
         }

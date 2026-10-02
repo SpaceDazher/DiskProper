@@ -173,28 +173,11 @@ std::string formatTimestamp(std::int64_t unixSeconds) {
     return std::to_string(unixSeconds) + " (unix)";
 }
 
-std::string pluralItems(std::size_t count) {
-    if (count == 0) return "0 элементов";
-    const std::size_t hundreds = count % 100;
-    const std::size_t tens = count % 10;
-    const bool last = hundreds >= 11 && hundreds <= 14;
-    if (last) return std::to_string(count) + " элементов";
-    if (tens == 1) return std::to_string(count) + " элемент";
-    if (tens >= 2 && tens <= 4) return std::to_string(count) + " элемента";
-    return std::to_string(count) + " элементов";
-}
-
-std::string pluralOperations(std::size_t count) {
-    if (count == 0) return "0 операций";
-    const std::size_t hundreds = count % 100;
-    const std::size_t tens = count % 10;
-    const bool last = hundreds >= 11 && hundreds <= 14;
-    if (last) return std::to_string(count) + " операций";
-    if (tens == 1) return std::to_string(count) + " операция";
-    if (tens >= 2 && tens <= 4) return std::to_string(count) + " операции";
-    return std::to_string(count) + " операций";
-}
-
+// Формы множественного числа в этом файле больше не дублируются: элементы и
+// операции считает core::units (formatCount с существительным). Две копии
+// правил CLDR, которые стояли здесь, печатали формы правильно, но только
+// по-русски и каждая по-своему — как раз из такого разнобоя получается «2
+// файлов» в сводке (D-70).
 // ---------------------------------------------------------------------------
 // Чтение кандидатов из JSON
 // ---------------------------------------------------------------------------
@@ -432,7 +415,8 @@ RootEnumeration enumerateRoot(std::string_view rootUtf8) {
             if (isFile) {
                 if (result.entries.size() >= kMaxEnumeratedPaths) {
                     result.complete = false;
-                    result.note = "в корне больше " + std::to_string(kMaxEnumeratedPaths) + " файлов: перечень неполон";
+                    result.note = "в корне больше " + core::formatCount(kMaxEnumeratedPaths, core::nouns::kFile) +
+                                  ": перечень неполон";
                     return result;
                 }
                 // Размер, который прочитать нельзя (нет прав на атрибуты), — это
@@ -625,7 +609,8 @@ bool synthesizeManifest(core::CleanupCandidate& candidate, core::CandidateManife
     if (candidate.fileCount != 0 &&
         static_cast<std::uint64_t>(candidate.fileCount) != enumeration.entries.size()) {
         note = candidate.displayName + ": в файле нет манифеста, а в корне " +
-               std::to_string(enumeration.entries.size()) + " файлов при " + std::to_string(candidate.fileCount) +
+               core::formatCount(static_cast<std::uint64_t>(enumeration.entries.size()), core::nouns::kFile) +
+               " при " + core::formatCount(static_cast<std::uint64_t>(candidate.fileCount), core::nouns::kFile) +
                " в кандидате — правило что-то оставило, какой перечень удалять, из файла не известно; "
                "нужен отчёт скана вместе с манифестом или повторный скан";
         return false;
@@ -685,7 +670,8 @@ void reportSnapshot(const core::PlanSnapshot& snapshot, const core::DryRunReport
     err << "  операций: " + std::to_string(snapshot.operationCount) + " · объём: " +
          core::formatBytes(snapshot.totalBytes) + " (аллоцированный размер)\n";
     err << "  отпечаток плана: " << std::to_string(snapshot.planSignature) << "\n";
-    err << "  кандидатов всего: " << core::formatCount(dryRun.operations.size() + dryRun.untouched.size()) << "\n";
+    err << "  кандидатов всего: "
+        << (dryRun.operations.size() + dryRun.untouched.size()) << "\n";
 
     // Журнал: FR-5 требует записи снимка, а §12 — пути в каждой ошибке.
     core::logInfo("plan.snapshot", "снимок состояния перед выполнением",
@@ -730,8 +716,8 @@ PlanExit prepareRun(const ApplyOptions& options, const ApplyIo& io, const ApplyE
         candidates = std::move(scan.candidates);
         manifests = std::move(scan.manifests);
         rules = std::move(scan.rules);
-        io.err << "MrProper: живой скан: кандидатов " << core::formatCount(candidates.size()) << ", манифестов "
-               << core::formatCount(manifests.size()) << "\n";
+        io.err << "MrProper: живой скан: кандидатов " << candidates.size() << ", манифестов " << manifests.size()
+               << "\n";
     } else if (env.candidates) {
         std::string error;
         if (!env.candidates(candidates, error)) {
@@ -769,8 +755,7 @@ PlanExit prepareRun(const ApplyOptions& options, const ApplyIo& io, const ApplyE
         }
         manifests = std::move(filtered);
         if (candidates.size() != before) {
-            io.err << "MrProper: фильтр по категориям оставил " << core::formatCount(candidates.size()) << " из "
-                   << core::formatCount(before) << "\n";
+            io.err << "MrProper: фильтр по категориям оставил " << candidates.size() << " из " << before << "\n";
         }
     }
 
@@ -839,9 +824,10 @@ bool hasRiskyOperation(const core::DryRunReport& dryRun) {
 
 PlanExit askConfirmation(const ApplyIo& io, const ApplyEnvironment& env, const ApplyReport& report) {
     const std::string token = requiredConfirmationToken(report.dryRun);
-    std::string question = "MrProper: будет выполнено " + pluralOperations(report.dryRun.operations.size()) +
-                           ", освободится " + core::formatBytes(report.dryRun.totalBytes) +
-                           " (аллоцированный размер).";
+    std::string question =
+        "MrProper: будет выполнено " +
+        core::formatCount(static_cast<std::uint64_t>(report.dryRun.operations.size()), core::nouns::kOperation) +
+        ", освободится " + core::formatBytes(report.dryRun.totalBytes) + " (аллоцированный размер).";
     if (hasRiskyOperation(report.dryRun)) {
         question += " В списке есть Risky-операции — это двойное подтверждение (SPEC §12).";
     }
@@ -1617,9 +1603,9 @@ bool liveScanWithEngine(const std::string& rulesPath, const std::vector<std::str
 
     std::uint64_t reclaimable = 0;
     for (const core::CleanupCandidate& candidate : out.candidates) reclaimable += candidate.allocatedBytes;
-    human << "MrProper: скан: кандидатов " << core::formatCount(out.candidates.size()) << ", манифестов "
-          << core::formatCount(out.manifests.size()) << ", освободится " << core::formatBytes(reclaimable)
-          << ", задач выполнено " << runReport->completed << " из " << runReport->tasks.size() << "\n";
+    human << "MrProper: скан: кандидатов " << out.candidates.size() << ", манифестов " << out.manifests.size()
+          << ", освободится " << core::formatBytes(reclaimable) << ", задач выполнено " << runReport->completed
+          << " из " << runReport->tasks.size() << "\n";
 
     core::logInfo("apply.scan", "живой скан завершён",
                   core::LogFields{core::logField("rules", rulesPath),

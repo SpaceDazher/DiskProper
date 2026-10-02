@@ -1,0 +1,114 @@
+[tidy] clang-tidy : D:\Project\MrProper\build\tools\llvm\bin\clang-tidy.exe
+[tidy] clang-cl   : D:\Project\MrProper\build\tools\llvm\bin\clang-cl.exe
+[tidy] cmake      : C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe
+[tidy] ninja      : C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe
+[tidy] версия     : LLVM (http://llvm.org/):
+[tidy] версия     : cmake version 3.20.21032501-MSVC_2
+[tidy] версия     : 1.10.2
+[tidy] vcvars64    : C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat
+[tidy] переменных окружения импортировано из vcvars64: 88
+
+[tidy] база компиляции: 65 единиц всего, 34 в проверенных путях
+[tidy]   TU D:/Project/MrProper/src/core/disk_model.cpp
+[tidy]   TU D:/Project/MrProper/src/core/glob.cpp
+[tidy]   TU D:/Project/MrProper/src/core/i18n.cpp
+[tidy]   TU D:/Project/MrProper/src/core/json.cpp
+[tidy]   TU D:/Project/MrProper/src/core/log.cpp
+[tidy]   TU D:/Project/MrProper/src/core/plan.cpp
+[tidy]   TU D:/Project/MrProper/src/core/report_html.cpp
+[tidy]   TU D:/Project/MrProper/src/core/report_json.cpp
+[tidy]   TU D:/Project/MrProper/src/core/rules.cpp
+[tidy]   TU D:/Project/MrProper/src/core/rulesync.cpp
+[tidy]   TU D:/Project/MrProper/src/core/scoring.cpp
+[tidy]   TU D:/Project/MrProper/src/core/sizing.cpp
+[tidy]   TU D:/Project/MrProper/src/core/trash.cpp
+[tidy]   TU D:/Project/MrProper/src/core/undo.cpp
+[tidy]   TU D:/Project/MrProper/src/core/units.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/bus_type.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/devices.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/gpt_kind.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/inventory.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/layout.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/net.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/process_control.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/restart_manager.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/rulesync_client.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/size_probe.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/storage_query.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/trim_cache.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/vfs_delete.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/vfs_paths.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/vfs_size.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/vfs_trash.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/vfs_walk.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/volumes.cpp
+[tidy]   TU D:/Project/MrProper/src/platform/wmi.cpp
+
+[tidy] clang-tidy завершился за 670 с, код 0, протокол: D:\Project\MrProper\build\tidy-a4\clang-tidy.log
+
+=== clang-tidy: 34 единиц компиляции, 670 с ===
+находок всего:                              244
+из них правила clang-tidy:                   237
+из них правила clang-analyzer-*:            1
+из них диагностика clang-diagnostic-*:       6
+severity: warning 244, error 0, note 0
+
+--- находки по правилам (по убыванию) ---
+   67  bugprone-exception-escape
+   43  readability-function-size
+   36  readability-function-cognitive-complexity
+   28  modernize-return-braced-init-list
+   18  modernize-use-emplace
+    8  cert-err33-c
+    8  performance-unnecessary-value-param
+    4  modernize-loop-convert
+    4  bugprone-suspicious-stringview-data-usage
+    3  readability-simplify-boolean-expr
+    3  readability-redundant-casting
+    3  clang-diagnostic-unused-function
+    3  bugprone-unused-return-value
+    3  performance-no-automatic-move
+    3  clang-diagnostic-switch
+    2  performance-no-int-to-ptr
+    1  performance-unnecessary-copy-initialization
+    1  cppcoreguidelines-owning-memory
+    1  performance-move-const-arg
+    1  clang-analyzer-optin.performance.Padding
+    1  performance-inefficient-string-concatenation
+    1  readability-redundant-string-cstr
+    1  bugprone-misplaced-widening-cast
+    1  modernize-pass-by-value
+
+--- находки по файлам ---
+   27  D:\Project\MrProper\src\platform\wmi.cpp
+   15  D:\Project\MrProper\src\platform\rulesync_client.cpp
+   14  D:\Project\MrProper\src\platform\net.cpp
+   14  D:\Project\MrProper\src\core\report_html.cpp
+   13  D:\Project\MrProper\src\platform\inventory.cpp
+   13  D:\Project\MrProper\src\platform\vfs_delete.cpp
+   13  D:\Project\MrProper\src\platform\vfs_paths.cpp
+   13  D:\Project\MrProper\src\platform\volumes.cpp
+   12  D:\Project\MrProper\src\platform\vfs_walk.cpp
+   11  D:\Project\MrProper\src\platform\restart_manager.cpp
+   10  D:\Project\MrProper\src\platform\vfs_trash.cpp
+    9  D:\Project\MrProper\src\platform\process_control.cpp
+    8  D:\Project\MrProper\src\core\plan.cpp
+    8  D:\Project\MrProper\src\core\disk_model.cpp
+    8  D:\Project\MrProper\src\core\report_json.cpp
+    7  D:\Project\MrProper\src\core\rulesync.cpp
+    7  D:\Project\MrProper\src\core\undo.cpp
+    7  D:\Project\MrProper\src\platform\devices.cpp
+    5  D:\Project\MrProper\src\platform\layout.cpp
+    4  D:\Project\MrProper\src\platform\trim_cache.cpp
+    4  D:\Project\MrProper\src\core\scoring.cpp
+    3  D:\Project\MrProper\src\core\sizing.cpp
+    3  D:\Project\MrProper\src\core\trash.cpp
+    3  D:\Project\MrProper\src\platform\size_probe.cpp
+    3  D:\Project\MrProper\src\core\json.cpp
+    2  D:\Project\MrProper\src\platform\gpt_kind.cpp
+    2  D:\Project\MrProper\src\core\glob.cpp
+    2  D:\Project\MrProper\src\core\rules.cpp
+    2  D:\Project\MrProper\src\core\i18n.cpp
+    1  D:\Project\MrProper\src\core\units.cpp
+    1  D:\Project\MrProper\src\platform\bus_type.cpp
+[tidy] сводка в JSON: D:\Project\MrProper\build\tidy-a4\tidy-summary.json

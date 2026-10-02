@@ -516,9 +516,11 @@ private:
     return std::to_string(elapsed.count() / 1000) + "." + std::to_string((elapsed.count() / 100) % 10) + " с";
 }
 
+// Подпись «элементов» называет предмет, поэтому число голое — с существительным
+// прогресс писал «элементов 42 файлов» (D-70).
 [[nodiscard]] std::string progressTail(const engine::ProgressSnapshot& snapshot) {
     std::ostringstream text;
-    text << formatTenthsOfSecond(snapshot.elapsed) << ", элементов " << core::formatCount(snapshot.itemsDone)
+    text << formatTenthsOfSecond(snapshot.elapsed) << ", элементов " << snapshot.itemsDone
          << ", найдено " << core::formatBytes(snapshot.bytesFound) << ", задач " << snapshot.tasksDone << '/'
          << snapshot.tasksTotal << ", потоков " << snapshot.workersActive << '/' << snapshot.workersTotal;
     return text.str();

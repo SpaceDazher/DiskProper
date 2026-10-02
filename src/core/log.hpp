@@ -59,26 +59,45 @@ std::string toUtf8(std::wstring_view text);
 LogField logField(std::string key, const std::wstring& value);
 LogField logField(std::string key, const wchar_t* value);
 
+// Запас буфера: «%.10g» даёт не больше 12 знаков, «%lld» и «%llu» — по 20,
+// плюс '\0'. Усечения не бывает, но при отказе форматтера читать буфер нельзя.
+constexpr std::size_t kNumberBufferSize = 32;
+
 // Арифметические типы пишутся в JSON без кавычек: logField("hr", hresult).
 // Числа с плавающей точкой печатаются с 10 значащими цифр — для лога достаточно.
+//
+// Возврат snprintf проверяется на всех трёх ветках. Раньше он игнорировался,
+// и при отказе форматтера out.value = buffer читала НЕИНИЦИАЛИЗИРОВАННЫЙ буфер:
+// в журнал уходил мусор. Запас буфера (32 байта) усечения не допускает — «%.10g»
+// даёт не больше 12 знаков, «%lld» и «%llu» по 20, — но подставлять в JSON
+// частичную запись нельзя: получатель прочитал бы другое число. При отказе
+// пишется null, тем же приёмом, что и для не-конечных значений в json.cpp.
+// null здесь допустим и по смыслу: asText == false требует JSON-скаляр,
+// а «<число>» скаляром не был бы.
 template <typename T>
     requires std::is_arithmetic_v<T>
 LogField logField(std::string key, T value) {
     LogField out;
     out.key = std::move(key);
     out.asText = false;
-    char buffer[32];
+    char buffer[kNumberBufferSize];
+    // Лямбда без захвата: сравнение с sizeof требовало бы захвата буфера, а
+    // clang-diagnostic-unused-lambda-capture справедливо называет его лишним
+    // (по одному такому замечанию на каждую из трёх веток ниже).
+    const auto truncated = [](int written) {
+        return written < 0 || static_cast<std::size_t>(written) >= kNumberBufferSize;
+    };
     if constexpr (std::is_same_v<T, bool>) {
         out.value = value ? "true" : "false";
     } else if constexpr (std::is_floating_point_v<T>) {
-        std::snprintf(buffer, sizeof(buffer), "%.10g", static_cast<double>(value));
-        out.value = buffer;
+        const int written = std::snprintf(buffer, sizeof(buffer), "%.10g", static_cast<double>(value));
+        out.value = truncated(written) ? "null" : buffer;
     } else if constexpr (std::is_signed_v<T>) {
-        std::snprintf(buffer, sizeof(buffer), "%lld", static_cast<long long>(value));
-        out.value = buffer;
+        const int written = std::snprintf(buffer, sizeof(buffer), "%lld", static_cast<long long>(value));
+        out.value = truncated(written) ? "null" : buffer;
     } else {
-        std::snprintf(buffer, sizeof(buffer), "%llu", static_cast<unsigned long long>(value));
-        out.value = buffer;
+        const int written = std::snprintf(buffer, sizeof(buffer), "%llu", static_cast<unsigned long long>(value));
+        out.value = truncated(written) ? "null" : buffer;
     }
     return out;
 }
@@ -131,6 +150,12 @@ public:
 
     // Основная запись. Никогда не бросает.
     void write(LogLevel level, std::string_view event, std::string_view message, LogFields fields = {}) noexcept;
+
+    // Запись об ошибке: путь и HRESULT добавляются первыми двумя полями сами
+    // (SPEC §12). Сборка полей — внутри этой функции, а не в вызывающей, потому
+    // что выделяет память, а обе точки объявлены noexcept.
+    void writeFailure(std::string_view event, std::string_view message, std::string_view path, std::int64_t hresult,
+                      LogFields fields = {}) noexcept;
 
     // Кольцо для UI: копия от самой старой записи к самой новой.
     std::vector<LogRecord> snapshot() const;

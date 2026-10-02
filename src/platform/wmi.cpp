@@ -1648,7 +1648,7 @@ struct Session::Impl {
         const std::string line = error.toString();
         core::LogFields fields;
         addField(fields, "hr", static_cast<std::int64_t>(hr));
-        core::logWarn("wmi.failed", line.c_str(), fields);
+        core::logWarn("wmi.failed", line, fields);
     }
 
     // Общий обход: подключение, ExecQuery, пакетное Next, reader на каждый объект.
@@ -1674,7 +1674,7 @@ struct Session::Impl {
             const std::string line = error.toString();
             core::LogFields fields;
             addField(fields, "timeoutMs", static_cast<std::int64_t>(kQueryTimeoutMs));
-            core::logWarn("wmi.timeout", line.c_str(), fields);
+            core::logWarn("wmi.timeout", line, fields);
             return;
         }
         if (isClassMissing(outcome.hr)) {
@@ -1857,7 +1857,7 @@ VolumeEncryption queryVolumeEncryptionFromManageBde(std::string_view driveLetter
         core::LogFields fields;
         addField(fields, "drive", wanted);
         addField(fields, "output", asciiForLog(run.output));
-        core::logWarn("wmi.manageBde.parse", parsed.detail.c_str(), fields);
+        core::logWarn("wmi.manageBde.parse", parsed.detail, fields);
     }
     return parsed;
 }
@@ -1865,9 +1865,13 @@ VolumeEncryption queryVolumeEncryptionFromManageBde(std::string_view driveLetter
 VolumeEncryption queryVolumeEncryption(std::string_view driveLetterUtf8) noexcept {
     // Порядок источников — из FR-1 п.7: сначала WMI, manage-bde только если WMI
     // по этому тому ничего не сказал.
-    const VolumeEncryption fromWmi = queryVolumeEncryptionFromWmi(driveLetterUtf8);
+    // const снят: возврат из функции копировал объект вместо перемещения
+    // (performance-no-automatic-move). Ниже эти два значения читаются только на
+    // том пути, где ни один из двух return не сработал, то есть когда перемещения
+    // ещё не было.
+    VolumeEncryption fromWmi = queryVolumeEncryptionFromWmi(driveLetterUtf8);
     if (fromWmi.known()) return fromWmi;
-    const VolumeEncryption fallback = queryVolumeEncryptionFromManageBde(driveLetterUtf8);
+    VolumeEncryption fallback = queryVolumeEncryptionFromManageBde(driveLetterUtf8);
     if (fallback.known()) return fallback;
     // Оба источника молчат: результат остаётся честно неизвестным, но с обеими
     // причинами, иначе потеряется половина диагностики.
@@ -1877,7 +1881,7 @@ VolumeEncryption queryVolumeEncryption(std::string_view driveLetterUtf8) noexcep
     result.detail = "WMI: " + fromWmi.detail + "; " + fallback.detail;
     core::LogFields fields;
     addField(fields, "drive", fromWmi.driveLetter);
-    core::logWarn("wmi.encryption.unknown", result.detail.c_str(), fields);
+    core::logWarn("wmi.encryption.unknown", result.detail, fields);
     return result;
 }
 

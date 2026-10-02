@@ -1099,7 +1099,9 @@ Snapshot TrashService::snapshot(const platform::TrashOptions& trashOptions) cons
         snap.summary += "; на диске сверх учёта: " + core::formatBytes(snap.driftBytes(), 1, true);
     }
     if (snap.brokenDirs != 0) {
-        snap.summary += "; каталогов без манифеста: " + core::formatCount(snap.brokenDirs);
+        // Подпись «каталогов без манифеста» уже называет предмет, поэтому число
+        // голое: с существительным здесь было «каталогов без манифеста: 2 файлов».
+        snap.summary += "; каталогов без манифеста: " + std::to_string(snap.brokenDirs);
     }
     snap.describe = describe(snap);
     return snap;

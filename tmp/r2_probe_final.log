@@ -1,0 +1,112 @@
+r2_plural_probe.cpp
+units.cpp
+i18n.cpp
+�������� ����...
+R2: формы множественного числа, ru/en, числа 0/1/2/5/21/101
+файл (kFile):
+  ok   ru                                             0 файлов
+  ok   en                                             0 files
+  ok   ru                                             1 файл
+  ok   en                                             1 file
+  ok   ru                                             2 файла
+  ok   en                                             2 files
+  ok   ru                                             5 файлов
+  ok   en                                             5 files
+  ok   ru                                             21 файл
+  ok   en                                             21 files
+  ok   ru                                             101 файл
+  ok   en                                             101 files
+кандидат (kCandidate):
+  ok   ru                                             0 кандидатов
+  ok   en                                             0 candidates
+  ok   ru                                             1 кандидат
+  ok   en                                             1 candidate
+  ok   ru                                             2 кандидата
+  ok   en                                             2 candidates
+  ok   ru                                             5 кандидатов
+  ok   en                                             5 candidates
+  ok   ru                                             21 кандидат
+  ok   en                                             21 candidates
+  ok   ru                                             101 кандидат
+  ok   en                                             101 candidates
+операция (kOperation):
+  ok   ru                                             0 операций
+  ok   en                                             0 operations
+  ok   ru                                             1 операция
+  ok   en                                             1 operation
+  ok   ru                                             2 операции
+  ok   en                                             2 operations
+  ok   ru                                             5 операций
+  ok   en                                             5 operations
+  ok   ru                                             21 операция
+  ok   en                                             21 operations
+  ok   ru                                             101 операция
+  ok   en                                             101 operations
+элемент (kItem):
+  ok   ru                                             0 элементов
+  ok   en                                             0 items
+  ok   ru                                             1 элемент
+  ok   en                                             1 item
+  ok   ru                                             2 элемента
+  ok   en                                             2 items
+  ok   ru                                             5 элементов
+  ok   en                                             5 items
+  ok   ru                                             21 элемент
+  ok   en                                             21 items
+  ok   ru                                             101 элемент
+  ok   en                                             101 items
+категория (kCategory):
+  ok   ru                                             0 категорий
+  ok   en                                             0 categories
+  ok   ru                                             1 категория
+  ok   en                                             1 category
+  ok   ru                                             2 категории
+  ok   en                                             2 categories
+  ok   ru                                             5 категорий
+  ok   en                                             5 categories
+  ok   ru                                             21 категория
+  ok   en                                             21 categories
+  ok   ru                                             101 категория
+  ok   en                                             101 categories
+день (kDay):
+  ok   ru                                             0 дней
+  ok   en                                             0 days
+  ok   ru                                             1 день
+  ok   en                                             1 day
+  ok   ru                                             2 дня
+  ok   en                                             2 days
+  ok   ru                                             5 дней
+  ok   en                                             5 days
+  ok   ru                                             21 день
+  ok   en                                             21 days
+  ok   ru                                             101 день
+  ok   en                                             101 days
+файл (formatCount без существительного — совместимость):
+  ok   ru (как в юит-тесте)               0 файлов
+  ok   ru (как в юит-тесте)               1 файл
+  ok   ru (как в юит-тесте)               2 файла
+  ok   ru (как в юит-тесте)               5 файлов
+  ok   ru (как в юит-тесте)               21 файл
+  ok   ru (как в юит-тесте)               101 файл
+formatAge (дни):
+  ok   0 секунд → секунды              0 с
+  ok   1 сутки → день                      1 день
+  ok   3 суток → дня                        3 дня
+  ok   21 сутки → день                     21 день
+  ok   30 суток → дней                     30 дней
+  ok   40 суток → месяц (форма не plural) 1 мес
+ключ каталога cleanup.hint.ruleCount против core-формы:
+  ok   ru: ключ == core                           0 правил
+  ok   en: ключ == core                           0 rules
+  ok   ru: ключ == core                           1 правило
+  ok   en: ключ == core                           1 rule
+  ok   ru: ключ == core                           2 правила
+  ok   en: ключ == core                           2 rules
+  ok   ru: ключ == core                           5 правил
+  ok   en: ключ == core                           5 rules
+  ok   ru: ключ == core                           21 правило
+  ok   en: ключ == core                           21 rules
+  ok   ru: ключ == core                           101 правило
+  ok   en: ключ == core                           101 rules
+
+проверок 96, провалов 0

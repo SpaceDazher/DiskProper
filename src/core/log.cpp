@@ -52,6 +52,23 @@ std::string clip(std::string_view text, std::size_t limit) {
     return out;
 }
 
+// Сравнение строки с заранее строчным образцом БЕЗ выделения памяти.
+//
+// logLevelFromString объявлена noexcept (log.hpp:40), а std::string(text) внутри
+// noexcept — это ровно тот дефект, который разбирался в Logger::instance(): на
+// нехватке памяти процесс получил бы std::terminate вместо «журнал настроек не
+// открылся». Шесть сравнений строк дешевле одной копии в 16 байт, а исход и раньше
+// приводил только ASCII A-Z — непарный байт UTF-8 и раньше оставался как есть.
+bool equalsAsciiLower(std::string_view text, std::string_view lowered) noexcept {
+    if (text.size() != lowered.size()) return false;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const char symbol = text[i];
+        const char folded = static_cast<char>((symbol >= 'A' && symbol <= 'Z') ? symbol - 'A' + 'a' : symbol);
+        if (folded != lowered[i]) return false;
+    }
+    return true;
+}
+
 // ISO 8601 в UTC: «2026-02-18T10:11:12.345Z». Своя запись вместо
 // std::put_time — тот тащит locale на каждый вызов и не умеет миллисекунды.
 std::string formatTimestamp(std::int64_t epochMillis) {
@@ -233,17 +250,21 @@ const char* logLevelName(LogLevel level) noexcept {
 }
 
 bool logLevelFromString(std::string_view text, LogLevel& out) noexcept {
-    std::string lower(text);
-    std::transform(lower.begin(), lower.end(), lower.begin(), [](char symbol) {
-        return static_cast<char>(symbol >= 'A' && symbol <= 'Z' ? symbol - 'A' + 'a' : symbol);
-    });
-    if (lower == "trace") out = LogLevel::Trace;
-    else if (lower == "debug") out = LogLevel::Debug;
-    else if (lower == "info") out = LogLevel::Info;
-    else if (lower == "warn" || lower == "warning") out = LogLevel::Warn;
-    else if (lower == "error" || lower == "err") out = LogLevel::Error;
-    else if (lower == "off" || lower == "none") out = LogLevel::Off;
-    else return false;
+    if (equalsAsciiLower(text, "trace")) {
+        out = LogLevel::Trace;
+    } else if (equalsAsciiLower(text, "debug")) {
+        out = LogLevel::Debug;
+    } else if (equalsAsciiLower(text, "info")) {
+        out = LogLevel::Info;
+    } else if (equalsAsciiLower(text, "warn") || equalsAsciiLower(text, "warning")) {
+        out = LogLevel::Warn;
+    } else if (equalsAsciiLower(text, "error") || equalsAsciiLower(text, "err")) {
+        out = LogLevel::Error;
+    } else if (equalsAsciiLower(text, "off") || equalsAsciiLower(text, "none")) {
+        out = LogLevel::Off;
+    } else {
+        return false;
+    }
     return true;
 }
 
@@ -370,6 +391,25 @@ void Logger::pushRingLocked(const LogRecord& record) {
 void Logger::noteFileErrorLocked(int code) {
     fileFailures_.fetch_add(1, std::memory_order_relaxed);
     fileError_ = code == 0 ? "unknown file error" : std::system_category().message(code);
+}
+
+// Запись об ошибке в принятой форме SPEC §12: путь и HRESULT первыми двумя
+// полями. Сборка полей вынесена сюда, а не в свободную logFailure, потому что
+// fields.insert() выделяет память, а свободная функция объявлена noexcept: там
+// та же проверка была невозможна, и нехватка памяти на двух полях кончалась
+// std::terminate вместо потерянной записи.
+//
+// Запись без path/hr НЕ пишется: SPEC §12 требует их в каждой ошибке, и «запись
+// есть, а обязательных полей в ней нет» — это ровно та потеря, которую счётчик
+// lost() и должен показывать.
+void Logger::writeFailure(std::string_view event, std::string_view message, std::string_view path,
+                          std::int64_t hresult, LogFields fields) noexcept {
+    try {
+        fields.insert(fields.begin(), {logField("path", path), logField("hr", hresult)});
+        write(LogLevel::Error, event, message, std::move(fields));
+    } catch (...) {
+        lost_.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 std::string Logger::archivedPathLocked(int index) const {
@@ -652,10 +692,7 @@ void logError(std::string_view event, std::string_view message, LogFields fields
 
 void logFailure(std::string_view event, std::string_view message, std::string_view path, std::int64_t hresult,
                 LogFields fields) noexcept {
-    // Путь и HRESULT — первые два поля: так их видно в любом просмотрщике
-    // и в первой же строке выгрузки отчёта (SPEC §12).
-    fields.insert(fields.begin(), {logField("path", path), logField("hr", hresult)});
-    Logger::instance().write(LogLevel::Error, event, message, std::move(fields));
+    Logger::instance().writeFailure(event, message, path, hresult, std::move(fields));
 }
 
 }  // namespace mrproper::core

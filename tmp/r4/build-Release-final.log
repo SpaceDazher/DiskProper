@@ -1,0 +1,118 @@
+[build] слот a4, конфигурация Release: жду очереди на компиляцию
+-- Selecting Windows SDK version 10.0.19041.0 to target Windows 10.0.22631.
+-- [MrProper] CMAKE_BUILD_TYPE=Release проигнорирован: генератор Visual Studio 16 2019 выбирает конфигурацию через --config
+-- [MrProper] санитайзеры включены: off (санитайзированная сборка не годится для поставки, только для проверки; в кэш значение не попало — обычная tools\build.bat Debug соберётся без санитайзеров)
+-- [MrProper] тулчейн MSVC 19.29.30159.0: все нужные возможности C++20 есть (std::stop_token/jthread=1, std::format=1, std::filesystem=1, std::ranges=1)
+-- [MrProper] цель mrproper_core: 15 модулей (переносимое ядро, без Windows API)
+-- [MrProper] цель mrproper_cli: 8 модулей (слой CLI, зависит от mrproper_core, mrproper_platform и mrproper_engine)
+-- [MrProper] цель mrproper_engine: 11 модулей (оркестрация, зависит от mrproper_core и mrproper_platform)
+-- [MrProper] цель mrproper_platform: 19 модулей (слой Win32, зависит от mrproper_core)
+-- [MrProper] цель mrproper_ui: 10 модулей (слой интерфейса, зависит от mrproper_core и mrproper_platform)
+-- [MrProper] цель mrproper: программа, точка входа в app_shell.cpp, ресурс версии из packaging/version.rc
+-- [MrProper] цель mrproper_unit_tests: 9 файлов тестов ядра (хост без Windows)
+-- [MrProper] цель mrproper_integration_tests: 4 файлов тестов Win32-слоя
+-- [MrProper] тесты: цели наборов [unit, integration]
+-- [MrProper] tests/e2e: зарегистрировано e2e_BadRules, e2e_EdgeCases, e2e_FullCycle, e2e_UndoRestore (метка e2e, PowerShell C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe)
+-- [MrProper] install: исполняемые файлы — mrproper, mrproper_cli
+-- [MrProper] CPack: генераторы NSIS;ZIP, установщик собирается явно: cpack -C Release --config CPackConfig.cmake
+-- [MrProper] установщик: ISCC.exe не найден, цель mrproper-installer объявлена и упадёт с инструкцией (см. -DMRPROPER_ISCC_EXE=...)
+-- [MrProper] зависимости: провайдер auto, сеть запрещена (MRPROPER_ALLOW_NETWORK=OFF), FetchContent обычный режим, vcpkg не используется
+-- [MrProper] конфигурация сборки:
+-- [MrProper]   проект:      MrProper 0.1.0
+-- [MrProper]   генератор:   Visual Studio 16 2019
+-- [MrProper]   платформа:   Windows/AMD64
+-- [MrProper]   компилятор:  MSVC 19.29.30159.0
+-- [MrProper]   C++:         20 (обязательный: ON, расширения: OFF)
+-- [MrProper]   тесты:       ON (mrproper_unit_tests собрана)
+-- [MrProper]   предупреждения как ошибки: да, строгий набор: OFF
+-- [MrProper]   санитайзеры: off
+-- [MrProper]   compile_commands.json: генератор «Visual Studio 16 2019» не пишет compile_commands.json
+-- [MrProper]    путь — пресет ninja-debug
+-- [MrProper]   install:     префикс «C:/Users/Daniil/AppData/Local/Programs/MrProper», тесты в составе: OFF, CPack: ON
+-- Configuring done
+-- Generating done
+-- Build files have been written to: D:/Project/MrProper/build/a4
+Microsoft (R) Build Engine ���ᨨ 16.11.6+a918ceb31 ��� .NET Framework
+(C) ��௮��� �������� (Microsoft Corporation). �� �ࠢ� ���饭�.
+
+  Checking File Globs
+  glob.cpp
+  log.cpp
+  rules.cpp
+  �������� ����...
+  mrproper_core.vcxproj -> D:\Project\MrProper\build\a4\src\core\Release\mrproper_core.lib
+Microsoft (R) Build Engine ���ᨨ 16.11.6+a918ceb31 ��� .NET Framework
+(C) ��௮��� �������� (Microsoft Corporation). �� �ࠢ� ���饭�.
+
+  Checking File Globs
+  mrproper_core.vcxproj -> D:\Project\MrProper\build\a4\src\core\Release\mrproper_core.lib
+  devices.cpp
+  inventory.cpp
+  layout.cpp
+  net.cpp
+  process_control.cpp
+  restart_manager.cpp
+  rulesync_client.cpp
+  size_probe.cpp
+  storage_query.cpp
+  trim_cache.cpp
+  vfs_delete.cpp
+  vfs_paths.cpp
+  vfs_size.cpp
+  vfs_trash.cpp
+  vfs_walk.cpp
+  volumes.cpp
+  wmi.cpp
+  �������� ����...
+  mrproper_platform.vcxproj -> D:\Project\MrProper\build\a4\src\platform\Release\mrproper_platform.lib
+Microsoft (R) Build Engine ���ᨨ 16.11.6+a918ceb31 ��� .NET Framework
+(C) ��௮��� �������� (Microsoft Corporation). �� �ࠢ� ���饭�.
+
+  Checking File Globs
+  mrproper_core.vcxproj -> D:\Project\MrProper\build\a4\src\core\Release\mrproper_core.lib
+  mrproper_platform.vcxproj -> D:\Project\MrProper\build\a4\src\platform\Release\mrproper_platform.lib
+  candidate_collector.cpp
+  executor.cpp
+  file_system_probe.cpp
+  journal.cpp
+  locks.cpp
+  plan_builder.cpp
+  scan_coordinator.cpp
+  scan_result.cpp
+  trash_service.cpp
+  undo_service.cpp
+  �������� ����...
+  mrproper_engine.vcxproj -> D:\Project\MrProper\build\a4\src\engine\Release\mrproper_engine.lib
+Microsoft (R) Build Engine ���ᨨ 16.11.6+a918ceb31 ��� .NET Framework
+(C) ��௮��� �������� (Microsoft Corporation). �� �ࠢ� ���饭�.
+
+  Checking File Globs
+  mrproper_core.vcxproj -> D:\Project\MrProper\build\a4\src\core\Release\mrproper_core.lib
+  mrproper_platform.vcxproj -> D:\Project\MrProper\build\a4\src\platform\Release\mrproper_platform.lib
+  core_tests.cpp
+  mrproper_engine.vcxproj -> D:\Project\MrProper\build\a4\src\engine\Release\mrproper_engine.lib
+  app_shell.cpp
+  vfs_walk_tests.cpp
+  cmd_apply.cpp
+  rules_fuzz_tests.cpp
+  locale.cpp
+  mv_bridge.cpp
+  �������� ����...
+  cmd_disks.cpp
+  mrproper_integration_tests.vcxproj -> D:\Project\MrProper\build\a4\Release\mrproper_integration_tests.exe
+  mrproper_unit_tests.vcxproj -> D:\Project\MrProper\build\a4\Release\mrproper_unit_tests.exe
+  renderer.cpp
+  cmd_scan.cpp
+  theme.cpp
+  view_cleanup.cpp
+  cmd_undo.cpp
+  view_disks.cpp
+  �������� ����...
+  view_report.cpp
+  view_settings.cpp
+  �������� ����...
+  mrproper_cli.vcxproj -> D:\Project\MrProper\build\a4\Release\mrproper_cli.exe
+  mrproper_ui.vcxproj -> D:\Project\MrProper\build\a4\src\ui\Release\mrproper_ui.lib
+  app_shell.cpp
+  mrproper.vcxproj -> D:\Project\MrProper\build\a4\src\ui\Release\mrproper.exe
+[build] ok: build\a4
