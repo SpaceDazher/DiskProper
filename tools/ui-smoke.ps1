@@ -110,6 +110,64 @@
 # Обход не состоялся — код 11, а не зелёный: иначе ворота, которые не смогли
 # открыть ни одну страницу, рапортовали бы «раскладка в порядке» о пустоте.
 #
+# СТОЛБЦЫ СПИСКА ПО ПИКСЕЛЯМ (S1). Прежняя проверка брала число столбцов
+# сообщением LVM_GETCOLUMNCOUNT. В commctrl.h это ТО ЖЕ САМОЕ число 0x1004, что
+# LVM_GETITEMCOUNT, то есть comctl32 отдаёт в нём ЧИСЛО СТРОК; имени с
+# отдельным значением не существует. Дальше ворота складывали LVM_GETCOLUMNWIDTH
+# по этому индексу, а для индекса за последним столбцом comctl32 отдаёт ширину
+# последнего — сумма всегда выходила больше полосы заголовка (428 + 9*96 = 1292
+# при полосе 648) и ворота краснели при ЛЮБОЙ вёрстке, требуя, чтобы имя узла
+# занимало 1 px. Через чужой процесс число столбцов не берётся: HDM_GETITEMCOUNT
+# = 0x0000 = WM_NULL отдаёт 0, а HDM_GETITEMW и LVM_GETCOLUMNW с указателем из
+# чужого процесса приложение убивают (проверено на первой версии пробы).
+# Теперь границы столбцов определяются по снимку: comctl32 рисует между
+# столбцами вертикальную полосу шириной 1..4 px, у которой вся высота полосы
+# заголовка отличается от её фона, а подпись столбца такой полосой быть не
+# может. Измерено на снимках: доля ненфоновых пикселей 1,000 у каждого
+# разделителя и не выше 0,706 у колонок с подписями; порог 0,90. Разделитель,
+# от которого до предыдущей границы меньше -MinColumnWidthPx, границей не
+# считается: в светлой теме край полосы прокрутки рисуется белой линией в 1 px
+# в 6 px от последнего разделителя, и без этого правила «Настройкам» выдавался
+# четвёртый столбец шириной 6 px.
+# Проверенные числа, живые прогоны ворот при 900x600:
+#   «Диски»     3 столбца 424+92+92  полоса 646  хвост 26
+#   «Отчёт»     4 из 88+80+128+316   полоса 642  хвост 14
+#   «Настройки» 3 столбца 380+118+120 полоса 630  хвост  6
+# то есть ровно те, что объявляет src\ui (kColumnCount = 3, 3, 3) — при 1136x795
+# «Отчёт» даёт все шесть: 88+80+128+316+116+100 при полосе 880.
+# Честная граница метода записана в коде: у «Отчёта» при 900x600 шесть столбцов
+# 92+84+132+320+120+104 = 852 не помещаются в полосу 642, последние два обрезаны,
+# хвост 14 px, и по пикселям это от пустого места полосы не отличить.
+# Метод «изменение цвета колонки на всю её высоту» отвергнут: в области строк
+# границу столбцов не рисует никто, а NM_CUSTOMDRAW красит подпункты на плоской
+# заливке, поэтому изменения цвета дают глифы подписей (7 «столбцов» вместо 3).
+#
+# НЕВИДИМЫЕ СТРОКИ СПИСКА (S1). В тёмной теме список «Дисков» рисуется белым по
+# белому: сплошной белой блок, в котором нет ни одной подписи. Общие счётчики
+# чернил его не видят — они меряют геометрию и «чернила» всего окна, а сплошная
+# заливка даёт и то и другое. Поэтому у каждого SysListView32 и SysTreeView32
+# меряется область строк: пиксель считается текстом, когда он отличается и от
+# фона строки (самый частый цвет области), и от фона страницы.
+# Живые числа того же бинарника при 900x600, 10 строк в списке «Дисков»:
+#   тёмная тема (дефект): текста 0 px из 114380 (0%), полоса текста 0 px
+#   светлая тема:        текста 12108 px из 239020 (5,07%), полоса 574 px (88,85%)
+#   «Настройки», 138 строк: текста 18364 px из 127260 (14,43%), полоса 566 px (93,4%)
+# Порог задан по ширине полосы в процентах от области строк (-MinListTextSpanPercent,
+# 3 %) плюс абсолютный порог пикселей (-MinListTextPixels, 400): у значка строки
+# полоса 16 px, у одной короткой подписи около 60 px, и число пикселей у них
+# различается вдвое, а ширина полосы — вчетверо.
+# Область строк берётся по пикселям, а не по клиентской области окна списка: у
+# списка «Дисков» окно 884x584, а нарисованные строки — полоса 177 px, остальное
+# клиентской области остаётся фоном страницы (причина — WS_EX_TRANSPARENT у
+# SysListView32, см. Measure-RowArea).
+# Пустой список — законное состояние («ничего не найдено», «отчёт ещё не
+# получен»), и в нём текста нет по определению: проверка применяется только к
+# непустому, а «пусто» от «не видно» различает число строк (LVM_GETITEMCOUNT
+# 0x1004 и TVM_GETCOUNT 0x1105 — единственные сообщения, которые ворота шлют
+# контролу, и оба возвращают число без указателей, то есть чужую память не
+# трогают). Проверено: у списка «Отчёта» и у пробного списка «Очистки» строк 0,
+# проверка не применяется, обход зелёный.
+#
 # Снимки страниц: -Shot задаёт имя БАЗОВОГО файла, обход дописывает суффикс
 # -p<N>-<имя> перед расширением (D:\Temp\ui.png -> D:\Temp\ui-p3-cleanup.png).
 #
@@ -127,13 +185,17 @@
 #       -MinCenterInkPixels чернил;
 #  10 — сломана раскладка: на обойдённой странице видимый потомок окна
 #       содержимого имеет нулевой размер или выходит за его клиентскую
-#       область (только при -AllPages);
+#       область, либо столбцы списка не помещаются в полосу шапки
+#       (только при -AllPages);
 #  11 — обход не состоялся: окно не удалось привести на передний план или
 #       открыть страницу (только при -AllPages);
 #  12 — открылась не та страница: -ExpectPage не совпала с видимой (значит
 #       состояние интерфейса не сброшено и ворота меряют чужой запуск);
 #  13 — прогоны разошлись: -DeterminismRuns 2 и числа двух запусков одной и
-#       той же команды не совпали (окно, клиент, чернила, цвета, страница).
+#       той же команды не совпали (окно, клиент, чернила, цвета, страница);
+#  14 — строки списка или дерева нарисованы невидимыми: список непустой, а
+#       текста в области строк меньше -MinListTextPixels или он занимает
+#       полосу уже -MinListTextSpanPercent % ширины (только при -AllPages).
 #
 # СОСТОЯНИЕ ИНТЕРФЕЙСА: почему ворота приводят его к известному (Q3).
 #
@@ -176,6 +238,17 @@ param(
     [int]$MinContentInkPixels = 5000,
     [int]$MinContentColors = 4,
     [int]$MinCenterInkPixels = 250,
+    # --- строки списка: текст должен быть виден (см. шапку, «СТРОКИ СПИСКА») --
+    # Пороги заданы в ПИКСЕЛЯХ КАДРА, а внутри скрипта выборка идёт с шагом 2 по
+    # обеим осям, то есть одна посчитанная точка равна четырём пикселям.
+    [int]$MinListTextPixels = 400,
+    # Ширина полосы, которую занимает текст строк, в процентах от ширины области
+    # строк. Значок строки (у «Дисков» это квадрат 16 px слева) текстом не
+    # считается: измеренная полоса при «белым по белому» равна 1,8 % ширины,
+    # у нарисованного списка — от 9 % (одна короткая подпись) до 97 %.
+    [double]$MinListTextSpanPercent = 3.0,
+    # Уже столбца: подпись в него не помещается ни при каком шрифте.
+    [int]$MinColumnWidthPx = 24,
     [int]$Width = 0,
     [int]$Height = 0,
     [int]$DpiPercent = 0,
@@ -210,6 +283,12 @@ if ($MinInkPixels -lt 0) { Write-Host "[ui] MinInkPixels отрицателен:
 if ($MinContentInkPixels -lt 0) { Write-Host "[ui] MinContentInkPixels отрицателен: $MinContentInkPixels"; exit 2 }
 if ($MinContentColors -lt 1) { Write-Host "[ui] MinContentColors меньше 1: $MinContentColors"; exit 2 }
 if ($MinCenterInkPixels -lt 0) { Write-Host "[ui] MinCenterInkPixels отрицателен: $MinCenterInkPixels"; exit 2 }
+if ($MinListTextPixels -lt 0) { Write-Host "[ui] MinListTextPixels отрицателен: $MinListTextPixels"; exit 2 }
+if ($MinListTextSpanPercent -lt 0 -or $MinListTextSpanPercent -gt 100) {
+    Write-Host "[ui] MinListTextSpanPercent вне 0..100: $MinListTextSpanPercent"
+    exit 2
+}
+if ($MinColumnWidthPx -lt 0) { Write-Host "[ui] MinColumnWidthPx отрицателен: $MinColumnWidthPx"; exit 2 }
 if (($Width -gt 0) -xor ($Height -gt 0)) {
     Write-Host '[ui] -Width и -Height задаются вместе (задано только одно)'
     exit 2
@@ -262,6 +341,12 @@ public class MrWin {
  [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+ // Стиль окна и метрика полосы прокрутки: нужны, чтобы область строк списка не
+ // включала горизонтальную полосу прокрутки (WS_HSCROLL есть у «Настроек»).
+ // Обе функции — обычные вызовы без сообщений, поэтому чужой процесс они не
+ // трогают и указателей из чужой памяти не требуют.
+ [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] public static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
+ [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
  // Обход страниц: передний план, клавиатура и обход дерева потомков.
  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
@@ -299,13 +384,39 @@ $script:gwHwndNext = 2
 $script:keyEventKeyUp = 0x0002
 $script:vkControl = 0x11
 $script:vkMenu = 0x12
-# Сообщения списка (commctrl.h): LVM_GETCOLUMNCOUNT = LVM_FIRST+4 = 0x1004,
-# LVM_GETCOLUMNWIDTH = LVM_FIRST+29 = 0x101D, LVM_GETHEADER = LVM_FIRST+31.
-# Числа взяты из commctrl.h Windows SDK 10.0.19041, а не посчитаны в уме: у
-# списка нет обёртки ListView_GetColumnWidth в почерке powershell.
-$script:lvmGetColumnCount = 0x1004
-$script:lvmGetColumnWidth = 0x101D
-$script:lvmGetHeader = 0x101F
+# Сообщения списка и дерева (commctrl.h Windows SDK 10.0.19041).
+#
+# В commctrl.h LVM_GETCOLUMNCOUNT и LVM_GETITEMCOUNT — ОДНО И ТО ЖЕ число
+# 0x1004 (LVM_FIRST+4), то есть имя есть, а числа за ним нет: comctl32 отдаёт
+# в нём ЧИСЛО СТРОК. Прежняя проверка брала это значение как число столбцов и
+# складывала LVM_GETCOLUMNWIDTH (0x101D) по такому индексу; для индекса за
+# последним столбцом comctl32 отдаёт ширину последнего, поэтому сумма всегда
+# выходила больше полосы заголовка (428 + 9*96 = 1292 при полосе 648) и ворота
+# краснели при ЛЮБОЙ вёрстке, требуя, чтобы имя узла занимало 1 px.
+# Через чужой процесс число столбцов не берётся: HDM_GETITEMCOUNT = 0x0000 =
+# WM_NULL отдаёт 0, а HDM_GETITEMW и LVM_GETCOLUMNW с указателем из чужого
+# процесса приложение убивают (проверено на первой версии пробы — процесс падал).
+# Поэтому и число столбцов, и их ширины берутся из пикселей снимка, а это
+# сообщение осталось только для числа СТРОК: указателей оно не принимает, то
+# есть чужую память не трогает.
+$script:lvmGetItemCount = 0x1004
+# TVM_GETCOUNT = TV_FIRST+5 = 0x1105 (commctrl.h) — число строк дерева.
+$script:tvmGetCount = 0x1105
+# GWL_STYLE = -16 (winuser.h), WS_HSCROLL = 0x00100000, WS_VSCROLL = 0x00200000,
+# SM_CYHSCROLL = 7, SM_CXVSCROLL = 8 (winuser.h).
+$script:gwlStyle = -16
+$script:wsHScroll = 0x00100000
+$script:wsVScroll = 0x00200000
+$script:smCyHScroll = 7
+$script:smCxVScroll = 8
+# Классы контролов, у которых есть строки.
+$script:classListView = 'SysListView32'
+$script:classTreeView = 'SysTreeView32'
+$script:classHeader = 'SysHeader32'
+# Пороги пиксельной меры полосы заголовка (см. Measure-HeaderColumns).
+$script:minHeaderStripPx = 24
+$script:minSeparatorShare = 0.90
+$script:maxSeparatorWidthPx = 12
 # Пять страниц рельса в порядке kPages (src/ui/nav.hpp): Overview, Disks,
 # Cleanup, Report, Settings; Ctrl+1..5 и класс окна экрана.
 $script:pages = @(
@@ -505,21 +616,32 @@ function Describe-AppWindows([int]$processId) {
 
 # Снимок окна в файл. Отдельная функция нужна обходу страниц: он снимает ту же
 # иерархию пять раз и обязан писать в разные файлы, не трогая код стартовой
-# страницы.
+# страницы. Вместе с путём возвращает и пиксели того же снимка: меры столбцов и
+# строк обязаны мерить ровно тот кадр, который лежит в артефакте, — перечитывать
+# файл значило бы мерить второй раз, который может отличаться от сохранённого.
 function Save-WindowShot([IntPtr]$hwnd, $windowRect, [string]$path) {
     $shotDir = Split-Path -Parent $path
     if ($shotDir -ne '' -and -not (Test-Path -LiteralPath $shotDir)) {
         New-Item -ItemType Directory -Path $shotDir -Force | Out-Null
     }
-    $bmp = New-Object System.Drawing.Bitmap(($windowRect.R - $windowRect.L), ($windowRect.B - $windowRect.T))
+    $shotWidth = $windowRect.R - $windowRect.L
+    $shotHeight = $windowRect.B - $windowRect.T
+    $bmp = New-Object System.Drawing.Bitmap($shotWidth, $shotHeight)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $dc = $g.GetHdc()
     [void][MrWin]::PrintWindow($hwnd, $dc, 2)
     $g.ReleaseHdc($dc)
     $g.Dispose()
     $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+    $data = $bmp.LockBits((New-Object System.Drawing.Rectangle(0, 0, $shotWidth, $shotHeight)),
+                          [System.Drawing.Imaging.ImageLockMode]::ReadOnly,
+                          [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $stride = $data.Stride
+    $bytes = New-Object byte[] ($stride * $shotHeight)
+    [Runtime.InteropServices.Marshal]::Copy($data.Scan0, $bytes, 0, $bytes.Length)
+    $bmp.UnlockBits($data)
     $bmp.Dispose()
-    return $path
+    return @{ Path = $path; Bytes = $bytes; Stride = $stride; Width = $shotWidth; Height = $shotHeight }
 }
 
 # Окно содержимого — самое крупное видимое дочернее окно главного. Рельс
@@ -651,9 +773,34 @@ function Set-AppForeground([IntPtr]$hwnd) {
     return ([MrWin]::GetForegroundWindow() -eq $hwnd)
 }
 
-# Ctrl+<цифра> настоящим вводом. Возвращает @{ Ok; Tries; Visible }.
+# Кто держит передний план. Измерено: на машине, где параллельно работают чужие
+# окна, обход давал код 11 «страница не открылась», и по этому коду нельзя было
+# понять, приложение это или среда. Имя и заголовок чужого окна превращают
+# отказ среды в конкретное указание.
+function Get-ForegroundOwner {
+    $fg = [MrWin]::GetForegroundWindow()
+    if ($fg -eq [IntPtr]::Zero) { return 'переднего окна нет' }
+    $pid2 = 0
+    [void][MrWin]::GetWindowThreadProcessId($fg, [ref]$pid2)
+    $c = New-Object Text.StringBuilder 256
+    [void][MrWin]::GetClassNameW($fg, $c, 256)
+    $t = New-Object Text.StringBuilder 256
+    [void][MrWin]::GetWindowTextW($fg, $t, 256)
+    $who = ''
+    if ($pid2 -ne 0) {
+        try {
+            $p = Get-Process -Id $pid2 -ErrorAction Stop
+            $who = $p.ProcessName + ' '
+        } catch {
+            $who = ''
+        }
+    }
+    return ('{0}pid {1} класс {2} заголовок «{3}»' -f $who, $pid2, $c.ToString(), $t.ToString())
+}
+
+# Ctrl+<цифра> настоящим вводом. Возвращает @{ Ok; Tries; Visible; Foreign }.
 function Switch-AppPage([IntPtr]$hwnd, [IntPtr]$hostWindow, [hashtable]$page) {
-    $result = @{ Ok = $false; Tries = 0; Visible = '' }
+    $result = @{ Ok = $false; Tries = 0; Visible = ''; Foreign = '' }
     $tries = 0
     while ($tries -lt $PageSwitchTries) {
         $tries++
@@ -674,40 +821,437 @@ function Switch-AppPage([IntPtr]$hwnd, [IntPtr]$hostWindow, [hashtable]$page) {
             return $result
         }
         if ($visible.Count -gt 0) { $result.Visible = $visible[0].Class }
+        # Почему не открылось: чужое окно успело перехватить фокус, пока
+        # жали клавиши. Без этой строки код 11 читается как отказ приложения.
+        if ($result.Foreign -eq '') { $result.Foreign = Get-ForegroundOwner }
+        # Пауза перед следующей попыткой: на занятом рабочем столе чужое окно
+        # возвращается на передний план через доли секунды, и восемь попыток
+        # подряд уходили все в одно и то же чужое окно.
+        Start-Sleep -Milliseconds 400
     }
     return $result
 }
 
-# Столбцы списка: сумма их ширин должна помещаться в ширину, по которой список
-# рисует столбцы (клиентская область панели столбцов — она уже без вертикальной
-# полосы прокрутки). Это проверка D-71: обрезанный третий столбец не меняет ни
-# размер окна, ни размер окна содержимого, поэтому проверка прямоугольников его
-# не видит, а человек видит сразу — заголовок «Уровень риска» превращается в
-# «Уровень ри…». Возвращает текст нарушения или пустую строку.
-function Measure-ListColumns([IntPtr]$list, [string]$class, [int]$tolerance) {
-    if ($class -ne 'SysListView32') { return '' }
-    $columns = [int][MrWin]::SendMessage($list, $script:lvmGetColumnCount, [IntPtr]::Zero, [IntPtr]::Zero)
-    if ($columns -le 0 -or $columns -gt 32) { return '' }
-    $header = [MrWin]::SendMessage($list, $script:lvmGetHeader, [IntPtr]::Zero, [IntPtr]::Zero)
-    if ($header -eq [IntPtr]::Zero) { return '' }
-    $room = New-Object MrWin+RECT
-    if ([MrWin]::GetClientRect($header, [ref]$room) -eq $false) { return '' }
-    $available = $room.R - $room.L
-    $sum = 0
-    for ($column = 0; $column -lt $columns; $column++) {
-        $sum += [int][MrWin]::SendMessage($list, $script:lvmGetColumnWidth, [IntPtr]$column, [IntPtr]::Zero)
+# Прямой потомок заданного класса (SysHeader32 у SysListView32). Именно прямой:
+# EnumChildWindows рекурсивный и нашёл бы шапки списков внутри чужих вложенных
+# окон. Класс читается GetClassNameW, то есть без сообщений чужому процессу.
+function Find-DirectChildByClass([IntPtr]$parent, [string]$className) {
+    foreach ($child in Get-DirectChild $parent) {
+        $c = New-Object Text.StringBuilder 256
+        [void][MrWin]::GetClassNameW($child, $c, 256)
+        if ($c.ToString() -eq $className -and [MrWin]::IsWindowVisible($child)) { return $child }
     }
-    if ($sum -le 0) { return '' }
-    if ($sum -gt ($available + $tolerance)) {
-        return ("столбцы шире списка: {0} > {1}" -f $sum, $available)
-    }
-    return ''
+    return [IntPtr]::Zero
 }
 
-# Раскладка одной страницы. Возвращает @{ Checked; Violations } где Violations —
-# массив строк с классом, подписью, прямоугольником в координатах хоста и
-# величиной вылета по каждой стороне.
-function Measure-PageLayout([IntPtr]$hostWindow, [int]$tolerance) {
+# Число строк списка или дерева. Единственное сообщение, которое ворота шлют
+# контролу: LVM_GETITEMCOUNT (0x1004) у списка и TVM_GETCOUNT (0x1105) у дерева.
+# Оба возвращают число и НЕ ПРИНИМАЮТ УКАЗАТЕЛЕЙ, поэтому чужую память не трогают
+# (в отличие от HDM_GETITEMW и LVM_GETCOLUMNW, которые приложение убивают).
+# lParam здесь NULL, а ответ читается из pdwResult: значение, которое сообщение
+# возвращает, SendMessageTimeout кладёт именно туда, а в lParam пишут только
+# сообщения с выходным буфером (как WM_GETMINMAXINFO).
+# Проверено пробой на живом окне: LVM_GETITEMCOUNT у списка «Дисков» = 10 —
+# это строки, а не столбцы (столбцов три, см. kColumnCount в src\ui), и именно
+# поэтому сумма ширин в прежней проверке выходила 428 + 9*96.
+# -1 означает «не ответил», и тогда проверка строк просто не применяется.
+function Get-ListItemCount([IntPtr]$hwnd, [string]$class) {
+    $message = if ($class -eq $script:classTreeView) { $script:tvmGetCount } else { $script:lvmGetItemCount }
+    $result = [IntPtr]::Zero
+    $sent = [MrWin]::SendMessageTimeout($hwnd, $message, [IntPtr]::Zero, [IntPtr]::Zero,
+                                        $script:smtoAbortIfHung, 5000, [ref]$result)
+    if ($sent -eq [IntPtr]::Zero) { return -1 }
+    return [int]$result.ToInt64()
+}
+
+# Самый частый цвет прямоугольника. Им ищется фон страницы: пиксель строки
+# считается текстом только когда он отличается и от фона строки, и от фона
+# страницы, иначе рамка окна содержимого, протекающая в область строк, сошла бы
+# за текст.
+function Measure-DominantColor($bytes, $stride, $x0, $y0, $x1, $y1, [int]$step) {
+    $counts = @{}
+    for ($y = $y0; $y -le $y1; $y += $step) {
+        $row = $y * $stride
+        for ($x = $x0; $x -le $x1; $x += $step) {
+            $i = $row + $x * 4
+            $key = "$($bytes[$i]),$($bytes[$i + 1]),$($bytes[$i + 2])"
+            if ($counts.ContainsKey($key)) { $counts[$key]++ } else { $counts[$key] = 1 }
+        }
+    }
+    if ($counts.Count -eq 0) { return '' }
+    return ($counts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Name
+}
+
+# ГРАНИЦЫ СТОЛБЦОВ ПО ПИКСЕЛЯМ (вместо LVM_GETCOLUMNCOUNT, S1).
+#
+# Разделитель между столбцами рисует сам comctl32: это вертикальная полоса
+# шириной 2..4 px, у которой ВСЯ высота полосы заголовка отличается от фона
+# полосы. Подпись столбца такой полосой быть не может — буквы занимают часть
+# высоты, а не всю. Измерено на снимках из D:\Temp (шаг 1 по x, вся высота
+# полосы): доля ненфоновых пикселей 1,000 у каждого разделителя и не выше
+# 0,706 («Диски», подпись «Диски») и 0,667 («Настройки», три подписи) у
+# колонок с текстом. Порог 0,90 разведён от обоих более чем в 1,2 раза.
+#
+# Ширина полосы берётся как прогон столбцов, у которых фон полосы держится хотя
+# бы на половине высоты: рамка окна шапки фоном не является и в прогон не
+# попадает (проверено: рамка слева 2 px цвета 255,255,255 и справа 14 px цвета
+# 23,23,23 обрезали бы первый и последний столбцы).
+#
+# Отвергнут метод «изменение цвета колонки на всю её высоту». В области строк
+# comctl32 границу столбцов не рисует, а NM_CUSTOMDRAW красит подпункты на
+# плоской заливке, поэтому изменения цвета там дают не границы столбцов, а
+# глифы подписей: на q3-allpages3-p2-disks.png цвет в области строк меняется в
+# 7 столбцах x из 440, и число «столбцов» вышло бы 7 вместо трёх.
+#
+# Возвращает $null, когда полосы в снимке нет (список без заголовка).
+function Measure-HeaderColumns($bytes, $stride, $x0, $y0, $x1, $y1) {
+    $rows = $y1 - $y0 + 1
+    $cols = $x1 - $x0 + 1
+    if ($rows -lt 4 -or $cols -lt $script:minHeaderStripPx) { return $null }
+    $counts = @{}
+    for ($y = $y0; $y -le $y1; $y++) {
+        $row = $y * $stride
+        for ($x = $x0; $x -le $x1; $x++) {
+            $i = $row + $x * 4
+            $key = "$($bytes[$i]),$($bytes[$i + 1]),$($bytes[$i + 2])"
+            if ($counts.ContainsKey($key)) { $counts[$key]++ } else { $counts[$key] = 1 }
+        }
+    }
+    $background = ($counts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Name
+    $profile = New-Object int[] $cols
+    $left = -1
+    $right = -1
+    for ($i = 0; $i -lt $cols; $i++) {
+        $x = $x0 + $i
+        $same = 0
+        for ($y = $y0; $y -le $y1; $y++) {
+            $k = $y * $stride + $x * 4
+            if ("$($bytes[$k]),$($bytes[$k + 1]),$($bytes[$k + 2])" -eq $background) { $same++ }
+        }
+        $profile[$i] = $rows - $same
+        if (($same / [double]$rows) -ge 0.5) {
+            if ($left -lt 0) { $left = $i }
+            $right = $i
+        }
+    }
+    if ($left -lt 0) { return $null }
+    $bands = New-Object System.Collections.ArrayList
+    $start = -1
+    for ($i = $left; $i -le $right; $i++) {
+        $isSeparator = ($profile[$i] -ge ($rows * $script:minSeparatorShare))
+        if ($isSeparator -and $start -lt 0) { $start = $i }
+        if (-not $isSeparator -and $start -ge 0) {
+            # Полоса шире 12 px — не разделитель столбцов, а рамка или заливка
+            # темы: такие пропускаются, иначе один такой прогон склеил бы все
+            # столбцы в один. На проверенных снимках разделители 2..4 px.
+            if (($i - $start) -le $script:maxSeparatorWidthPx) {
+                [void]$bands.Add(@{ From = $x0 + $start; To = $x0 + $i - 1 })
+            }
+            $start = -1
+        }
+    }
+    $widths = New-Object System.Collections.ArrayList
+    $stripLeft = $x0 + $left
+    $stripRight = $x0 + $right
+    $cursor = $stripLeft
+    $skipped = 0
+    foreach ($band in $bands) {
+        $width = $band.From - $cursor
+        if ($width -ge $MinColumnWidthPx) {
+            [void]$widths.Add($width)
+            $cursor = $band.To + 1
+        } else {
+            # Разделитель, от которого до предыдущей границы меньше
+            # -MinColumnWidthPx, границей столбцов НЕ считается, и его пиксели
+            # уходят в хвост. Так отсекается не разделитель, а край полосы
+            # прокрутки: в светлой теме он рисуется белой линией в 1 px на
+            # расстоянии 6 px от последнего разделителя, и без этого правила
+            # ворота объявляли «Настройкам» четвёртый столбец шириной 6 px.
+            $skipped++
+        }
+    }
+    $tail = $stripRight - $cursor + 1
+    $sum = if ($bands.Count -eq 0) { 0 } else { $cursor - $stripLeft }
+    return @{ Background = $background; Bands = $bands; Widths = $widths; Sum = $sum
+              Tail = $tail; Skipped = $skipped; Left = $stripLeft; Right = $stripRight
+              Strip = $stripRight - $stripLeft + 1 }
+}
+
+# ОБЛАСТЬ СТРОК ПО ПИКСЕЛЯМ.
+#
+# Возвращает самый большой прямоугольник внутри $area, залитый ЦЕЛИКОМ цветом,
+# отличным от фона страницы, и начинающийся не выше $area.T + 1: такими блоками
+# приложение рисует строки списка и дерева (см. Measure-ListItem — почему не
+# берётся клиентская область окна). Прямоугольник ищется построчно сверху вниз:
+# для каждой верхней строки нижележащие строки добавляются, пока они целиком
+# лежат в одном прогоне цвета, а площадь не перестала расти, — это даёт самый
+# большой однородный блок без перебора всех пар границ.
+# Поле Found = $false означает, что такого блока нет: список пуст и строки не
+# нарисованы вовсе.
+function Measure-RowArea($bytes, $stride, $area, [string]$pageBackground) {
+    $none = @{ Found = $false; Left = $area.L; Top = $area.T; Right = $area.R; Bottom = $area.B }
+    $height = $area.B - $area.T
+    $width = $area.R - $area.L
+    if ($height -lt 8 -or $width -lt 8) { return $none }
+    # Фон строк ищется по верхней четверти: строки начинаются сразу под шапкой,
+    # а низ клиентской области (у списка «Дисков» это 395 из 584 пикселей)
+    # может быть фоном страницы, и тогда фон строк искался бы не там.
+    $top = $area.T
+    $probeBottom = [Math]::Min($area.B, $top + [Math]::Max(16, ($height / 4)))
+    $rowBackground = Measure-DominantColor $bytes $stride $area.L $top $area.R $probeBottom 2
+    if ($rowBackground -eq '' -or $rowBackground -eq $pageBackground) { return $none }
+    $best = 0
+    $bestRect = $none
+    for ($y = $top; $y -lt $area.B; $y++) {
+        $runStart = -1
+        $bestForRow = 0
+        $bestRectForRow = $none
+        for ($x = $area.L; $x -le $area.R + 1; $x++) {
+            $inside = $false
+            if ($x -le $area.R) {
+                $i = $y * $stride + $x * 4
+                $key = "$($bytes[$i]),$($bytes[$i + 1]),$($bytes[$i + 2])"
+                $inside = ($key -eq $rowBackground)
+            }
+            if ($inside -and $runStart -lt 0) { $runStart = $x }
+            if (-not $inside -and $runStart -ge 0) {
+                $runEnd = $x - 1
+                $heightNow = $y - $top + 1
+                $areaSize = ($runEnd - $runStart + 1) * $heightNow
+                if ($areaSize -gt $bestForRow) {
+                    $bestForRow = $areaSize
+                    $bestRectForRow = @{ Found = $true; Left = $runStart; Top = $top
+                                        Right = $runEnd; Bottom = $y }
+                }
+                $runStart = -1
+            }
+        }
+        if ($bestForRow -gt $best) {
+            $best = $bestForRow
+            $bestRect = $bestRectForRow
+        }
+        if (($width * ($y - $top + 1)) -le $best) { break }
+    }
+    if ($best -le 0) { return $none }
+    return $bestRect
+}
+
+# ТЕКСТ СТРОК СПИСКА (второй отказ ворот, S1).
+#
+# Пиксель строки считается текстом, когда его цвет отличается и от фона строки
+# (самый частый цвет области строк), и от фона страницы. Такое требование ловит
+# отказ, который геометрия и общие счётчики пропускают: в тёмной теме список
+# «Дисков» рисуется белым по белому — сплошной белый блок, в котором есть
+# пиксели цвета, отличного от фона строки (значки строк слева), но нет ни одной
+# подписи. Измерено на q3-allpages3-p2-disks.png: 94,32 % площади цвет
+# 255,255,255, весь «текст» — 623 точки в 7 столбцах x, то есть полоса шириной
+# 16 px из 880. У нарисованного списка «Настроек» на том же снимке 13,16 %
+# точек и полоса 858 px из 858.
+#
+# Порог задан ПО ПОЛОСЕ, а не по числу точек: у значка строки 16 px, у одной
+# короткой подписи на 900x600 — около 60 px, и число точек у них отличается
+# вдвое, а ширина полосы — вчетверо. Порог в процентах от ширины области строк
+# не плывёт ни от DPI, ни от размера окна.
+#
+# Шаг 2 по обеим осям: одна посчитанная точка равна четырём пикселям кадра, и
+# все пороги приведены к пикселям кадра умножением на 4.
+function Measure-RowText($bytes, $stride, $x0, $y0, $x1, $y1, [string]$pageBackground) {
+    $step = 2
+    $counts = @{}
+    $samples = 0
+    for ($y = $y0; $y -le $y1; $y += $step) {
+        $row = $y * $stride
+        for ($x = $x0; $x -le $x1; $x += $step) {
+            $i = $row + $x * 4
+            $key = "$($bytes[$i]),$($bytes[$i + 1]),$($bytes[$i + 2])"
+            if ($counts.ContainsKey($key)) { $counts[$key]++ } else { $counts[$key] = 1 }
+            $samples++
+        }
+    }
+    if ($samples -eq 0) { return $null }
+    $rowBackground = ($counts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Name
+    $text = 0
+    $maxRun = 0
+    $first = -1
+    $last = -1
+    for ($y = $y0; $y -le $y1; $y += $step) {
+        $row = $y * $stride
+        $run = 0
+        for ($x = $x0; $x -le $x1; $x += $step) {
+            $i = $row + $x * 4
+            $key = "$($bytes[$i]),$($bytes[$i + 1]),$($bytes[$i + 2])"
+            if ($key -ne $rowBackground -and $key -ne $pageBackground) {
+                $text++
+                # Полоса текста — это МИНИМУМ и МАКСИМУМ x, а не последний
+                # встреченный: обход идёт построчно, и последняя строка, где есть
+                # текст, — это обычно значок слева (у «Дисков» это 8 значков в
+                # колонке x=240..254 под последней строкой с подписями). При
+                # записи «последнего встреченного» полоса нарисованного списка
+                # выходила 16 px — ровно как у невидимых строк, и проверка не
+                # отличала их.
+                if ($text -eq 1) { $first = $x }
+                if ($x -gt $last) { $last = $x }
+                $run++
+                if ($run -gt $maxRun) { $maxRun = $run }
+            } else {
+                $run = 0
+            }
+        }
+    }
+    $span = if ($first -lt 0) { 0 } else { $last - $first + $step }
+    return @{ RowBackground = $rowBackground; Text = $text; Samples = $samples; Span = $span
+              MaxRun = $maxRun * $step; Width = ($x1 - $x0 + 1); Height = ($y1 - $y0 + 1)
+              Ratio = [Math]::Round(100.0 * $text / $samples, 2) }
+}
+
+# Список или дерево на снимке: строка отчёта и до двух нарушений — «столбцы» и
+# «строки». Обе меры в одной функции, потому что читают один и тот же
+# прямоугольник окна и обе молчат, когда окно меньше 8 px.
+function Measure-ListItem($shot, $windowRect, [IntPtr]$hwnd, [string]$class,
+                          [string]$pageBackground, [int]$tolerance) {
+    $result = @{ Log = ''; ColumnWhy = ''; RowsWhy = '' }
+    $rect = New-Object MrWin+RECT
+    [void][MrWin]::GetWindowRect($hwnd, [ref]$rect)
+    $top = $rect.T - $windowRect.T
+    $left = $rect.L - $windowRect.L
+    $right = $rect.R - $windowRect.L
+    if (($right - $left) -lt 8 -or ($rect.B - $top) -lt 8) { return $result }
+    $rows = Get-ListItemCount $hwnd $class
+    $style = [int64][MrWin]::GetWindowLongPtr($hwnd, $script:gwlStyle)
+
+    # Область строк: по клиентской области окна минус полосы прокрутки. Левая и
+    # правая границы берутся из полосы заголовка, когда он есть: полоса
+    # заголовка у SysListView32 в режиме отчёта уже без вертикальной полосы
+    # прокрутки, то есть это ровно та ширина, на которой список рисует столбцы
+    # (то же рассуждение в src\ui\view_disks.cpp, columnRoomPx).
+    $rowsLeft = $left + 1
+    $rowsRight = $right - 1
+    $rowsTop = $top + 1
+    $strip = $null
+    $header = Find-DirectChildByClass $hwnd $script:classHeader
+    if ($header -ne [IntPtr]::Zero) {
+        $headerRect = New-Object MrWin+RECT
+        [void][MrWin]::GetWindowRect($header, [ref]$headerRect)
+        $hx0 = $headerRect.L - $windowRect.L
+        $hy0 = $headerRect.T - $windowRect.T
+        $hx1 = $headerRect.R - $windowRect.L - 1
+        $hy1 = $headerRect.B - $windowRect.T - 1
+        $strip = Measure-HeaderColumns $shot.Bytes $shot.Stride $hx0 $hy0 $hx1 $hy1
+        if ($null -ne $strip) {
+            $rowsLeft = $strip.Left
+            $rowsRight = $strip.Right
+            $rowsTop = $headerRect.B - $windowRect.T
+        }
+    }
+    $clientOrigin = New-Object MrWin+POINT
+    $clientOrigin.X = 0
+    $clientOrigin.Y = 0
+    [void][MrWin]::ClientToScreen($hwnd, [ref]$clientOrigin)
+    $clientRect = New-Object MrWin+RECT
+    [void][MrWin]::GetClientRect($hwnd, [ref]$clientRect)
+    if ($null -eq $strip) {
+        $rowsLeft = $clientOrigin.X - $windowRect.L
+        $rowsRight = $rowsLeft + ($clientRect.R - $clientRect.L) - 1
+        if (($style -band $script:wsVScroll) -ne 0) {
+            $rowsRight -= [MrWin]::GetSystemMetrics($script:smCxVScroll)
+        }
+    }
+    $rowsBottom = ($clientOrigin.Y + $clientRect.B) - $windowRect.T - 1
+    if (($style -band $script:wsHScroll) -ne 0) {
+        $rowsBottom -= [MrWin]::GetSystemMetrics($script:smCyHScroll)
+    }
+
+    # ГРАНИЦЫ ОБЛАСТИ СТРОК ПО ПИКСЕЛЯМ.
+    #
+    # Клиентская область окна списка — это НЕ то же самое, что нарисованные
+    # строки. Измерено на списке «Дисков» при окне 1136x795: окно списка
+    # 884x584, шапка 884x20, а нарисованные строки — полоса высотой 189 px, и
+    # всё остальное клиентской области остаётся фоном страницы. Причина в
+    # WS_EX_TRANSPARENT (extstyle 0x00000200 у SysListView32): ком-контроль
+    # не красит свой фон, и красит его NM_CUSTOMDRAW только под строками, а
+    # «строка» без подпунктов (список пуст) не рисуется вовсе. Ни одно
+    # сообщение списка про это не говорит, а LVM_GETNEXTITEM идёт по элементам,
+    # а не по нарисованным строкам.
+    #
+    # Поэтому область строк ищется по пикселям: это самый большой прямоугольник
+    # внутри клиентской области списка, залитый ЦЕЛИКОМ цветом строки (фоном
+    # строк), — то есть самый большой однородный блок, начинающийся под шапкой.
+    # На пустом списке такого блока нет, и проверка строк не применяется.
+    $area = New-Object MrWin+RECT
+    $area.L = $rowsLeft
+    $area.T = $rowsTop
+    $area.R = $rowsRight
+    $area.B = $rowsBottom
+    $painted = Measure-RowArea $shot.Bytes $shot.Stride $area $pageBackground
+    if ($painted.Found) {
+        $rowsLeft = $painted.Left
+        $rowsTop = $painted.Top
+        $rowsRight = $painted.Right
+        $rowsBottom = $painted.Bottom
+    }
+
+    $line = ''
+    if ($null -ne $strip) {
+        $narrowest = 0
+        foreach ($w in $strip.Widths) { if ($narrowest -eq 0 -or $w -lt $narrowest) { $narrowest = $w } }
+        $line = "  [шапка] столбцов={0} ширины={1} полоса={2} хвост={3} фон={4}" -f `
+            $strip.Widths.Count, ($strip.Widths -join '+'), $strip.Strip, $strip.Tail, $strip.Background
+        if ($strip.Skipped -gt 0) {
+            $line += " (полос не-столбцов отброшено: {0})" -f $strip.Skipped
+        }
+        if ($strip.Widths.Count -eq 0) {
+            # Ни одного разделителя на полосе шириной Strip: первый столбец
+            # либо обрезан краем окна, либо шапка не нарисована вовсе. Раньше тот
+            # же случай давался как «столбцы шире списка: 1292 > 648».
+            $result.ColumnWhy = "столбцы не различимы: на полосе заголовка $($strip.Strip) px нет ни одного разделителя столбцов"
+        } else {
+            if ($result.ColumnWhy -eq '' -and $strip.Tail -gt $tolerance -and $strip.Tail -ge $narrowest) {
+                # Хвост полосы шире самого узкого столбца — это не «свободное
+                # место», а отрезанная часть последнего столбца: comctl32 красит
+                # её тем же фоном шапки, и отличить от пустого места по пикселям
+                # нельзя. Порог выбран по измеренным хвостам: 26 px при самом
+                # узком столбце 92 («Диски» при 900x600), 6 при 120
+                # («Настройки»), 21 у «Настроек» в светлой теме — запас в 3,5
+                # раза. Обратная сторона честно записана в шапке: у «Отчёта» при
+                # 900x600 шесть столбцов по 92+84+132+320+120+104 = 852 не
+                # помещаются в полосу 642, последние два обрезаны, хвост 14 px,
+                # и это НЕ ловится — отрезанная часть меньше самого узкого
+                # видимого столбца.
+                $result.ColumnWhy = "хвост полосы $($strip.Tail) px не уже самого узкого столбца $narrowest px — часть столбца уехала за край"
+            }
+        }
+    }
+    $text = Measure-RowText $shot.Bytes $shot.Stride $rowsLeft $rowsTop $rowsRight $rowsBottom $pageBackground
+    if ($null -ne $text) {
+        $pixels = $text.Text * 4
+        $spanPercent = 0.0
+        if ($text.Width -gt 0) { $spanPercent = [Math]::Round(100.0 * $text.Span / $text.Width, 2) }
+        $line += ("`n  [строки] строк={0} фон строки={1} текст={2} px из {3} px ({4}%), полоса текста={5} px ({6}% ширины), макс. серия={7} px" -f `
+            $rows, $text.RowBackground, $pixels, ($text.Samples * 4), $text.Ratio,
+            $text.Span, $spanPercent, $text.MaxRun)
+        if ($rows -gt 0) {
+            # Пустой список — законное состояние («ничего не найдено», «отчёт ещё
+            # не получен»), и текста в нём нет по определению: проверка
+            # применяется только к непустому. Это единственное место, где
+            # «пусто» отличается от «не видно», и различает их по числу строк,
+            # а не по пикселям: у невидимых строк пикселей ровно столько же,
+            # сколько у пустого списка.
+            if ($pixels -lt $MinListTextPixels) {
+                $result.RowsWhy = "строк $rows, а текста всего $pixels px при пороге $MinListTextPixels — строки нарисованы цветом фона"
+            } elseif ($spanPercent -lt $MinListTextSpanPercent) {
+                $result.RowsWhy = "строк $rows, текст занимает полосу $spanPercent % при пороге $MinListTextSpanPercent % — это значки строк, а не подписи"
+            }
+        }
+    }
+    $result.Log = $line
+    return $result
+}
+
+# Раскладка одной страницы. Возвращает @{ Checked; Violations; Hidden } где
+# Violations — массив строк с классом, подписью, прямоугольником в координатах
+# хоста и величиной вылета по каждой стороне, а Hidden — строки списка и
+# дерева, нарисованные невидимыми (отдельный отказ, отдельный код 14).
+function Measure-PageLayout([IntPtr]$hostWindow, [int]$tolerance, $shot, $windowRect) {
     $client = New-Object MrWin+RECT
     [void][MrWin]::GetClientRect($hostWindow, [ref]$client)
     $origin = New-Object MrWin+POINT
@@ -719,7 +1263,18 @@ function Measure-PageLayout([IntPtr]$hostWindow, [int]$tolerance) {
     $limitRight = $origin.X + ($client.R - $client.L)
     $limitBottom = $origin.Y + ($client.B - $client.T)
 
+    # Фон страницы: самый частый цвет окна содержимого. Шаг 4 — фон страницы это
+    # большая площадь, а не подпись, и точность ему не нужна.
+    $pageBackground = ''
+    if ($null -ne $shot) {
+        $pageX = $origin.X - $windowRect.L
+        $pageY = $origin.Y - $windowRect.T
+        $pageBackground = Measure-DominantColor $shot.Bytes $shot.Stride $pageX $pageY `
+            ($pageX + ($client.R - $client.L) - 1) ($pageY + ($client.B - $client.T) - 1) 4
+    }
+
     $violations = New-Object System.Collections.ArrayList
+    $hidden = New-Object System.Collections.ArrayList
     $checked = 0
     foreach ($root in Get-DirectChild $hostWindow) {
         if (-not [MrWin]::IsWindowVisible($root)) { continue }
@@ -767,15 +1322,22 @@ function Measure-PageLayout([IntPtr]$hostWindow, [int]$tolerance) {
                 }
                 if ($over -ne '') { $why = $over.TrimStart(';').Trim() }
             }
-            if ($why -eq '') { $why = Measure-ListColumns $item $cls.ToString() $tolerance }
-            if ($why -eq '') { continue }
+            $className = $cls.ToString()
             $relL = $rect.L - $origin.X
             $relT = $rect.T - $origin.Y
-            $text = '{0,-22} {1,-16} ({2},{3}) {4}x{5}  ' -f $cls.ToString(), ('"' + $label + '"'), $relL, $relT, $w, $h
-            [void]$violations.Add(($text + $why.TrimStart(';')))
+            $head = '{0,-22} {1,-16} ({2},{3}) {4}x{5}  ' -f $className, ('"' + $label + '"'), $relL, $relT, $w, $h
+            $hiddenWhy = ''
+            if ($null -ne $shot -and ($className -eq $script:classListView -or $className -eq $script:classTreeView)) {
+                $list = Measure-ListItem $shot $windowRect $item $className $pageBackground $tolerance
+                if ($list.Log -ne '') { Write-Host $list.Log }
+                if ($why -eq '') { $why = $list.ColumnWhy }
+                $hiddenWhy = $list.RowsWhy
+            }
+            if ($why -ne '') { [void]$violations.Add($head + $why.TrimStart(';').Trim()) }
+            if ($hiddenWhy -ne '') { [void]$hidden.Add($head + $hiddenWhy) }
         }
     }
-    return @{ Checked = $checked; Violations = $violations }
+    return @{ Checked = $checked; Violations = $violations; Hidden = $hidden }
 }
 
 function Stop-AppProcess($proc) {
@@ -1101,37 +1663,63 @@ function Invoke-Smoke {
                 return 9
             }
             $walk = New-Object System.Collections.ArrayList
+            $walkHidden = New-Object System.Collections.ArrayList
             $script:contentHwnd = $walkHost.Hwnd
             $script:brokenPages = New-Object System.Collections.ArrayList
+            $script:hiddenPages = New-Object System.Collections.ArrayList
             for ($index = 0; $index -lt $script:pages.Count; $index++) {
                 $page = $script:pages[$index]
                 $state = Switch-AppPage $hwnd $script:contentHwnd $page
                 if (-not $state.Ok) {
                     Write-Host ("[ui] ПРОВАЛ: не удалось открыть страницу {0} за {1} попыток (последняя видимая: {2}) — обход не состоялся, раскладка не проверена" -f $page.Name, $state.Tries, $state.Visible)
+                    Write-Host ("[ui] ПЕРЕДНИЙ ПЛАН В МОМЕНТ ОТКАЗА: {0}. Чужое окно перехватило фокус, пока шёл ввод; это отказ среды, а не дефект приложения." -f $state.Foreign)
                     return 11
                 }
                 [void][MrWin]::RedrawWindow($hwnd, [IntPtr]::Zero, [IntPtr]::Zero, $script:redrawAll)
                 [void][MrWin]::UpdateWindow($hwnd)
                 Start-Sleep -Milliseconds $PageSettleMilliseconds
-                $layout = Measure-PageLayout $script:contentHwnd $LayoutTolerance
                 $pageShot = "$($Shot -replace '\.[^.]+$', '')-p$($index + 1)-$($page.Name)$([IO.Path]::GetExtension($Shot))"
-                [void](Save-WindowShot $hwnd $rect $pageShot)
-                Write-Host ("[ui] страница {0} (Ctrl+{1}, попыток {2}): проверено видимых элементов {3}, нарушений {4}; снимок {5}" -f `
-                    $page.Name, ($index + 1), $state.Tries, $layout.Checked, $layout.Violations.Count, $pageShot)
+                # Снимок снимается ДО измерения: меры столбцов и строк читают его
+                # пиксели, а не окна.
+                $pageShotPixels = Save-WindowShot $hwnd $rect $pageShot
+                $layout = Measure-PageLayout $script:contentHwnd $LayoutTolerance $pageShotPixels $rect
+                Write-Host ("[ui] страница {0} (Ctrl+{1}, попыток {2}): проверено видимых элементов {3}, нарушений раскладки {4}, невидимых списков {5}; снимок {6}" -f `
+                    $page.Name, ($index + 1), $state.Tries, $layout.Checked, $layout.Violations.Count, $layout.Hidden.Count, $pageShot)
                 if ($layout.Violations.Count -gt 0) {
                     [void]$script:brokenPages.Add($page.Name)
                     foreach ($line in $layout.Violations) {
                         [void]$walk.Add("  [$($page.Name)] $line")
                     }
                 }
+                if ($layout.Hidden.Count -gt 0) {
+                    [void]$script:hiddenPages.Add($page.Name)
+                    foreach ($line in $layout.Hidden) {
+                        [void]$walkHidden.Add("  [$($page.Name)] $line")
+                    }
+                }
+            }
+            # Оба отказа печатаются целиком, даже когда вернётся только один
+            # код: невидимые строки и вылет элемента лежат на разных страницах,
+            # и молчаливый второй список прятал бы ровно тот дефект, который
+            # чинят.
+            if ($script:hiddenPages.Count -gt 0) {
+                Write-Host "[ui] ПРОВАЛ: строки списка нарисованы невидимыми на страницах: $($script:hiddenPages -join ', ')"
+                foreach ($line in $walkHidden) { Write-Host $line }
             }
             if ($script:brokenPages.Count -gt 0) {
                 Write-Host "[ui] ПРОВАЛ: сломана раскладка на страницах: $($script:brokenPages -join ', ')"
                 foreach ($line in $walk) { Write-Host $line }
+            }
+            if ($script:hiddenPages.Count -gt 0 -or $script:brokenPages.Count -gt 0) {
                 Write-Host ("[ui] Хост содержимого: клиентская область {0}x{1}, окно содержимого {2}x{3}" -f $walkHost.W, $walkHost.H, $cw, $ch)
+                # Невидимые строки важнее вылета: элемент за краем пользователь
+                # видит и может нажать, а пустой список не отличить от «ничего
+                # не найдено» вообще.
+                if ($script:hiddenPages.Count -gt 0) { return 14 }
                 return 10
             }
             Write-Host '[ui] раскладка всех пяти страниц в порядке'
+            Write-Host '[ui] столбцы помещаются в полосу шапки, строки списков и деревьев нарисованы видимыми'
         }
 
         # Числа прогона. Это и есть результат ворота: по ним два запуска одной и
