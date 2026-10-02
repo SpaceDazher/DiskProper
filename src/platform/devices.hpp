@@ -98,7 +98,11 @@ struct DiskInterface {
     int number{-1};                 // номер физического диска; -1, если номер не получен
     std::uint32_t deviceType{};     // первое поле ответа IOCTL, «как есть»
     std::uint32_t flags{};          // третье поле ответа IOCTL, «как есть»
-    std::string devicePath;         // UTF-8, "\\?\X#&…" с ОДНИМ завершающим '\'
+    // UTF-8 путь интерфейса диска в том виде, в каком его открывает
+    // CreateFileW: «\\?\X#&…», БЕЗ завершающего '\'. Разделитель не добавляем:
+    // измерено на этой машине, что «\\?\X#&…\» не открывается вовсе
+    // (CreateFileW -> ERROR_NOT_READY, 31), и номер диска из-за этого не читается.
+    std::string devicePath;
     std::string instanceId;         // SetupDiGetDeviceInstanceIdW, UTF-8; пусто, если не получили
     bool numberKnown{false};        // номер получен: с этого диска можно открыть \\.\PhysicalDriveN
     bool accessible{false};         // устройство открылось и ответило на IOCTL (таймаут не сработал)

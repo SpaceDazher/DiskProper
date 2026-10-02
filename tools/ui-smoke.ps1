@@ -129,7 +129,41 @@
 #       содержимого имеет нулевой размер или выходит за его клиентскую
 #       область (только при -AllPages);
 #  11 — обход не состоялся: окно не удалось привести на передний план или
-#       открыть страницу (только при -AllPages).
+#       открыть страницу (только при -AllPages);
+#  12 — открылась не та страница: -ExpectPage не совпала с видимой (значит
+#       состояние интерфейса не сброшено и ворота меряют чужой запуск);
+#  13 — прогоны разошлись: -DeterminismRuns 2 и числа двух запусков одной и
+#       той же команды не совпали (окно, клиент, чернила, цвета, страница).
+#
+# СОСТОЯНИЕ ИНТЕРФЕЙСА: почему ворота приводят его к известному (Q3).
+#
+# Измерено: одна и та же команда в разные прогоны дала окно 1136x795 с
+# 127 490 чернилами и окно 1280x720 с 128 149 чернилами. Причина не в окне и не
+# в отрисовке: приложение наследует из HKCU\Software\MrProper\UI выбранную
+# страницу (nav.current) и положение окна (window.placement), то есть ворота
+# меряют не приложение, а то, что человек оставил в прошлый раз. На раннере CI
+# это не видно (ветка чистая на каждый запуск), а на машине разработчика —
+# ровно то, что и было измерено.
+#
+# Сброс по умолчанию (ключ -KeepUiState его отключает): приложение запускается
+# с документированным флагом запуска --fresh-ui-state (см. src/ui/app_shell.cpp,
+# раздел «Флаг запуска»). Флаг, а не удаление ключей реестра скриптом:
+#   * скрипт обязан знать ВЕСЬ список сохраняемых ключей, а он пополнялся уже
+#     трижды; забытый ключ означал бы тихо вернувшиеся ворота к прежнему;
+#   * удаление ключей на машине человека стирает его состояние — ворота не
+#     имеют права это делать, а флаг не пишет ничего;
+#   * «состояние по умолчанию» считает само приложение, поэтому ворота и
+#     приложение не могут разойтись в том, что считать состоянием.
+#
+# Ключ -DeterminismRuns N превращает это правило в проверку: приложение
+# запускается N раз ОДНОЙ И ТОЙ ЖЕ командой, и все числа прогона (размер окна,
+# размер клиента, чернила клиента, чернила содержимого, число цветов, страница)
+# обязаны совпасть до цифры. Расхождение — код 13, а не зелёный прогон.
+#
+# Что сброс НЕ делает намеренно: FontScalePercent (масштаб шрифта) лежит в том
+# же ключе реестра, но читается не хранилищем состояния, а theme.cpp, и флагом
+# не охвачен. Пока он есть, скрипт приводит его к 100 и возвращает прежний —
+# тем же приёмом, которым уже готовится -ThemeMode.
 #
 # Прав администратора не требует и не должен: приложение только рисует окно, а
 # состояние готовится в HKCU собственного ключа. Порог чернил подобран по
@@ -149,6 +183,18 @@ param(
     [string]$ExpectBackground = '',
     [int]$SettleSeconds = 7,
     [int]$RepaintSeconds = 2,
+    # Поиск окна и разворачивание окна делаются с повторами: на машине,
+    # где параллельно работают другие агенты, окно то появляется позже
+    # SettleSeconds, то сворачивается системой. Оба случая давали «красный
+    # код из-за среды» вместо честного результата — то есть ворота сами
+    # становились недетерминированными.
+    [int]$WindowFindTries = 8,
+    [int]$WindowRestoreTries = 5,
+    # --- состояние интерфейса: сброс по умолчанию (см. шапку выше) -------------
+    [switch]$KeepUiState,
+    [string]$ExpectPage = '',
+    [int]$DeterminismRuns = 1,
+    [int]$KeepFontScale = 100,
     # --- обход всех страниц (см. шапку) ---------------------------------------
     [switch]$AllPages,
     [int]$PageSwitchTries = 8,
@@ -185,7 +231,13 @@ if ($ExpectBackground -ne '' -and @('dark', 'light') -notcontains $ExpectBackgro
     exit 2
 }
 if ($PageSwitchTries -lt 1) { Write-Host "[ui] -PageSwitchTries меньше 1: $PageSwitchTries"; exit 2 }
+if ($WindowFindTries -lt 1) { Write-Host "[ui] -WindowFindTries меньше 1: $WindowFindTries"; exit 2 }
+if ($WindowRestoreTries -lt 1) { Write-Host "[ui] -WindowRestoreTries меньше 1: $WindowRestoreTries"; exit 2 }
 if ($LayoutTolerance -lt 0) { Write-Host "[ui] -LayoutTolerance отрицателен: $LayoutTolerance"; exit 2 }
+if ($DeterminismRuns -lt 1 -or $DeterminismRuns -gt 10) {
+    Write-Host "[ui] -DeterminismRuns вне 1..10: $DeterminismRuns"
+    exit 2
+}
 
 Add-Type -TypeDefinition @'
 using System; using System.Text; using System.Runtime.InteropServices;
@@ -217,6 +269,10 @@ public class MrWin {
  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);
  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr wp, IntPtr lp, uint flags, uint timeout, out IntPtr result);
+ // SendMessage без таймаута — только для СВОИХ окон и только синхронных
+ // сообщений списка (LVM_GETCOLUMNWIDTH, LVM_GETHEADER): висящее окно в воротах
+ // не зависает, потому что приложение нашёлось и отвечает на WM_GETMINMAXINFO.
+ [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
  [StructLayout(LayoutKind.Sequential)] public struct MINMAXINFO {
@@ -243,6 +299,13 @@ $script:gwHwndNext = 2
 $script:keyEventKeyUp = 0x0002
 $script:vkControl = 0x11
 $script:vkMenu = 0x12
+# Сообщения списка (commctrl.h): LVM_GETCOLUMNCOUNT = LVM_FIRST+4 = 0x1004,
+# LVM_GETCOLUMNWIDTH = LVM_FIRST+29 = 0x101D, LVM_GETHEADER = LVM_FIRST+31.
+# Числа взяты из commctrl.h Windows SDK 10.0.19041, а не посчитаны в уме: у
+# списка нет обёртки ListView_GetColumnWidth в почерке powershell.
+$script:lvmGetColumnCount = 0x1004
+$script:lvmGetColumnWidth = 0x101D
+$script:lvmGetHeader = 0x101F
 # Пять страниц рельса в порядке kPages (src/ui/nav.hpp): Overview, Disks,
 # Cleanup, Report, Settings; Ctrl+1..5 и класс окна экрана.
 $script:pages = @(
@@ -252,6 +315,15 @@ $script:pages = @(
     @{ Name = 'report';   Digit = 0x34; View = 'MrProper.ReportView' },
     @{ Name = 'settings'; Digit = 0x35; View = 'MrProper.SettingsView' }
 )
+
+
+if ($ExpectPage -ne '' -and @($script:pages | Where-Object { $_.Name -eq $ExpectPage }).Count -eq 0) {
+    # Имя страницы проверяется по тому же списку, что и обход: страница без
+    # цифры в рельсе обходиться не будет, и опечатка в -ExpectPage молча
+    # сделала бы проверку зелёной.
+    Write-Host "[ui] -ExpectPage ожищает overview|disks|cleanup|report|settings, получено '$ExpectPage'"
+    exit 2
+}
 
 # --- состояние темы в реестре: запомнить, поставить, вернуть как было ---------
 $script:themePath = 'HKCU:\Software\MrProper\UI'
@@ -306,6 +378,63 @@ function Restore-AppThemeMode {
     return 0
 }
 
+# --- состояние, готовимое скриптом: FontScalePercent ------------------------
+# Масштаб шрифта лежит в той же ветке, но читает его theme.cpp напрямую, а не
+# хранилище состояния, поэтому --fresh-ui-state его не касается. Пока значение
+# есть на машине человека, ворота меряют другой кегль — и числа двух запусков
+# расходятся. Поэтому на время прогона ставится -KeepFontScale (по умолчанию
+# 100, то есть значение по умолчанию приложения), а прежнее возвращается.
+$script:fontScaleName = 'FontScalePercent'
+$script:fontScaleSaved = $false
+$script:fontScaleSavedValue = 100
+
+function Save-FontScaleState {
+    $script:fontScaleSaved = $false
+    try {
+        if (-not (Test-Path -LiteralPath $script:themePath)) { return }
+        $key = Get-Item -LiteralPath $script:themePath
+        $value = $key.GetValue($script:fontScaleName, $null)
+        if ($null -ne $value) {
+            $script:fontScaleSaved = $true
+            $script:fontScaleSavedValue = [int]$value
+        }
+    } catch {
+        # Ключа нет — это не ошибка: «шрифт по умолчанию» тоже состояние.
+    }
+}
+
+function Set-AppFontScale([int]$percent) {
+    if (-not (Test-Path -LiteralPath $script:themePath)) {
+        New-Item -Path $script:themePath -Force | Out-Null
+    }
+    New-ItemProperty -Path $script:themePath -Name $script:fontScaleName -Value $percent `
+        -PropertyType DWord -Force | Out-Null
+}
+
+function Restore-AppFontScale {
+    if ($KeepUiState) { return 0 }
+    try {
+        if ($script:fontScaleSaved) {
+            New-ItemProperty -Path $script:themePath -Name $script:fontScaleName `
+                -Value $script:fontScaleSavedValue -PropertyType DWord -Force | Out-Null
+        } elseif (Test-Path -LiteralPath $script:themePath) {
+            Remove-ItemProperty -LiteralPath $script:themePath -Name $script:fontScaleName `
+                -ErrorAction SilentlyContinue
+        }
+        # Ветку, которой не было, не оставляем после себя пустой.
+        if (-not $script:themeKeyExisted -and (Test-Path -LiteralPath $script:themePath)) {
+            $key = Get-Item -LiteralPath $script:themePath
+            if ($key.GetValueNames().Length -eq 0 -and $key.GetSubKeyNames().Length -eq 0) {
+                Remove-Item -LiteralPath $script:themePath -Force
+            }
+        }
+    } catch {
+        Write-Host "[ui] ВНИМАНИЕ: прежний FontScalePercent не восстановлен ($($_.Exception.Message))"
+        return 7
+    }
+    return 0
+}
+
 # Относительная яркость по WCAG: решением «тёмный фон или светлый» занимается
 # не цветовой канал, а формула, иначе тёмно-синий прошёл бы за серый.
 function Get-RelativeLuminance([int]$r, [int]$g, [int]$b) {
@@ -343,6 +472,35 @@ function Find-AppWindow([int]$processId) {
     }
     [void][MrWin]::EnumWindows($cb, [IntPtr]::Zero)
     return $script:hwnd
+}
+
+# Что у процесса есть на самом деле. Сообщение «окно не найдено» само по себе
+# бесполезно: из него не видно, было ли окно свёрнутым (тогда GetWindowRect
+# отдаёт 160x24 в (-32000,-32000)), пустым по размеру или без заголовка, — а
+# это три разные причины и три разные починки.
+$script:windowRows = $null
+
+function Describe-AppWindows([int]$processId) {
+    $script:windowRows = New-Object System.Collections.ArrayList
+    $cb = [MrWin+EnumProc] {
+        param($h, $l)
+        $q = 0
+        [void][MrWin]::GetWindowThreadProcessId($h, [ref]$q)
+        if ($q -eq $processId) {
+            $r = New-Object MrWin+RECT
+            [void][MrWin]::GetWindowRect($h, [ref]$r)
+            $c = New-Object Text.StringBuilder 256
+            [void][MrWin]::GetClassNameW($h, $c, 256)
+            $t = New-Object Text.StringBuilder 256
+            [void][MrWin]::GetWindowTextW($h, $t, 256)
+            [void]$script:windowRows.Add(("{0} класс='{1}' заголовок='{2}' видимо={3} свёрнуто={4} размер={5}x{6}" -f `
+                $h, $c.ToString(), $t.ToString(), [MrWin]::IsWindowVisible($h), [MrWin]::IsIconic($h),
+                ($r.R - $r.L), ($r.B - $r.T)))
+        }
+        return $true
+    }
+    [void][MrWin]::EnumWindows($cb, [IntPtr]::Zero)
+    return $script:windowRows
 }
 
 # Снимок окна в файл. Отдельная функция нужна обходу страниц: он снимает ту же
@@ -520,6 +678,32 @@ function Switch-AppPage([IntPtr]$hwnd, [IntPtr]$hostWindow, [hashtable]$page) {
     return $result
 }
 
+# Столбцы списка: сумма их ширин должна помещаться в ширину, по которой список
+# рисует столбцы (клиентская область панели столбцов — она уже без вертикальной
+# полосы прокрутки). Это проверка D-71: обрезанный третий столбец не меняет ни
+# размер окна, ни размер окна содержимого, поэтому проверка прямоугольников его
+# не видит, а человек видит сразу — заголовок «Уровень риска» превращается в
+# «Уровень ри…». Возвращает текст нарушения или пустую строку.
+function Measure-ListColumns([IntPtr]$list, [string]$class, [int]$tolerance) {
+    if ($class -ne 'SysListView32') { return '' }
+    $columns = [int][MrWin]::SendMessage($list, $script:lvmGetColumnCount, [IntPtr]::Zero, [IntPtr]::Zero)
+    if ($columns -le 0 -or $columns -gt 32) { return '' }
+    $header = [MrWin]::SendMessage($list, $script:lvmGetHeader, [IntPtr]::Zero, [IntPtr]::Zero)
+    if ($header -eq [IntPtr]::Zero) { return '' }
+    $room = New-Object MrWin+RECT
+    if ([MrWin]::GetClientRect($header, [ref]$room) -eq $false) { return '' }
+    $available = $room.R - $room.L
+    $sum = 0
+    for ($column = 0; $column -lt $columns; $column++) {
+        $sum += [int][MrWin]::SendMessage($list, $script:lvmGetColumnWidth, [IntPtr]$column, [IntPtr]::Zero)
+    }
+    if ($sum -le 0) { return '' }
+    if ($sum -gt ($available + $tolerance)) {
+        return ("столбцы шире списка: {0} > {1}" -f $sum, $available)
+    }
+    return ''
+}
+
 # Раскладка одной страницы. Возвращает @{ Checked; Violations } где Violations —
 # массив строк с классом, подписью, прямоугольником в координатах хоста и
 # величиной вылета по каждой стороне.
@@ -583,11 +767,12 @@ function Measure-PageLayout([IntPtr]$hostWindow, [int]$tolerance) {
                 }
                 if ($over -ne '') { $why = $over.TrimStart(';').Trim() }
             }
+            if ($why -eq '') { $why = Measure-ListColumns $item $cls.ToString() $tolerance }
             if ($why -eq '') { continue }
             $relL = $rect.L - $origin.X
             $relT = $rect.T - $origin.Y
             $text = '{0,-22} {1,-16} ({2},{3}) {4}x{5}  ' -f $cls.ToString(), ('"' + $label + '"'), $relL, $relT, $w, $h
-            [void]$violations.Add(($text + $why))
+            [void]$violations.Add(($text + $why.TrimStart(';')))
         }
     }
     return @{ Checked = $checked; Violations = $violations }
@@ -606,14 +791,76 @@ function Stop-AppProcess($proc) {
     }
 }
 
+# Запуск приложения. Флаг --fresh-ui-state — это и есть сброс состояния
+# интерфейса (см. шапку): приложение стартует как при первой установке и
+# ничего не пишет обратно в HKCU. -KeepUiState оставляет привычное поведение
+# для того, кто СПЕЦИАЛЬНО хочет померить своё сохранённое состояние.
+function Start-AppProcess {
+    if ($KeepUiState) {
+        Write-Host '[ui] состояние интерфейса НЕ сбрасывается (-KeepUiState): окно может прийти из HKCU'
+        return Start-Process $Exe -PassThru
+    }
+    Write-Host '[ui] состояние интерфейса сброшено флагом запуска --fresh-ui-state'
+    return Start-Process $Exe -ArgumentList '--fresh-ui-state' -PassThru
+}
+
+# Числа одного прогона. Их сравнивает -DeterminismRuns, поэтому сюда попадает
+# ровно то, что обязано совпасть: размеры, оба счётчика чернил, число цветов и
+# открытая страница.
+$script:lastRun = @{}
+
 function Invoke-Smoke {
-    $proc = Start-Process $Exe -PassThru
+    $proc = Start-AppProcess
     try {
         Start-Sleep -Seconds $SettleSeconds
         if ($proc.HasExited) { Write-Host "[ui] процесс упал, код $($proc.ExitCode)"; return 6 }
 
-        $hwnd = Find-AppWindow $proc.Id
-        if ($hwnd -eq [IntPtr]::Zero) { Write-Host '[ui] окно не найдено'; return 5 }
+        # Поиск окна с повторами: SettleSeconds — это ожидание, а не
+        # гарантия. На загруженной машине окно появляется позже (два
+        # прогона подряд из десяти заканчивались кодом 5 при живом
+        # процессе), и такой «красный» код говорил о среде, а не о
+        # приложении.
+        $hwnd = [IntPtr]::Zero
+        for ($attempt = 1; $attempt -le $WindowFindTries -and $hwnd -eq [IntPtr]::Zero; $attempt++) {
+            if ($attempt -gt 1) { Start-Sleep -Seconds 1 }
+            $hwnd = Find-AppWindow $proc.Id
+            if ($hwnd -eq [IntPtr]::Zero -and $proc.HasExited) {
+                Write-Host "[ui] процесс упал, код $($proc.ExitCode)"
+                return 6
+            }
+        }
+        if ($hwnd -eq [IntPtr]::Zero) {
+            Write-Host "[ui] окно не найдено за $WindowFindTries попытками"
+            $seen = Describe-AppWindows $proc.Id
+            if ($null -eq $seen -or $seen.Count -eq 0) {
+                Write-Host '  [окно] у процесса нет ни одного верхнего окна'
+            } else {
+                foreach ($line in $seen) { Write-Host "  [окно] $line" }
+            }
+            return 5
+        }
+
+        # Какая страница открылась — проверка состояния, а не рисунка. Ворота
+        # обязаны знать, ЧТО они измеряют: до сброса одна и та же команда
+        # открывала то «Настройки» (128 149 чернил), то «Обзор» (38 315) в
+        # зависимости от nav.current в реестре. Спрашивается у ВИДИМОГО окна
+        # экрана, а не у реестра: реестр показывает, что было записано, а
+        # вопрос в том, что приложение открыло на самом деле.
+        $startRect = New-Object MrWin+RECT
+        [void][MrWin]::GetWindowRect($hwnd, [ref]$startRect)
+        $startHost = Find-ContentHost $hwnd $startRect
+        $visibleScreens = @()
+        if ($startHost.Found) { $visibleScreens = @(Get-VisibleScreen $startHost.Hwnd) }
+        $startPage = ''
+        if ($visibleScreens.Count -eq 1) {
+            $startPage = ($visibleScreens[0].Class -replace '^MrProper\.', '' -replace 'View$', '').ToLower()
+        }
+        Write-Host ("[ui] стартовая страница: {0} (видимых экранов: {1})" -f `
+            $(if ($startPage -eq '') { 'не определена' } else { $startPage }), $visibleScreens.Count)
+        if ($ExpectPage -ne '' -and $startPage -ne $ExpectPage) {
+            Write-Host ("[ui] ПРОВАЛ: открыта страница '{0}', а -ExpectPage='{1}' — состояние интерфейса НЕ сброшено, ворота меряют чужой запуск" -f $startPage, $ExpectPage)
+            return 12
+        }
 
         $realDpi = [MrWin]::GetDpiForWindow($hwnd)
         if ($realDpi -eq 0) { $realDpi = $script:baseDpi }
@@ -681,10 +928,18 @@ function Invoke-Smoke {
         # иконку 160x24 в точке (-32000,-32000) — снимок такого окна дал бы
         # «11% чернил в окне 160x24» и код 8 вместо честного отказа. Поэтому
         # перед съёмкой окно разворачивается, а размер проверяется повторно.
-        if ([MrWin]::IsIconic($hwnd)) {
-            Write-Host '[ui] окно оказалось свёрнутым — разворачиваем (SW_RESTORE)'
-            [void][MrWin]::ShowWindow($hwnd, 9)
-            Start-Sleep -Milliseconds 400
+        for ($attempt = 1; $attempt -le $WindowRestoreTries; $attempt++) {
+            if ([MrWin]::IsIconic($hwnd)) {
+                Write-Host ("[ui] окно свёрнуто (попытка {0} из {1}) — разворачиваем (SW_RESTORE)" -f $attempt, $WindowRestoreTries)
+                [void][MrWin]::ShowWindow($hwnd, 9)
+                Start-Sleep -Milliseconds 400
+            }
+            $probe = New-Object MrWin+RECT
+            [void][MrWin]::GetWindowRect($hwnd, [ref]$probe)
+            if ((($probe.R - $probe.L) -ge 200) -and (($probe.B - $probe.T) -ge 200)) { break }
+            # Свёрнутое окно отдаёт 160x24 в (-32000,-32000): пока размер
+            # такой, снимок брать рано — это был бы отказ из-за среды.
+            Start-Sleep -Milliseconds 500
         }
         Start-Sleep -Seconds $RepaintSeconds
         [void][MrWin]::RedrawWindow($hwnd, [IntPtr]::Zero, [IntPtr]::Zero, $script:redrawAll)
@@ -770,6 +1025,11 @@ function Invoke-Smoke {
         # Клиентских чернил мало, чтобы отличить «интерфейс есть» от «нарисован
         # только рельс»: рельс — это всегда ~17% клиента при 1280x720. Содержимое
         # проверяется отдельно, иначе версия «работает и пуста» снова пройдёт.
+        # Счётчики содержимого объявлены здесь, а не внутри проверки ниже: они
+        # попадают в ИТОГ, а ИТОГ печатается и при -MinContentInkPixels 0.
+        $contentInk = 0
+        $contentColors = 0
+        $centerInk = 0
         if ($MinContentInkPixels -gt 0) {
             $contentWindow = Find-ContentHost $hwnd $rect
             if (-not $contentWindow.Found) {
@@ -789,6 +1049,8 @@ function Invoke-Smoke {
                 return 9
             }
             $content = Measure-Ink $bytes $stride $hx $hy $hx2 $hy2
+            $contentInk = $content.Ink
+            $contentColors = $content.Colors
             Write-Host ("[ui] содержимое: фон={0} чернила={1} из {2} точек ({3}%, порог {4}) цветов={5}" -f `
                 $content.Background, $content.Ink, $content.Samples, $content.Ratio, $MinContentInkPixels, $content.Colors)
             if ($content.Ink -lt $MinContentInkPixels) {
@@ -819,6 +1081,7 @@ function Invoke-Smoke {
             $my0 = $hy + [int](($hy2 - $hy) * (1.0 - $centerShare) / 2.0)
             $my1 = $hy2 - [int](($hy2 - $hy) * (1.0 - $centerShare) / 2.0)
             $center = Measure-Ink $bytes $stride $mx0 $my0 $mx1 $my1
+            $centerInk = $center.Ink
             Write-Host ("[ui] центр 70%: {0}x{1} чернила={2} из {3} точек ({4}%, порог {5})" -f `
                 ($mx1 - $mx0), ($my1 - $my0), $center.Ink, $center.Samples, $center.Ratio, $MinCenterInkPixels)
             if ($center.Ink -lt $MinCenterInkPixels) {
@@ -871,6 +1134,22 @@ function Invoke-Smoke {
             Write-Host '[ui] раскладка всех пяти страниц в порядке'
         }
 
+        # Числа прогона. Это и есть результат ворота: по ним два запуска одной и
+        # той же команды обязаны совпасть до цифры (-DeterminismRuns), и по ним
+        # видно, что измерялось.
+        $script:lastRun = [ordered]@{
+            Window      = "$($w)x$($h)"
+            Client      = "$($cw)x$($ch)"
+            InkClient   = $ink
+            InkContent  = $contentInk
+            Colors      = $contentColors
+            InkCenter   = $centerInk
+            StartPage   = $startPage
+        }
+        Write-Host ("[ui] ИТОГ: окно={0} клиент={1} чернила-клиент={2} чернила-содержимое={3} цветов={4} центр={5} страница={6}" -f `
+            $script:lastRun.Window, $script:lastRun.Client, $script:lastRun.InkClient, `
+            $script:lastRun.InkContent, $script:lastRun.Colors, $script:lastRun.InkCenter, $script:lastRun.StartPage)
+
         Write-Host "[ui] окно нарисовало содержимое. Снимок: $Shot"
         return 0
     } finally {
@@ -878,9 +1157,61 @@ function Invoke-Smoke {
     }
 }
 
+# Прогоны одной и той же команды, которые обязаны дать один и тот же
+# результат: разница размеров или чернил — код 13, а не «ну почти».
+function Invoke-DeterminismRuns {
+    $runs = New-Object System.Collections.ArrayList
+    $originalShot = $Shot
+    try {
+        for ($index = 1; $index -le $DeterminismRuns; $index++) {
+            if ($DeterminismRuns -gt 1) {
+                # Снимок второго и следующих прогонов получает свой суффикс:
+                # один и тот же файл перезаписал бы доказательство, что кадров
+                # было два, а не один.
+                $Shot = "$($originalShot -replace '\.[^.]+$', '')-run$index$([IO.Path]::GetExtension($originalShot))"
+            }
+            $script:lastRun = @{}
+            Write-Host ("[ui] --- прогон {0} из {1} ---" -f $index, $DeterminismRuns)
+            $result = Invoke-Smoke
+            if ($result -ne 0) { return $result }
+            [void]$runs.Add([pscustomobject]@{ Index = $index; Data = $script:lastRun })
+        }
+    } finally {
+        $Shot = $originalShot
+    }
+
+    if ($runs.Count -lt 2) { return 0 }
+
+    $first = $runs[0].Data
+    $differences = New-Object System.Collections.ArrayList
+    foreach ($run in $runs) {
+        foreach ($field in $first.Keys) {
+            $reference = $first[$field]
+            $value = $run.Data[$field]
+            if ([string]$reference -ne [string]$value) {
+                [void]$differences.Add(("{0}: прогон 1 = '{1}', прогон {2} = '{3}'" -f `
+                    $field, $reference, $run.Index, $value))
+            }
+        }
+    }
+    if ($differences.Count -gt 0) {
+        Write-Host '[ui] ПРОВАЛ: одна и та же команда дала разные числа в прогонах:'
+        foreach ($line in $differences) { Write-Host "  $line" }
+        Write-Host ("[ui] сравнено полей: {0}, прогонов: {1}. Состояние интерфейса не сброшено?" -f `
+            $first.Keys.Count, $runs.Count)
+        return 13
+    }
+    $summary = @()
+    foreach ($field in $first.Keys) { $summary += ("{0}={1}" -f $field, $first[$field]) }
+    Write-Host ("[ui] детерминизм подтверждён: {0} прогонов одной команды совпали по всем полям ({1})" -f `
+        $runs.Count, ($summary -join ', '))
+    return 0
+}
+
 $themeReady = 0
+Save-ThemeState
+Save-FontScaleState
 if ($ThemeMode -ne '') {
-    Save-ThemeState
     try {
         Set-AppThemeMode $ThemeMode
         Write-Host "[ui] режим темы приложения: $ThemeMode (системную тему не трогаем)"
@@ -889,8 +1220,19 @@ if ($ThemeMode -ne '') {
         $themeReady = 7
     }
 }
+if ($themeReady -eq 0 -and -not $KeepUiState) {
+    try {
+        Set-AppFontScale $KeepFontScale
+        Write-Host "[ui] масштаб шрифта на время прогона: $KeepFontScale% (прежнее значение вернётся)"
+    } catch {
+        Write-Host "[ui] ПРОВАЛ: не удалось привести масштаб шрифта к известному: $($_.Exception.Message)"
+        $themeReady = 7
+    }
+}
 
-$code = if ($themeReady -eq 0) { Invoke-Smoke } else { $themeReady }
+$code = if ($themeReady -eq 0) { Invoke-DeterminismRuns } else { $themeReady }
 $restored = Restore-AppThemeMode
+$fontRestored = Restore-AppFontScale
 if ($code -eq 0 -and $restored -ne 0) { $code = $restored }
+if ($code -eq 0 -and $fontRestored -ne 0) { $code = $fontRestored }
 exit $code

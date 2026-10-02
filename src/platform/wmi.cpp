@@ -484,7 +484,12 @@ bool getString(IWbemClassObject* object, const wchar_t* name, std::string& utf8)
             return true;
         case VT_NULL:
         case VT_EMPTY:
-            return false;
+            // VT_NULL, VT_EMPTY и любой нераспознанный тип дают по контракту
+            // читателя один и тот же отказ — «свойства нет» (см. контракт
+            // функции выше). Раньше это были три копии `return false;` подряд,
+            // и проверка branch-clone указывала справедливо: правка одного
+            // случая разошлась бы с остальными, а результат зависел бы от
+            // того, какой VT именно отдал WMI в этот раз. Ветви объединены.
         default:
             return false;
     }

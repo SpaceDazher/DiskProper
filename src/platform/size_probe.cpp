@@ -19,6 +19,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -37,6 +39,27 @@ namespace {
 // Вызовы, которые не уложились в таймаут: за ними остались потоки внутри
 // драйвера. Счётчик — только для отчёта и отладки, на поведение не влияет.
 std::atomic<std::uint32_t> gAbandonedCalls{0};
+
+// Потерянные диагностики: отказ самой записи в журнал об отказе опроса.
+// Ловить его больше негде — журнал не записался именно потому, что памяти не
+// хватило, и повторная попытка дала бы тот же отказ. Причина (код Win32) и так
+// лежит в полях результата, но и факт потери диагностики обязан быть виден:
+// иначе «отказ был, а в журнале пусто» неотличимо от «отказа не было».
+//
+// Счётчики локальны для модуля: единственный его канал вывода — тот же журнал.
+// Поэтому единственная дополнительная попытка идёт в stderr (не требует памяти и
+// потому переживает ту же нехватку), а текст там ASCII — чтобы кодовая страница
+// терминала не превратила его в мусор. Отказ самой этой записи тоже считается.
+std::atomic<std::uint64_t> gLostDiagnostics{0};
+std::atomic<std::uint64_t> gStderrWriteFailures{0};
+
+void noteLostDiagnostic(const char* event, std::uint32_t win32Error) noexcept {
+    gLostDiagnostics.fetch_add(1, std::memory_order_relaxed);
+    if (std::fprintf(stderr, "[mrproper] %s: log write failed (win32=%u)\n", event,
+                     static_cast<unsigned>(win32Error)) < 0) {
+        gStderrWriteFailures.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 // INVALID_HANDLE_VALUE — это ((HANDLE)(LONG_PTR)-1), то есть приведение
 // литерала, а не constant expression. Поэтому объявляем константой: с
@@ -161,6 +184,11 @@ std::optional<CallResult<T>> runWithDeadline(std::chrono::milliseconds timeout, 
             } catch (...) {
                 // Единственный выход наружу — «недоступно» с нулевым кодом:
                 // причина не в Win32, а в нехватке памяти внутри вызова.
+                // Отказ логирования тут невозможен — этой точки код вызова
+                // ещё не знает, — но потеря самого результата обязана быть
+                // видна, иначе тихий ноль читается как «устройство ответило
+                // нулём». Код 0 — это ровно то, что вернётся наружу.
+                noteLostDiagnostic("size_probe.call", 0u);
             }
             {
                 // Присваивание ниже не бросает: CallResult — POD, копирование
@@ -248,6 +276,33 @@ CallResult<std::uint64_t> readDiskLength(const std::wstring& path) {
     result.value = static_cast<std::uint64_t>(info.Length.QuadPart);
     result.status = ProbeStatus::Ok;
     return result;
+}
+
+// Корень тома для GetDiskFreeSpaceExW — ровно тот, который требует функция:
+// с завершающим разделителем. Измерено на этой машине (Windows 11 22631, без
+// повышения прав):
+//
+//   GetDiskFreeSpaceExW("\\?\Volume{GUID}")    -> FALSE, ERROR_INVALID_FUNCTION (1)
+//   GetDiskFreeSpaceExW("\\?\Volume{GUID}\")   -> TRUE,  total=126833651712
+//
+// То есть путь тома из перечисления, у которого точки монтирования
+// недоступны, даёт ноль размера молча, хотя размер спрашивается без прав.
+// Тот же разделитель обязателен и для FindFirstVolumeMountPointW. Корень
+// буквы («C:\») и каталога уже приходят с разделителем — их не трогаем.
+std::wstring volumeRootWithSeparator(std::wstring_view path) {
+    std::wstring root(path);
+    if (root.empty()) {
+        return root;
+    }
+    // «\\» и «\\.\» — корни без содержимого, разделитель им не нужен.
+    if (root.size() == 2 && (root[1] == L'\\' || root[1] == L'/')) {
+        return root;
+    }
+    if (root.back() == L'\\' || root.back() == L'/') {
+        return root;
+    }
+    root.push_back(L'\\');
+    return root;
 }
 
 // Свободное место: GetDiskFreeSpaceExW по пути тома, буквы или каталога.
@@ -414,7 +469,10 @@ DiskSizeResult queryDiskSize(std::wstring_view devicePath, std::chrono::millisec
                            timeout);
         } catch (...) {
             // Нехватка памяти при записи в лог — не повод потерять результат
-            // опроса и не повод уронить процесс.
+            // опроса и не повод уронить процесс. Причина опроса уже в полях
+            // результата; потеря самой диагностики считается, чтобы отказ не
+            // выглядел так, будто его не было.
+            noteLostDiagnostic("size_probe.disk_length", result.win32Error);
         }
     }
     return result;
@@ -425,7 +483,7 @@ VolumeSpaceResult queryVolumeSpace(std::wstring_view rootPath, std::chrono::mill
     const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 
     try {
-        const std::wstring path(rootPath);
+        const std::wstring path = volumeRootWithSeparator(rootPath);
         if (path.empty()) {
             result.status = ProbeStatus::InvalidArgument;
             result.win32Error = static_cast<std::uint32_t>(ERROR_INVALID_PARAMETER);
@@ -454,6 +512,7 @@ VolumeSpaceResult queryVolumeSpace(std::wstring_view rootPath, std::chrono::mill
                            timeout);
         } catch (...) {
             // Как и выше: сбой записи в лог не влияет на результат опроса.
+            noteLostDiagnostic("size_probe.volume_space", result.win32Error);
         }
     }
     return result;

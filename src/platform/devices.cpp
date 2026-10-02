@@ -167,17 +167,34 @@ std::wstring_view detailPath(const DetailBlock* detail, std::size_t detailBytes)
     return std::wstring_view(first, length);
 }
 
-// Завершающий разделитель у пути устройства — ровно один.
+// Завершающий разделитель у пути устройства — НЕ добавляем, а убираем.
 //
-// SetupDiGetDeviceInterfaceDetailW уже возвращает путь с завершающим '\'
-// (того же требует FR-1 п.1), но полагаться на это молча нельзя: второй
-// разделитель даёт «\\?\X#&…\\», который не открывается и ломает
-// SetupDiOpenDevRegKey и запросы WMI. Поэтому проверяем, а не добавляем.
-std::wstring withTrailingSeparator(std::wstring path) {
-    if (path.empty() || path.back() == L'\\') {
+// Это не косметика, измерено на этой машине (NVMe, Windows 11 22631), путь
+// интерфейса «\\?\scsi#disk&ven_nvme&…#{53f56307-…}»:
+//
+//   CreateFileW(путь как есть)                  -> OK, дескриптор получен
+//   CreateFileW(путь + '\')                     -> ERROR_NOT_READY (31)
+//
+// Разделитель под «\\?\» не нормализуется и уходит в ядро как есть: хендл
+// открывается не на устройство, а «внутрь» него, и драйвер диска на таком
+// хендле не отвечает ни на что. Раньше здесь стояло обратное — разделитель
+// добавлялся, — и цена была ровно такая: номер диска не читался
+// (IOCTL_STORAGE_GET_DEVICE_NUMBER), disk.numberKnown оставался false, а
+// инвентарь отдавал диск без размера и без разметки (FR-1 п.3, п.4). Заодно
+// ломались SetupDiOpenDevRegKey и запросы WMI, что и было описано в старом
+// комментарии, но вывод оттуда был сделан неверно: виноват был не второй
+// разделитель, а любой.
+//
+// Формат пути в модели задан SPEC §6.3 как «\\?\X#&…» — без разделителя;
+// inventory.cpp в модель кладёт ровно это значение.
+std::wstring withoutTrailingSeparator(std::wstring path) {
+    while (path.size() > 1 && (path.back() == L'\\' || path.back() == L'/')) {
+        path.pop_back();
+    }
+    // «\\» и «\\?\» — корни, у которых разделитель часть пути.
+    if (path.size() == 2 && (path[1] == L'\\' || path[1] == L'/')) {
         return path;
     }
-    path.push_back(L'\\');
     return path;
 }
 
@@ -308,8 +325,15 @@ QueryOutcome queryDeviceNumberLocked(const std::wstring& devicePath) {
 std::wstring queryInstanceId(HDEVINFO infoSet, SP_DEVINFO_DATA& deviceInfo, std::uint32_t& win32Error) {
     DWORD chars = 0;
     if (::SetupDiGetDeviceInstanceIdW(infoSet, &deviceInfo, nullptr, 0, &chars) == FALSE) {
-        win32Error = ::GetLastError();
-        return {};
+        const std::uint32_t sizeError = static_cast<std::uint32_t>(::GetLastError());
+        // Запрос размера отвечает FALSE + ERROR_INSUFFICIENT_BUFFER (122) и при
+        // этом размер всё равно кладёт в chars — измерено на этой машине:
+        // «instanceId(null,0) ok=False win32=122 req=61». Раньше такой ответ
+        // считался отказом, и идентификатор экземпляра был пуст всегда.
+        if (sizeError != ERROR_INSUFFICIENT_BUFFER) {
+            win32Error = sizeError;
+            return {};
+        }
     }
     if (chars == 0 || chars > kMaxInstanceIdChars) {
         win32Error = ERROR_INVALID_DATA;
@@ -319,7 +343,7 @@ std::wstring queryInstanceId(HDEVINFO infoSet, SP_DEVINFO_DATA& deviceInfo, std:
     WideBuffer buffer;
     buffer.reset(chars);
     if (::SetupDiGetDeviceInstanceIdW(infoSet, &deviceInfo, buffer.data(), buffer.chars(), nullptr) == FALSE) {
-        win32Error = ::GetLastError();
+        win32Error = static_cast<std::uint32_t>(::GetLastError());
         return {};
     }
     win32Error = ERROR_SUCCESS;
@@ -389,7 +413,7 @@ bool collectInterface(HDEVINFO infoSet, SP_DEVICE_INTERFACE_DATA& interfaceData,
         return false;
     }
 
-    const std::wstring devicePath = withTrailingSeparator(std::wstring(detailPath(detail.data(), detailSize)));
+    const std::wstring devicePath = withoutTrailingSeparator(std::wstring(detailPath(detail.data(), detailSize)));
     if (devicePath.empty()) {
         addIssue(result, Stage::InterfaceDetail, {}, 0, "путь устройства пуст");
         return false;

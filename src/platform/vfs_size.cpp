@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <new>
 #include <string>
 #include <string_view>
@@ -35,6 +36,30 @@ std::atomic<std::uint64_t> gMeasured{0};
 std::atomic<std::uint64_t> gFailed{0};
 std::atomic<std::uint64_t> gAllocatedUnknown{0};
 std::atomic<std::uint64_t> gLogThrottled{0};
+
+// Потерянные диагностики: отказ самой записи в журнал об отказе измерения.
+// Поймать его можно только здесь — журнал не записался именно потому, что
+// памяти не хватило, и повторная попытка дала бы тот же самый отказ. Поэтому
+// причина (код Win32) уже лежит в полях результата, а сам факт потери
+// диагностики обязан быть виден: иначе «отказ был, но в журнале пусто» и
+// «отказа не было» выглядят одинаково.
+//
+// Счётчик локальный для модуля, и это осознанный размен: единственный канал
+// вывода у него — тот же журнал, который отказал. Поэтому единственная
+// дополнительная попытка идёт в stderr, а текст там ASCII, чтобы кодовая
+// страница терминала не превратила его в мусор. stderr не требует памяти и
+// потому переживает ту же нехватку; отказ самой этой записи тоже считается,
+// а не отбрасывается.
+std::atomic<std::uint64_t> gLostDiagnostics{0};
+std::atomic<std::uint64_t> gStderrWriteFailures{0};
+
+void noteLostDiagnostic(const char* event, std::uint32_t win32Error) noexcept {
+    gLostDiagnostics.fetch_add(1, std::memory_order_relaxed);
+    if (std::fprintf(stderr, "[mrproper] %s: log write failed (win32=%u)\n", event,
+                     static_cast<unsigned>(win32Error)) < 0) {
+        gStderrWriteFailures.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 // Обход считает сотни тысяч элементов, и каждый отказ писать в лог — это
 // полмиллиона записей, которые съедают и место, и время. Поэтому первые отказы
@@ -198,8 +223,11 @@ void logMeasureFailure(std::string_view event, std::wstring_view path, SizeStatu
         core::logFailure(event, "размер элемента не измерен: неизвестны и логический, и аллоцированный размер",
                          core::toUtf8(path), static_cast<std::int64_t>(win32Error), std::move(fields));
     } catch (...) {
-        // Сбой записи в журнал не имеет права превращать отказ Win32 в падение
-        // обхода (SPEC §5).
+        // Отказ записи в журнал не имеет права превращать отказ Win32 в падение
+        // обхода (SPEC §5). Причина уже в полях результата, а потеря самой
+        // диагностики считается: молчащий catch превращал бы отказ в «ничего не
+        // произошло», а это ровно то, чего обход ждать не должен.
+        noteLostDiagnostic("vfs.size.failed", win32Error);
     }
 }
 
@@ -228,6 +256,8 @@ void logAllocatedUnknown(std::wstring_view path, const FileSize& size) noexcept 
                       std::move(fields));
     } catch (...) {
         // Как и выше: оценка «по логическому» лучше, чем падение обхода.
+        // Отказ записи считается отдельно — см. noteLostDiagnostic.
+        noteLostDiagnostic("vfs.size.allocated_unknown", size.allocatedWin32Error);
     }
 }
 

@@ -56,10 +56,13 @@
 #include <winioctl.h>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <new>
 #include <string>
 #include <string_view>
@@ -75,6 +78,94 @@ namespace mrproper::platform::vfs {
 namespace {
 
 using ScopedHandle = unique_handle<KernelHandlePolicy>;
+
+// ---------------------------------------------------------------------------
+// Профиль обхода по этапам (docs/scan-performance.md)
+// ---------------------------------------------------------------------------
+//
+// Зачем. Время обхода складывается из четырёх разных вещей — открытия каталога,
+// перечисления, чтения тега ссылки и работы посетителя, — и по счётчикам
+// видно только «элементов столько, ошибок столько». Какая из четырёх съедает
+// минуты, по этим числам не сказать, а оптимизировать вслепую нельзя.
+//
+// Включается переменной окружения MRPROPER_SCAN_PROFILE=<путь>: обход дописывает
+// в <путь>.walk по строке на каждый вызов walk(). Молчаливый дефолт — ничего не
+// пишет и ничего не меряет: замер идёт через steady_clock вокруг горячего кода,
+// и в сборке, которой профиль не заказан, лишних двух чтений счётчика на
+// элемент быть не должно.
+//
+// Формат строки — «ключ=значение», значения без пробелов и кавычек (путь корня
+// заключён в кавычки). Машина читает построчно, человек глазами видит таблицу.
+// Запись под мьютексом: обход идёт в пуле потоков, а файл общий.
+[[nodiscard]] bool stageProfilePath(std::string& out) {
+    // Читается один раз на процесс: переменная окружения в горячем коде не
+    // читается, а mid-run не меняется. GetEnvironmentVariableW, а не
+    // std::getenv: MSVC помечает узкий getenv как C4996, а слой собирается с
+    // /WX (то есть предупреждение стало бы ошибкой сборки), и широкая пара
+    // отдаёт путь в UTF-8, а не в кодовой странице консоли.
+    static const std::string path = [] {
+        wchar_t buffer[1024];
+        const DWORD written = ::GetEnvironmentVariableW(L"MRPROPER_SCAN_PROFILE", buffer,
+                                                        static_cast<DWORD>(std::size(buffer)));
+        if (written == 0 || written >= std::size(buffer)) return std::string();
+        std::string out;
+        out.reserve(written);
+        for (DWORD index = 0; index < written; ++index) {
+            out.push_back(buffer[index] < 0x80 ? static_cast<char>(buffer[index]) : '?');
+        }
+        return out;
+    }();
+    out = path;
+    return !out.empty();
+}
+
+// Заменить непечатаемые символы, чтобы один битый путь не разорвал строку
+// профиля на две и не сдвинул все последующие колонки.
+std::string printable(const std::wstring& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (const wchar_t symbol : text) {
+        if (symbol >= L' ' && symbol != L'"' && symbol != 0x7f) {
+            out.push_back(static_cast<char>(symbol < 0x80 ? symbol : L'?'));
+        } else {
+            out.push_back('?');
+        }
+    }
+    return out;
+}
+
+void appendStageLine(const std::string& path, const std::string& line) {
+    static std::mutex writeMutex;
+    const std::lock_guard<std::mutex> guard(writeMutex);
+    // fopen помечен в MSVC как небезопасный (C4996 при /W4 /WX), fopen_s есть
+    // только у CRT от Microsoft — ровно как в core/log.cpp.
+    std::FILE* file = nullptr;
+    if (::fopen_s(&file, path.c_str(), "ab") != 0 || file == nullptr) return;
+    std::fwrite(line.data(), 1, line.size(), file);
+    std::fclose(file);
+}
+
+// Счётчик этапа: наносекунды, накопленные на всё время обхода. Класс копировать
+// нельзя — иначе двойное сложение, — и он не бросает исключений.
+class StageClock {
+public:
+    explicit StageClock(std::uint64_t& sink) noexcept
+        : sink_(&sink), started_(std::chrono::steady_clock::now()) {}
+    ~StageClock() {
+        *sink_ += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started_).count());
+    }
+    StageClock(const StageClock&) = delete;
+    StageClock& operator=(const StageClock&) = delete;
+
+private:
+    std::uint64_t* sink_;
+    std::chrono::steady_clock::time_point started_;
+};
+
+[[nodiscard]] std::uint64_t toMs(std::chrono::nanoseconds value) noexcept {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(value).count());
+}
 
 // Буфер перечисления каталога: 64 КиБ. Запись FILE_ID_BOTH_DIR_INFO — это 104
 // байта заголовка (включая 12 WCHAR короткого имени) плюс имя, а NTFS, ReFS и
@@ -286,6 +377,19 @@ private:
     std::vector<std::vector<std::byte>> enumBuffers_;
     std::vector<std::byte> reparseBuffer_;
     std::uint64_t sinceCancelCheck_{};
+
+    // Накопленные наносекунды по этапам (профиль обхода, см. шапку файла).
+    // Четыре счётчика, потому что четыре разные вещи зовутся по-разному:
+    // openMs — открытие каталога и его идентификация, enumMs — собственно
+    // GetFileInformationByHandleEx, reparseMs — CreateFileW + DeviceIoControl
+    // на каждую ссылку, visitorMs — работа посетителя (в обходе это сборщик
+    // кандидатов, то есть правила, возраст, список разрешённого).
+    std::uint64_t openNs_{};
+    std::uint64_t enumNs_{};
+    std::uint64_t reparseNs_{};
+    std::uint64_t visitorNs_{};
+    std::uint64_t reparseReads_{};
+    std::uint64_t directoriesOpened_{};
 };
 
 [[nodiscard]] bool Walker::cancelled() {
@@ -323,6 +427,8 @@ void Walker::noteError(std::wstring_view path, DWORD code, std::wstring message)
     // Права 0: FSCTL_GET_REPARSE_POINT документирован именно так, а
     // FILE_FLAG_OPEN_REPARSE_POINT обязателен — иначе тег пришёл бы от цели
     // ссылки, а не от самой ссылки.
+    const StageClock clock(reparseNs_);
+    ++reparseReads_;
     const std::wstring extended = toExtendedPath(path);
     const ScopedHandle link(::CreateFileW(extended.c_str(), 0, kShareAll, nullptr, OPEN_EXISTING, kDirectoryFlags, nullptr));
     if (!link) {
@@ -419,7 +525,10 @@ void Walker::noteError(std::wstring_view path, DWORD code, std::wstring message)
 
     // --- посетитель --------------------------------------------------------
     if (visitor_) {
-        const WalkStep step = visitor_(entry);
+        const WalkStep step = [&] {
+            const StageClock clock(visitorNs_);
+            return visitor_(entry);
+        }();
         if (step == WalkStep::Stop) {
             result_.stoppedByVisitor = true;
             return false;
@@ -438,8 +547,15 @@ void Walker::noteError(std::wstring_view path, DWORD code, std::wstring message)
 [[nodiscard]] bool Walker::walkDirectory(const std::wstring& dirPath, std::uint32_t depth, std::uint64_t volumeSerial,
                                          std::uint64_t expectedFileId) {
     const std::wstring extended = toExtendedPath(dirPath);
-    const ScopedHandle dir(::CreateFileW(extended.c_str(), kListAccess, kShareAll, nullptr, OPEN_EXISTING,
-                                         kDirectoryFlags, nullptr));
+    // Открытие каталога и его идентификация — два системных вызова на каталог,
+    // и на дереве в сотни тысяч каталогов это не «мелочь, которую не видно».
+    // Замер живёт только на этом участке: перечисление ниже считается отдельно.
+    const ScopedHandle dir = [&] {
+        const StageClock clock(openNs_);
+        ++directoriesOpened_;
+        return ScopedHandle(::CreateFileW(extended.c_str(), kListAccess, kShareAll, nullptr, OPEN_EXISTING,
+                                          kDirectoryFlags, nullptr));
+    }();
     if (!dir) {
         const DWORD code = ::GetLastError();
         // Корень, который не открылся, — это результат обхода, а не «пустое
@@ -449,9 +565,12 @@ void Walker::noteError(std::wstring_view path, DWORD code, std::wstring message)
     }
 
     BY_HANDLE_FILE_INFORMATION info{};
-    if (!::GetFileInformationByHandle(dir.get(), &info)) {
-        noteError(dirPath, ::GetLastError());
-        return true;
+    {
+        const StageClock clock(openNs_);
+        if (!::GetFileInformationByHandle(dir.get(), &info)) {
+            noteError(dirPath, ::GetLastError());
+            return true;
+        }
     }
     if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
         // Файл занял место каталога между перечислением и открытием.
@@ -513,9 +632,12 @@ void Walker::noteError(std::wstring_view path, DWORD code, std::wstring message)
         // остатки предыдущего каталога выглядели бы как записи текущего (а в
         // худшем случае — как запись с именем, которого нет).
         std::memset(enumBuffers_[depth].data(), 0, enumBuffers_[depth].size());
-        const BOOL listed = ::GetFileInformationByHandleEx(
-            dir.get(), restart ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo,
-            enumBuffers_[depth].data(), static_cast<DWORD>(enumBuffers_[depth].size()));
+        const BOOL listed = [&] {
+            const StageClock clock(enumNs_);
+            return ::GetFileInformationByHandleEx(
+                dir.get(), restart ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo,
+                enumBuffers_[depth].data(), static_cast<DWORD>(enumBuffers_[depth].size()));
+        }();
         restart = false;
         if (!listed) {
             const DWORD code = ::GetLastError();
@@ -628,6 +750,30 @@ void Walker::finish(const std::chrono::steady_clock::time_point& started) {
     fields.push_back(mrproper::core::logField("completed", result_.completed));
     fields.push_back(mrproper::core::logField("elapsedMs", static_cast<std::uint64_t>(result_.elapsed.count())));
     mrproper::core::logTrace("vfs.walk.done", "обход дерева завершён", fields);
+
+    // Профиль по этапам — только когда его заказали переменной окружения
+    // (см. шапку файла). Одна строка на обход: итог складывается из тысяч
+    // строк по корням, и по ней видно, какой корень стоил минуту.
+    std::string profilePath;
+    if (stageProfilePath(profilePath)) {
+        std::string line = "WALK";
+        line += " root=\"" + printable(result_.root) + "\"";
+        line += " ms=" + std::to_string(result_.elapsed.count());
+        line += " openMs=" + std::to_string(toMs(std::chrono::nanoseconds(openNs_)));
+        line += " enumMs=" + std::to_string(toMs(std::chrono::nanoseconds(enumNs_)));
+        line += " reparseMs=" + std::to_string(toMs(std::chrono::nanoseconds(reparseNs_)));
+        line += " visitorMs=" + std::to_string(toMs(std::chrono::nanoseconds(visitorNs_)));
+        line += " reparseReads=" + std::to_string(reparseReads_);
+        line += " dirsOpened=" + std::to_string(directoriesOpened_);
+        line += " entries=" + std::to_string(result_.stats.entries);
+        line += " files=" + std::to_string(result_.stats.files);
+        line += " dirs=" + std::to_string(result_.stats.directories);
+        line += " reparseSkipped=" + std::to_string(result_.stats.reparseSkipped);
+        line += " errors=" + std::to_string(result_.stats.errors);
+        line += " completed=" + std::string(result_.completed ? "1" : "0");
+        line += "\n";
+        appendStageLine(profilePath + ".walk", line);
+    }
 }
 
 [[nodiscard]] WalkResult Walker::run(std::wstring_view root) {

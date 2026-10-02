@@ -425,8 +425,20 @@ void collectOneDisk(const devices::DiskInterface& iface, CollectContext& ctx, st
                  std::string("не удалось получить размер ") + diskLabel(disk.number) + ": " + deviceStateName(state) +
                      ", " + winErrorText(size.win32Error));
         if (state == DeviceState::AccessDenied) {
-            addDegraded(ctx, "нет прав на " + subject + " (" + winErrorText(size.win32Error) +
-                                 ") — размер и разметка не прочитаны, карта неполна (нужно повышение прав)");
+            // Что именно не прочитано, должно быть написано здесь: разметка
+            // (IOCTL_DISK_GET_DRIVE_LAYOUT_EX — FILE_ANY_ACCESS) на этой машине
+            // читается без повышения прав, а размера (IOCTL_DISK_GET_LENGTH_INFO
+            // — FILE_READ_ACCESS, то есть GENERIC_READ) без них не достаётся.
+            // Измерено на Windows 11 22631, medium integrity:
+            //   \\.\PhysicalDrive0 + FILE_READ_ATTRIBUTES -> LAYOUT_EX OK PartitionCount=5
+            //   \\.\PhysicalDrive0 + FILE_READ_ATTRIBUTES -> LENGTH_INFO FALSE, ERROR_ACCESS_DENIED (5)
+            // Раньше текст обещал отказ обоих шагов, и карта в JSON показывала
+            // разделы — то есть врёт ровно в том случае, когда данные есть.
+            const bool layoutMissing = !layoutKnown;
+            addDegraded(ctx, "нет прав на " + subject + " (" + winErrorText(size.win32Error) + ") — " +
+                                 (layoutMissing ? "размер и разметка не прочитаны"
+                                                : "размер диска не прочитан, разметка прочитана") +
+                                 ", карта неполна (нужно повышение прав)");
         } else {
             addDegraded(ctx, diskLabel(disk.number) + " не ответил на запрос размера: " + deviceStateName(state) + ", " +
                                  winErrorText(size.win32Error));

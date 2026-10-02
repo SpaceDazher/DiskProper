@@ -7,6 +7,7 @@
 #include <ctime>
 #include <filesystem>
 #include <iterator>
+#include <memory>
 #include <system_error>
 #include <utility>
 
@@ -39,9 +40,15 @@ std::int64_t nowEpochMillis() noexcept {
 std::string clip(std::string_view text, std::size_t limit) {
     if (text.size() <= limit) return std::string(text);
     char tail[48];
-    std::snprintf(tail, sizeof(tail), "...[+%llu bytes]", static_cast<unsigned long long>(text.size() - limit));
+    // CERT ERR33-C: возврат snprintf не игнорируется. При формате «...[+N bytes]»
+    // и size_t в 20 цифрах строка занимает 28 байт из 48, то есть усечения здесь
+    // быть не может по построению. Проверка стоит всё равно: если буфер когда-нибудь
+    // уменьшат, в хвост попадёт метка без числа, и читатель решит, что пропало
+    // ноль байт. Лучше явная пометка, чем враньё в логе.
+    const int written = std::snprintf(tail, sizeof(tail), "...[+%llu bytes]",
+                                      static_cast<unsigned long long>(text.size() - limit));
     std::string out(text.substr(0, limit));
-    out += tail;
+    out += (written < 0 || static_cast<std::size_t>(written) >= sizeof(tail)) ? "...[size unknown]" : tail;
     return out;
 }
 
@@ -61,9 +68,43 @@ std::string formatTimestamp(std::int64_t epochMillis) {
     if (gmtime_r(&seconds, &utc) == nullptr) return "1970-01-01T00:00:00.000Z";
 #endif
     char buffer[40];
-    std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", utc.tm_year + 1900, utc.tm_mon + 1,
-                  utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec, millis);
+    // CERT ERR33-C: возврат snprintf не игнорируется. Формат фиксированной ширины
+    // занимает 24 байта из 40, усечения не бывает — но при отказе форматтера в
+    // буфере может остаться что угодно, и строка «ts» в JSON Lines перестала бы
+    // разбираться. Отдаём заведомо корректный ISO-текст с эпохой: читатель
+    // увидит «время неизвестно», а не сломанную запись.
+    const int written = std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+                                      utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour, utc.tm_min,
+                                      utc.tm_sec, millis);
+    if (written < 0 || static_cast<std::size_t>(written) >= sizeof(buffer)) {
+        return "1970-01-01T00:00:00.000Z";
+    }
     return buffer;
+}
+
+// Закрытие файла журнала с проверкой возврата (CERT ERR33-C).
+//
+// fclose возвращает EOF, когда не удалось дописать буфер, — то есть ровно тот
+// случай, когда теряется последняя запись. Раньше этот код отбрасывался в трёх
+// местах подряд, и «запись потерялась» внешне выглядело как «записалось всё».
+//
+// Указатель обнуляется ДО проверки: после fclose он недействителен, и если
+// вызывающий бросит исключение на обработке кода, повторный close() не должен
+// ткнуться в освобождённый поток.
+//
+// Код отказа возвращается, а не записывается здесь: noteFileErrorLocked()
+// формирует строку и потому может бросить исключение, а вызывающий бывает
+// noexcept.
+int closeLogFile(std::FILE*& file) noexcept {
+    if (file == nullptr) return 0;
+    std::FILE* closing = file;
+    file = nullptr;
+    // fclose забирает FILE* по значению и сам освобождает поток: передавать
+    // «владельца» тут нечего, а указатель обнулён строкой выше, поэтому
+    // повторный вызов уже ничего не сделает. Подавление точечное и с причиной:
+    // правило остаётся включённым для всех остальных мест, где настоящая утечка
+    // памяти обязана быть видна.
+    return std::fclose(closing) == 0 ? 0 : errno;  // NOLINT(cppcoreguidelines-owning-memory)
 }
 
 // Открытие файла на дозапись. Вариант fopen помечен в MSVC как небезопасный
@@ -132,6 +173,17 @@ void appendJsonScalar(std::string& out, const LogField& field) {
         appendJsonString(out, field.value);
     }
 }
+
+// Удалятель, который ничего не удаляет. Нужен ровно в одном месте —
+// Logger::instance(): объект логгера обязан пережить разрушение статических
+// объектов программы, поэтому освобождать его нельзя. Владение выражено типом
+// (unique_ptr), а не комментарием: проверка cppcoreguidelines-owning-memory на
+// такой строке не срабатывает, и «утечка памяти» в этом модуле означает
+// настоящую ошибку, а не известную особенность.
+struct NeverFreed {
+    template <typename T>
+    void operator()(T*) const noexcept {}
+};
 
 LogFields clipFields(LogFields fields) {
     if (fields.size() > FIELD_COUNT_LIMIT) fields.resize(FIELD_COUNT_LIMIT);
@@ -271,7 +323,22 @@ std::string formatLogRecord(const LogRecord& record) {
 Logger& Logger::instance() noexcept {
     // «Утечка» намеренная: см. комментарий в log.hpp. Порядок разрушения
     // статических объектов не определён, а лог нужен и их деструкторам.
-    static Logger* singleton = new Logger();
+    //
+    // Раньше здесь стояло `static Logger* singleton = new Logger();`, и это были
+    // два настоящих дефекта, а не придирки анализатора:
+    //   * bugprone-unhandled-exception-at-new — operator new бросает
+    //     std::bad_alloc, а функция помечена noexcept, то есть на нехватке
+    //     памяти процесс завершался std::terminate вместо того, чтобы продолжить
+    //     работу. Для утилиты, которой чистят диск, это худший возможный отказ:
+    //     теряется ровно то состояние, ради которого всё затевалось;
+    //   * cppcoreguidelines-owning-memory — «утечка» была объявлена комментарием,
+    //     и любая правка рядом могла превратить её в утечку настоящую.
+    // Теперь память — статический массив байт, а объект создаётся placement new:
+    // operator new не вызывается вовсе, а конструктор Logger по умолчанию не
+    // бросает (mutex, пустые string/vector, атомарные счётчики). Никакой
+    // нехватки памяти на этой строке возникнуть не может.
+    alignas(Logger) static unsigned char storage[sizeof(Logger)];
+    static const std::unique_ptr<Logger, NeverFreed> singleton(new (storage) Logger());
     return *singleton;
 }
 
@@ -319,21 +386,38 @@ std::size_t Logger::currentSizeLocked() {
 
 bool Logger::rotateLocked() {
     if (file_ != nullptr) {
-        std::fclose(file_);
-        file_ = nullptr;
+        // Отказ закрытия здесь не останавливает ротацию: файл всё равно уходит
+        // в архив, а открытие ниже откроет новый. Но код не отбрасывается —
+        // если дописать не удалось, потерялась последняя запись, и это должно
+        // попасть в fileFailures(). Отметка, впрочем, может быть стёрта
+        // успешным открытием ниже: файл к тому моменту уже новый, и показывать
+        // в UI ошибку закрытия старого незачем.
+        const int closeCode = closeLogFile(file_);
+        if (closeCode != 0) noteFileErrorLocked(closeCode);
     }
     if (path_.empty()) return false;
     const int keep = options_.keepFiles;
     if (keep <= 0) {
-        std::remove(path_.c_str());
+        // CERT ERR33-C: std::remove возвращает 0 при успехе. ENOENT отказом не
+        // считается — файла могло не быть вовсе (rotate() до первого open()), и
+        // тогда fileFailures() показывал бы в UI неисправность там, где её нет.
+        // Остальные коды означают, что старый лог не удалён и место не освободилось.
+        if (const int rc = std::remove(path_.c_str()); rc != 0 && errno != ENOENT) noteFileErrorLocked(errno);
     } else {
         std::error_code ignored;
         std::filesystem::remove(archivedPathLocked(keep), ignored);  // самый старый — в корзину
         for (int index = keep - 1; index >= 1; --index) {
             const std::string from = archivedPathLocked(index);
-            if (std::filesystem::exists(from)) std::rename(from.c_str(), archivedPathLocked(index + 1).c_str());
+            // То же, что выше: несуществующий архив — это норма, а не отказ.
+            if (std::filesystem::exists(from)) {
+                if (std::rename(from.c_str(), archivedPathLocked(index + 1).c_str()) != 0 && errno != ENOENT) {
+                    noteFileErrorLocked(errno);
+                }
+            }
         }
-        std::rename(path_.c_str(), archivedPathLocked(1).c_str());
+        if (std::rename(path_.c_str(), archivedPathLocked(1).c_str()) != 0 && errno != ENOENT) {
+            noteFileErrorLocked(errno);
+        }
     }
     const int code = openAppend(path_.c_str(), file_);
     if (file_ == nullptr) {
@@ -348,11 +432,17 @@ bool Logger::rotateLocked() {
 bool Logger::open(std::string path, const LogOptions& options) {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
+        // Код закрытия старого файла снимается здесь, а засчитывается после
+        // fileError_.clear(): очистка иначе стёрла бы и след отказа, а потеря
+        // последней записи старого файла — это ровно то, что не должно остаться
+        // незамеченным. Отказ открытия нового файла перезапишет текст позже: он
+        // важнее и говорит вызывающему о чём-то более конкретном.
+        int closeCode = 0;
         if (file_ != nullptr) {
-            std::fclose(file_);
-            file_ = nullptr;
+            closeCode = closeLogFile(file_);
         }
         fileError_.clear();
+        if (closeCode != 0) noteFileErrorLocked(closeCode);
         options_ = options;
         resetRingLocked();
         if (path.empty()) {
@@ -386,8 +476,12 @@ void Logger::close() noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         if (file_ != nullptr) {
-            std::fclose(file_);
-            file_ = nullptr;
+            const int code = closeLogFile(file_);
+            // Отказ закрытия — это «буфер не дописан», то есть потерянная запись,
+            // и она обязана попасть в fileFailures(): иначе после close() вызывающий
+            // считает, что файл дописан целиком. Если формирование текста ошибки
+            // бросит (нехватка памяти), outer catch посчитает это как lost.
+            if (code != 0) noteFileErrorLocked(code);
         }
         fileBytes_ = 0;
     } catch (...) {
@@ -433,8 +527,18 @@ void Logger::write(LogLevel level, std::string_view event, std::string_view mess
         pushRingLocked(record);  // кольцо получает запись всегда, даже без файла
         const std::string line = formatLogRecord(record);
         if (options_.echoToStderr) {
-            std::fputs(line.c_str(), stderr);
-            std::fputc('\n', stderr);
+            // CERT ERR33-C: fputs/fputc возвращают EOF при отказе. Дублирование
+            // в stderr — тоже запись журнала (LogOptions::echoToStderr), поэтому
+            // её отказ считается наравне с отказом файла: иначе «эхо включено, а
+            // в консоли пусто» осталось бы незамеченным. Перевод строки пишется
+            // только после успеха fputs, иначе один отказ посчитался бы дважды,
+            // поэтому проверки сведены в один счётчик, а не в две одинаковые
+            // ветви.
+            bool failed = std::fputs(line.c_str(), stderr) == EOF;
+            if (!failed) {
+                failed = std::fputc('\n', stderr) == EOF;
+            }
+            if (failed) noteFileErrorLocked(errno);
         }
         appendLineLocked(line);
     } catch (...) {
@@ -486,7 +590,10 @@ std::uint64_t Logger::lastSequence() const noexcept {
 void Logger::flush() noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (file_ != nullptr) std::fflush(file_);
+        // CERT ERR33-C: flush() возвращает EOF, когда данные не дошли до файла.
+        // Отбрасывать его нельзя: flush() зовут перед экспортом отчёта и перед
+        // выходом, и именно там «сбросили и не проверили» стоит потерянного отчёта.
+        if (file_ != nullptr && std::fflush(file_) != 0) noteFileErrorLocked(errno);
     } catch (...) {
         lost_.fetch_add(1, std::memory_order_relaxed);
     }

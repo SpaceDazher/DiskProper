@@ -70,6 +70,12 @@ void utcParts(std::int64_t nowUnixSeconds, std::int64_t& year, std::int64_t& mon
     restOfDay = rest;
 }
 
+// Отказ модуля с именем места: единственная ошибка, которую этот файл выпускает
+// наружу (TrashError), поэтому её видно и вызывающему, и в тексте отчёта.
+// Объявлена здесь, до compactStamp: метка времени тоже обязана сообщить об
+// отказе форматтера, и ждать объявления до конца раздела нельзя.
+[[noreturn]] void fail(const std::string& origin, const std::string& what) { throw TrashError(origin + ": " + what); }
+
 // Метка без двоеточий: только она годится для имени каталога, потому что
 // двоеточие в Windows — это поток данных (поток «Z»), и путь с ним нельзя
 // ни создать, ни прочитать обычным способом.
@@ -81,16 +87,25 @@ std::string compactStamp(std::int64_t nowUnixSeconds) {
     utcParts(nowUnixSeconds, year, month, day, rest);
 
     char buf[64];  // запас на год длиннее четырёх цифр
-    std::snprintf(buf, sizeof(buf), "%04lld%02lld%02lldT%02lld%02lld%02lldZ", static_cast<long long>(year),
-                  static_cast<long long>(month), static_cast<long long>(day), static_cast<long long>(rest / kSecondsPerHour),
-                  static_cast<long long>((rest % kSecondsPerHour) / kSecondsPerMinute),
-                  static_cast<long long>(rest % kSecondsPerMinute));
+    // CERT ERR33-C: возврат snprintf не игнорируем. Здесь проверка не формальная:
+    // метка становится именем каталога корзины, и обрезанная метка дала бы
+    // каталог, который нельзя ни найти по своему txId, ни удалить через undo.
+    // Отказ форматтера — TrashError с точным именем места, а не укороченная
+    // строка. Ширина не хватает только при year длиннее 47 цифр, чего int64
+    // дать не может, — ветка недостижима по построению и остаётся как
+    // доказательство, что молчаливого усечения нет.
+    const int written = std::snprintf(buf, sizeof(buf), "%04lld%02lld%02lldT%02lld%02lld%02lldZ",
+                                      static_cast<long long>(year), static_cast<long long>(month),
+                                      static_cast<long long>(day), static_cast<long long>(rest / kSecondsPerHour),
+                                      static_cast<long long>((rest % kSecondsPerHour) / kSecondsPerMinute),
+                                      static_cast<long long>(rest % kSecondsPerMinute));
+    if (written < 0 || static_cast<std::size_t>(written) >= sizeof(buf)) {
+        fail("compactStamp", "метка времени не помещается в буфер — имя каталога было бы повреждено");
+    }
     return std::string(buf);
 }
 
 // --- Проверки манифеста -----------------------------------------------------
-
-[[noreturn]] void fail(const std::string& origin, const std::string& what) { throw TrashError(origin + ": " + what); }
 
 // Обязательное поле: отсутствие — TrashError, а не runtime_error из json.
 // Иначе вызывающий, который ловит только ошибки корзины, пропустил бы битый
@@ -425,18 +440,38 @@ std::string formatUtcStamp(std::int64_t nowUnixSeconds) {
     utcParts(nowUnixSeconds, year, month, day, rest);
 
     char buf[64];  // запас на год длиннее четырёх цифр
-    std::snprintf(buf, sizeof(buf), "%04lld%02lld%02lldT%02lld:%02lld:%02lldZ", static_cast<long long>(year),
-                  static_cast<long long>(month), static_cast<long long>(day), static_cast<long long>(rest / kSecondsPerHour),
-                  static_cast<long long>((rest % kSecondsPerHour) / kSecondsPerMinute),
-                  static_cast<long long>(rest % kSecondsPerMinute));
+    // CERT ERR33-C: то же, что в compactStamp, но для формы с двоеточиями.
+    // Эта метка идёт в текст сводки, поэтому отказ форматтера — тоже отказ:
+    // показать «старейшая от <обрезано>» хуже, чем сказать, что не разобралось.
+    const int written = std::snprintf(buf, sizeof(buf), "%04lld%02lld%02lldT%02lld:%02lld:%02lldZ",
+                                      static_cast<long long>(year), static_cast<long long>(month),
+                                      static_cast<long long>(day), static_cast<long long>(rest / kSecondsPerHour),
+                                      static_cast<long long>((rest % kSecondsPerHour) / kSecondsPerMinute),
+                                      static_cast<long long>(rest % kSecondsPerMinute));
+    if (written < 0 || static_cast<std::size_t>(written) >= sizeof(buf)) {
+        fail("formatUtcStamp", "метка времени не помещается в буфер");
+    }
     return std::string(buf);
 }
 
 std::string makeTxId(std::int64_t nowUnixSeconds, std::uint32_t counter, std::uint32_t nonce) {
     char counterText[16];
-    std::snprintf(counterText, sizeof(counterText), "%06lx", static_cast<unsigned long>(counter & 0xFFFFFFu));
+    // CERT ERR33-C: счётчик замаскирован до 24 бит, то есть «%06lx» даёт ровно
+    // 6 знаков при буфере 16, и nonce как uint32 — ровно 8 при «%08lx».
+    // Проверка всё равно стоит: обрезанный здесь номер дал бы идентификатор,
+    // который проходит isValidTxId (символы те же), но указывает на другую
+    // транзакцию, — то есть отказ, который нельзя заметить. Поэтому TrashError.
+    const int counterWritten = std::snprintf(counterText, sizeof(counterText), "%06lx",
+                                             static_cast<unsigned long>(counter & 0xFFFFFFu));
+    if (counterWritten < 0 || static_cast<std::size_t>(counterWritten) >= sizeof(counterText)) {
+        fail("makeTxId", "счётчик не помещается в буфер");
+    }
     char nonceText[16];
-    std::snprintf(nonceText, sizeof(nonceText), "%08lx", static_cast<unsigned long>(nonce));
+    const int nonceWritten =
+        std::snprintf(nonceText, sizeof(nonceText), "%08lx", static_cast<unsigned long>(nonce));
+    if (nonceWritten < 0 || static_cast<std::size_t>(nonceWritten) >= sizeof(nonceText)) {
+        fail("makeTxId", "nonce не помещается в буфер");
+    }
     // Метка компактная, без двоеточий: результат должен проходить isValidTxId,
     // иначе получившееся имя каталога нельзя было бы даже собрать.
     return compactStamp(nowUnixSeconds) + "-" + std::string(counterText) + "-" + std::string(nonceText);
@@ -777,10 +812,14 @@ RestorePlan planRestore(const TrashTransaction& tx, const std::vector<std::size_
 
         switch (entry.action) {
             case RestoreAction::Restore:
-                plan.restoreCount += 1;
-                plan.restoreBytes = addSaturating(plan.restoreBytes, item.bytes);
-                break;
             case RestoreAction::Overwrite:
+                // FR-7 различает эти два действия только при применении:
+                // Overwrite перезаписывает занятое место, Restore на нём
+                // останавливается. В плане же оба занимают ровно одно и то же
+                // место — оба возвращают item.bytes в корзину, — поэтому ветви
+                // объединены. Две одинаковые копии означали бы, что любая правка
+                // одной из них (например, учёт перезаписанного места в Overwrite)
+                // разошлась бы со второй, и план показал бы разные числа.
                 plan.restoreCount += 1;
                 plan.restoreBytes = addSaturating(plan.restoreBytes, item.bytes);
                 break;

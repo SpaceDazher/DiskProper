@@ -37,10 +37,15 @@
 #include "candidate_collector.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -56,6 +61,116 @@ namespace mrproper::engine {
 namespace {
 
 constexpr char kSeparator = '\\';
+
+// ---------------------------------------------------------------------------
+// Профиль сбора по этапам (docs/scan-performance.md)
+// ---------------------------------------------------------------------------
+//
+// Скан состоит из четырёх разных работ, и по одному durationMs не сказать,
+// какая из них стоила минуты: разворот локаторов (перечисление каталогов по
+// «**»), statPath на каждый корень, обход дерева корня и сборка кандидата.
+// Каждая из них меряется отдельно, по правилу — строка в профиль на правило.
+//
+// Профиль включается переменной окружения MRPROPER_SCAN_PROFILE=<путь> (общий
+// путь с остальными слоями: мост дописывает <путь>.probe, обход — <путь>.walk,
+// сборщик — <путь>.collect). Молчаливый дефолт — ничего не пишет.
+// Чтение переменной окружения по-разному на Windows и на прочих хостах —
+// ровно как в src/cli/cmd_scan.cpp. Две причины не использовать std::getenv:
+//
+//  1) MSVC помечает его как C4996 («используйте _dupenv_s»), а переносимый слой
+//     собирается с /WX: предупреждение стало бы ошибкой сборки на хосте, где
+//     ничего чинить нельзя;
+//  2) узкий вариант отдаёт значение в кодовой странице консоли, а путь профиля
+//     на русской Windows пришлось бы писать как «C:\Temp\?????».
+//
+// _wgetenv_s — широкая функция CRT: широкий windows.h этому файлу не нужен, и
+// граница «переносимый слой не включает windows.h» (шапка файла, SPEC §6.1)
+// остаётся целой. Определение скрыто #if, а не только вызов, — на хосте без
+// широкой CRT функция была бы неиспользуемой, а -Wall -Wextra -Werror
+// превратили бы это в ошибку сборки.
+#if defined(_WIN32) && defined(_MSC_VER)
+[[nodiscard]] std::string readScanProfilePath() {
+    constexpr std::size_t kInitialSlots = 1024;  // 2 КиБ: длиннее в Windows не бывает
+    constexpr int kMaxAttempts = 3;
+    // Имя переменной — ASCII-константа, поэтому расширение символ в символ
+    // корректно без MultiByteToWideChar.
+    std::wstring wideName;
+    for (const char symbol : std::string_view("MRPROPER_SCAN_PROFILE")) {
+        wideName.push_back(static_cast<wchar_t>(static_cast<unsigned char>(symbol)));
+    }
+    std::wstring buffer(kInitialSlots, L'\0');
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        std::size_t required = 0;
+        const int status = _wgetenv_s(&required, buffer.data(), buffer.size(), wideName.c_str());
+        if (status == ERANGE) {
+            if (required <= buffer.size()) return {};  // размер не растёт — выхода нет
+            buffer.assign(required, L'\0');
+            continue;
+        }
+        if (status != 0) return {};
+        const std::wstring_view text(buffer.c_str());
+        if (text.empty()) return {};
+        std::string out;
+        out.reserve(text.size());
+        for (const wchar_t symbol : text) {
+            out.push_back(symbol < 0x80 ? static_cast<char>(symbol) : '?');
+        }
+        return out;
+    }
+    return {};
+}
+#else
+[[nodiscard]] std::string readScanProfilePath() {
+    const char* value = std::getenv("MRPROPER_SCAN_PROFILE");
+    return value != nullptr ? std::string(value) : std::string();
+}
+#endif
+
+[[nodiscard]] const std::string& profilePath() {
+    // Один раз на процесс: переменная окружения в горячем коде не читается.
+    static const std::string path = readScanProfilePath();
+    return path;
+}
+
+void appendProfileLine(std::string_view line) {
+    const std::string& path = profilePath();
+    if (path.empty()) return;
+    static std::mutex writeMutex;
+    const std::lock_guard<std::mutex> guard(writeMutex);
+    std::FILE* file = nullptr;
+    // fopen помечен в MSVC как небезопасный (C4996 при /W4 /WX), fopen_s есть
+    // только у CRT от Microsoft — как в core/log.cpp и platform/vfs_walk.cpp.
+    if (::fopen_s(&file, (path + ".collect").c_str(), "ab") != 0 || file == nullptr) return;
+    std::fwrite(line.data(), 1, line.size(), file);
+    std::fclose(file);
+}
+
+// Замена разделителей и управляющих символов: путь правила попадает в файл
+// профиля построчно, и непечатаемый символ разорвал бы разбор колонок.
+std::string flat(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    for (const char symbol : text) {
+        out.push_back(symbol >= ' ' && symbol != '"' ? symbol : '?');
+    }
+    return out;
+}
+
+class StageClock {
+public:
+    explicit StageClock(std::uint64_t& sink) noexcept
+        : sink_(&sink), started_(std::chrono::steady_clock::now()) {}
+    ~StageClock() {
+        *sink_ += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started_).count());
+    }
+    StageClock(const StageClock&) = delete;
+    StageClock& operator=(const StageClock&) = delete;
+
+private:
+    std::uint64_t* sink_;
+    std::chrono::steady_clock::time_point started_;
+};
 
 bool isSeparator(char c) noexcept { return c == '/' || c == '\\'; }
 
@@ -289,7 +404,48 @@ struct RootTally {
     std::uint64_t sizeUnknown{};
     std::uint64_t outsideRoot{};
     std::uint64_t leafFiltered{};
+
+    // Каталоги, содержимое которых заведомо не проходит фильтр листьев, и
+    // поэтому НЕ обойдено (см. RootScan::visit). Это не «сколько файлов мы
+    // отбросили», а «сколько поддеревьев мы не стали даже читать» — и именно
+    // поэтому счётчик попадает в filteredAnything(): не обойденное поддерево
+    // означает «внутри корня есть то, что правило не берёт», то есть корень
+    // удалять целиком нельзя. Исчезновение этого счётчика сделало бы
+    // rootDeleteAllowed истинным там, где раньше он был ложным из-за
+    // leafFiltered, а leafFiltered при отказе от спуска перестаёт расти.
+    std::uint64_t leafSkippedDirs{};
 };
+
+// Накопители времени по этапам сбора. thread_local, а не общие для процесса:
+// collectCandidates зовётся из пула потоков по одному разу на категорию, и
+// общий счётчик смешал бы время пятнадцати параллельных задач в одну цифру,
+// из которой нельзя понять, кто сколько занял. Побочный эффект полезен: снимок
+// «в начале — в конце» внутри одного collectCandidates даёт время ИМЕННО этой
+// категории, без вычитания чужого потока.
+struct CollectProfile {
+    std::uint64_t expandNs{};    // разворот локаторов (listDirectory внутри)
+    std::uint64_t statNs{};      // statPath на каждый корень
+    std::uint64_t walkNs{};      // обход дерева корня
+    std::uint64_t finalizeNs{};  // сборка кандидата, манифеста и reasons
+    std::uint64_t excludedNs{};  // проверки исключений
+    std::uint64_t excludedCalls{};
+};
+
+thread_local CollectProfile t_collectProfile;
+
+// Снимок накопителей: разница между двумя снимками — время одной категории.
+[[nodiscard]] CollectProfile profileSnapshot() {
+    return CollectProfile{t_collectProfile.expandNs,   t_collectProfile.statNs,
+                          t_collectProfile.walkNs,    t_collectProfile.finalizeNs,
+                          t_collectProfile.excludedNs, t_collectProfile.excludedCalls};
+}
+
+// Время между двумя снимками по каждому полю.
+[[nodiscard]] CollectProfile profileDelta(const CollectProfile& before, const CollectProfile& after) {
+    return CollectProfile{after.expandNs - before.expandNs,    after.statNs - before.statNs,
+                          after.walkNs - before.walkNs,        after.finalizeNs - before.finalizeNs,
+                          after.excludedNs - before.excludedNs, after.excludedCalls - before.excludedCalls};
+}
 
 // Контекст обхода одного корня: правило (исключения), корень (граница), фильтр
 // листьев и возрастной порог. Вынесен в структуру, потому что посетитель
@@ -306,6 +462,27 @@ struct RootScan {
     bool includeReparse{};
     CollectStats* stats{};
     RootTally tally;
+
+    // Проверка исключений: у правила с пустым списком исключений вызывать
+    // core::Rule::excluded бессмысленно — он всё равно копирует путь
+    // (normalizeSeparators) ради цикла по пустому вектору. Счётчики видят,
+    // сколько таких вызовов было на самом деле (docs/scan-performance.md).
+    //
+    // Пустой список — не «микрооптимизация ради вкуса»: на дереве в сотни
+    // тысяч файлов это сто тысяч лишних строковых копий, и на прогоне,
+    // который идёт минутами, это уже не ноль.
+    bool ruleHasExcludes{};
+    std::uint64_t excludedCalls{};
+    std::uint64_t excludedNs{};
+
+    [[nodiscard]] bool isExcluded(const std::string& path) {
+        if (!ruleHasExcludes) return false;
+        ++excludedCalls;
+        t_collectProfile.excludedCalls += 1;
+        const StageClock own(excludedNs);
+        const StageClock task(t_collectProfile.excludedNs);
+        return rule->excluded(path);
+    }
 
     // Список файлов, которые правило разрешило удалить (docs/review-02.md F-01).
     // Заполняется только когда правило хоть что-то отсекает: если отсекать
@@ -397,7 +574,7 @@ struct RootScan {
             ++tally.outsideRoot;
             return entry.isDirectory ? VisitStep::Skip : VisitStep::Continue;
         }
-        if (rule->excluded(entry.path)) {
+        if (isExcluded(entry.path)) {
             // Исключение выигрывает у совпадения всегда (docs/rules-authoring.md §6.4),
             // а каталог под исключением не обходится вовсе: «...\Service Worker\
             // ScriptCache» — это сотни мегабайт, которые нельзя даже измерить.
@@ -410,7 +587,24 @@ struct RootScan {
             ++tally.excludedFiles;
             return VisitStep::Continue;
         }
-        if (entry.isDirectory) return VisitStep::Continue;
+        if (entry.isDirectory) {
+            // Фильтр листьев действует ТОЛЬКО на верхнем уровне корня, поэтому
+            // спуск ниже первого уровня не может дать ни одного кандидата:
+            // leafAllows для вложенного элемента всегда ложь (directChildName
+            // требует, чтобы путь был прямой ребёнок корня). Спускаться —
+            // значит читать дерево впустую.
+            //
+            // Именно это и стоило минуты: «%USERPROFILE%\*.*» даёт корень
+            // C:\Users\<пользователь> с фильтром «*.*», и обход уходил во
+            // ВСЮ домашнюю папку (677 766 элементов, 87 742 каталога,
+            // 117 640 мс на прогоне docs/scan-performance.md), чтобы найти
+            // 25 файлов верхнего уровня.
+            if (!leafPattern.empty()) {
+                ++tally.leafSkippedDirs;
+                return VisitStep::Skip;
+            }
+            return VisitStep::Continue;
+        }
         if (!leafAllows(entry)) {
             ++tally.leafFiltered;
             return VisitStep::Continue;
@@ -447,7 +641,7 @@ struct RootScan {
     [[nodiscard]] bool filteredAnything() const {
         return tally.tooYoung != 0 || tally.unknownAge != 0 || tally.tooSmall != 0 || tally.excludedFiles != 0 ||
                tally.prunedDirs != 0 || tally.reparse != 0 || tally.outsideRoot != 0 || tally.leafFiltered != 0 ||
-               allowedTruncated;
+               tally.leafSkippedDirs != 0 || allowedTruncated;
     }
 };
 
@@ -704,6 +898,10 @@ std::vector<LocatedRoot> expandRuleLocator(const core::Rule& rule, FileSystemPro
 
 CollectResult collectCandidates(const core::RuleSet& rules, FileSystemProbe& probe,
                                 const CollectOptions& options, std::stop_token token) {
+    const CollectProfile taskProfile = profileSnapshot();
+    // Имя категории для строки профиля: набор правит на категорию, и по одному
+    // прогону на категорию видно, кто из них стоил минуты.
+    const std::string taskName = rules.rules.empty() ? std::string("(empty)") : rules.rules.front().category;
     CollectResult result;
     CollectStats& stats = result.stats;
     stats.rulesTotal = static_cast<std::uint64_t>(rules.rules.size());
@@ -763,7 +961,12 @@ CollectResult collectCandidates(const core::RuleSet& rules, FileSystemProbe& pro
         }
 
         bool rootsTruncated = false;
-        const std::vector<LocatedRoot> roots = expandRuleLocator(rule, probe, options.limits, token, &rootsTruncated);
+        const std::uint64_t expandNsBefore = t_collectProfile.expandNs;
+        const std::vector<LocatedRoot> roots = [&] {
+            const StageClock clock(t_collectProfile.expandNs);
+            return expandRuleLocator(rule, probe, options.limits, token, &rootsTruncated);
+        }();
+        const std::uint64_t expandNs = t_collectProfile.expandNs - expandNsBefore;
         if (rootsTruncated) {
             // Предел сработал: показываем то, что нашли, но говорим, что список
             // неполон (SPEC §8 Этап 2, отчёт FR-8). Молчаливый неполный список
@@ -794,7 +997,13 @@ CollectResult collectCandidates(const core::RuleSet& rules, FileSystemProbe& pro
             }
 
             ProbeEntry rootEntry;
-            if (!probe.statPath(root.path, token, rootEntry)) {
+            bool rootStatOk = false;
+            const std::uint64_t statNsBefore = t_collectProfile.statNs;
+            {
+                const StageClock clock(t_collectProfile.statNs);
+                rootStatOk = probe.statPath(root.path, token, rootEntry);
+            }
+            if (!rootStatOk) {
                 ++stats.probeErrors;
                 addNote(stats, options.maxNotes, "правило " + rule.id + ": корень не читается — " + root.path);
                 continue;
@@ -839,6 +1048,7 @@ CollectResult collectCandidates(const core::RuleSet& rules, FileSystemProbe& pro
 
             RootScan scan;
             scan.rule = &rule;
+            scan.ruleHasExcludes = !rule.resolvedExcludes.empty();
             scan.root = rootPath;
             scan.leafPattern = root.leafPattern;
             scan.ageFilter = minAgeDays > 0;
@@ -856,9 +1066,13 @@ CollectResult collectCandidates(const core::RuleSet& rules, FileSystemProbe& pro
                 scan.allowed.reserve(std::min<std::size_t>(options.maxAllowedPaths, 4096));
             }
 
+            const std::uint64_t walkNsBefore = t_collectProfile.walkNs;
+            const std::uint64_t finalizeNsBefore = t_collectProfile.finalizeNs;
             if (rootEntry.isDirectory) {
-                const bool completed =
-                    probe.walk(rootPath, token, [&scan](const ProbeEntry& entry) { return scan.visit(entry); });
+                const bool completed = [&] {
+                    const StageClock clock(t_collectProfile.walkNs);
+                    return probe.walk(rootPath, token, [&scan](const ProbeEntry& entry) { return scan.visit(entry); });
+                }();
                 if (!completed) {
                     result.canceled = true;
                     ++stats.canceled;
@@ -946,6 +1160,11 @@ CollectResult collectCandidates(const core::RuleSet& rules, FileSystemProbe& pro
                 candidate.reasons.push_back("не подошло под фильтр листьев и в удаление не входит файлов: " +
                                             std::to_string(scan.tally.leafFiltered));
             }
+            if (scan.tally.leafSkippedDirs > 0) {
+                candidate.reasons.push_back("поддеревьев не обойдено: фильтр листьев берёт только верхний уровень, "
+                                            "каталогов пропущено: " +
+                                            std::to_string(scan.tally.leafSkippedDirs));
+            }
             if (scan.tally.reparse > 0) {
                 candidate.reasons.push_back("пропущено ссылок: " + std::to_string(scan.tally.reparse) +
                                             " (в удаление не входят)");
@@ -967,13 +1186,32 @@ CollectResult collectCandidates(const core::RuleSet& rules, FileSystemProbe& pro
                 candidate.reasons.push_back("часть элементов вне корня правила не учтена");
             }
 
-            if (options.finalize) {
-                options.finalize(candidate);
+            {
+                const StageClock clock(t_collectProfile.finalizeNs);
+                if (options.finalize) {
+                    options.finalize(candidate);
+                }
+                ++stats.candidatesEmitted;
+                result.candidates.push_back(std::move(candidate));
+                result.manifests.push_back(std::move(manifest));
             }
 
-            ++stats.candidatesEmitted;
-            result.candidates.push_back(std::move(candidate));
-            result.manifests.push_back(std::move(manifest));
+            if (!profilePath().empty()) {
+                std::string line = "ROOT";
+                line += " task=\"" + flat(taskName) + "\"";
+                line += " rule=\"" + flat(rule.id) + "\"";
+                line += " root=\"" + flat(rootPath) + "\"";
+                line += " expandMs=" + std::to_string(expandNs / 1000000ull);
+                line += " statMs=" + std::to_string((t_collectProfile.statNs - statNsBefore) / 1000000ull);
+                line += " walkMs=" + std::to_string((t_collectProfile.walkNs - walkNsBefore) / 1000000ull);
+                line += " finalizeMs=" + std::to_string((t_collectProfile.finalizeNs - finalizeNsBefore) / 1000000ull);
+                line += " excludedMs=" + std::to_string(scan.excludedNs / 1000000ull);
+                line += " excludedCalls=" + std::to_string(scan.excludedCalls);
+                line += " files=" + std::to_string(scan.tally.files);
+                line += " roots=" + std::to_string(roots.size());
+                line += "\n";
+                appendProfileLine(line);
+            }
         }
 
         if (result.canceled) break;
@@ -991,6 +1229,30 @@ CollectResult collectCandidates(const core::RuleSet& rules, FileSystemProbe& pro
                                                      stats.rulesSkippedEmptyLocator + stats.rulesSkippedNoClock));
     fields.push_back(core::logField("canceled", result.canceled));
     core::logInfo("scan.collect", "сбор кандидатов завершён", std::move(fields));
+
+    if (!profilePath().empty()) {
+        const CollectProfile delta = profileDelta(taskProfile, profileSnapshot());
+        std::string line = "TASK";
+        line += " task=\"" + flat(taskName) + "\"";
+        line += " totalMs=" + std::to_string(delta.expandNs / 1000000ull + delta.statNs / 1000000ull +
+                                              delta.walkNs / 1000000ull + delta.finalizeNs / 1000000ull);
+        line += " expandMs=" + std::to_string(delta.expandNs / 1000000ull);
+        line += " statMs=" + std::to_string(delta.statNs / 1000000ull);
+        line += " walkMs=" + std::to_string(delta.walkNs / 1000000ull);
+        line += " finalizeMs=" + std::to_string(delta.finalizeNs / 1000000ull);
+        line += " excludedMs=" + std::to_string(delta.excludedNs / 1000000ull);
+        line += " excludedCalls=" + std::to_string(delta.excludedCalls);
+        line += " rules=" + std::to_string(stats.rulesTotal);
+        line += " roots=" + std::to_string(stats.rootsFound);
+        line += " candidates=" + std::to_string(stats.candidatesEmitted);
+        line += " filesSeen=" + std::to_string(stats.filesSeen);
+        line += " prunedDirs=" + std::to_string(stats.directoriesPruned);
+        line += " pathsListed=" + std::to_string(stats.pathsListed);
+        line += " tooYoung=" + std::to_string(stats.filesTooYoung);
+        line += " rootsTruncated=" + std::to_string(stats.rootsTruncated);
+        line += "\n";
+        appendProfileLine(line);
+    }
 
     return result;
 }

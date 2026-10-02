@@ -112,7 +112,19 @@ std::int64_t nowUnixSeconds() {
         .count();
 }
 
-std::string countText(std::size_t value) { return formatCount(static_cast<std::uint64_t>(value)); }
+// D-70: число БЕЗ существительного. Здесь стоял formatCount(...) — это
+// «{0} файл|{0} файла|{0} файлов» (locale.cpp, kCleanupFiles), то есть слово
+// «файлов» печаталось для ЛЮБОГО счёта: сводка настроек писала «Правил: 138
+// файлов» о ста тридцати восьми ПРАВИЛАХ, а статистика — «Правил в наборе:
+// 138 файлов». Подписи рядом уже называют предмет («Правил:», «включено:»,
+// «Правил в наборе»), поэтому в значении существительное не нужно: строка
+// грамматична на любом счёте и на обоих языках, где в шаблоне тоже стоит
+// «Rules: {0}». Если существительное всё-таки нужно (его нет в подписи),
+// формат берётся из каталога строк с правилом множественного числа:
+// core::trPlural("cleanup.hint.ruleCount", n) → «138 правил» / «2 правила».
+std::string plainCount(std::size_t value) {
+    return core::formatInteger(static_cast<std::uint64_t>(value), numberFormat());
+}
 
 // Дата в формате локали языка интерфейса (§5 «даты/числа через
 // GetLocaleInfoEx»). В UI-потоке, без системных вызовов в горячем цикле.
@@ -608,7 +620,7 @@ void SettingsViewModel::forgetOverrides() {
     impl_->overrides.clear();
     impl_->armedRisky.clear();
     impl_->rebuild();
-    impl_->lastAction = text("settings.overridesForgotten", core::StringArgs{countText(dropped)});
+    impl_->lastAction = text("settings.overridesForgotten", core::StringArgs{plainCount(dropped)});
 }
 
 void SettingsViewModel::setFilter(std::string_view filter) {
@@ -775,7 +787,7 @@ bool SettingsViewModel::requestRestoreEmbedded(std::int64_t nowUnixSeconds) {
     impl_->armedRisky.clear();
     impl_->status = core::resetToEmbeddedSet(impl_->status, nowUnixSeconds);
     impl_->rebuild();
-    impl_->lastAction = text("settings.restoreDone", core::StringArgs{countText(dropped)});
+    impl_->lastAction = text("settings.restoreDone", core::StringArgs{plainCount(dropped)});
     return true;
 }
 
@@ -801,7 +813,7 @@ std::string SettingsViewModel::lastCheckedText() const {
 
 std::string SettingsViewModel::summaryText() const {
     return text("settings.rulesSummary",
-                core::StringArgs{countText(ruleCount()), countText(enabledCount()), countText(overrideCount())});
+                core::StringArgs{plainCount(ruleCount()), plainCount(enabledCount()), plainCount(overrideCount())});
 }
 
 std::string SettingsViewModel::statusText() const {
@@ -921,12 +933,12 @@ std::string SettingsViewModel::statisticsText() const {
                                                        : impl_->status.lastResult));
     lines.push_back(text("settings.statAutoUpdate") + ": " + (impl_->status.autoUpdateEnabled ? "1" : "0"));
     lines.push_back(text("settings.statLanguage") + ": " + core::languageTag(impl_->language));
-    lines.push_back(text("settings.statRules") + ": " + countText(ruleCount()));
-    lines.push_back(text("settings.statEnabled") + ": " + countText(enabledCount()));
+    lines.push_back(text("settings.statRules") + ": " + plainCount(ruleCount()));
+    lines.push_back(text("settings.statEnabled") + ": " + plainCount(enabledCount()));
     // Именно все решения пользователя, а не число по видимым строкам: статистика
     // описывает установку целиком, а фильтр ниже выгружается отдельной строкой,
     // и читатель видит, по чему считали остальные цифры.
-    lines.push_back(text("settings.statChanged") + ": " + countText(impl_->overrides.size()));
+    lines.push_back(text("settings.statChanged") + ": " + plainCount(impl_->overrides.size()));
     lines.push_back(text("settings.statFilter") + ": " +
                     (impl_->filter.empty() ? std::string(tr(StringId::kCommonNone)) : impl_->filter));
     lines.push_back(text("settings.statSelected") + ": " +
@@ -1595,6 +1607,32 @@ struct ViewState {
         }
     }
 
+    // Ширина столбца — по ИЗМЕРЕННОМУ заголовку, а не по зашитым 110 px.
+    // D-71: «Уровень риска» в 110 px не помещался, и заголовок третьего столбца
+    // уезжал в многоточие («Уровень ри…») — а это как раз тот столбец, по
+    // которому видно риск правила. Заголовок рисует панель столбцов СВОИМ
+    // шрифтом (WM_GETFONT у неё), и измерять его шрифтом окна значило бы
+    // ошибиться на разнице кеглей.
+    [[nodiscard]] int headerTextWidth(int column) const {
+        if (list == nullptr) return 0;
+        const HWND header = reinterpret_cast<HWND>(::SendMessageW(list, LVM_GETHEADER, 0, 0));
+        if (header == nullptr) return 0;
+        const std::array<std::string_view, kColumnCount> titles{"settings.ruleColumn",
+                                                               "settings.categoryColumn",
+                                                               "settings.safetyColumn"};
+        if (column < 0 || column >= static_cast<int>(titles.size())) return 0;
+        const std::wstring caption = toWide(text(titles[static_cast<std::size_t>(column)]));
+        HDC dc = ::GetDC(header);
+        if (dc == nullptr) return 0;
+        const HFONT font = reinterpret_cast<HFONT>(::SendMessageW(header, WM_GETFONT, 0, 0));
+        const HGDIOBJ oldFont = font != nullptr ? ::SelectObject(dc, font) : nullptr;
+        SIZE measured{};
+        ::GetTextExtentPoint32W(dc, caption.c_str(), static_cast<int>(caption.size()), &measured);
+        if (oldFont != nullptr) ::SelectObject(dc, oldFont);
+        ::ReleaseDC(header, dc);
+        return measured.cx;
+    }
+
     void syncColumns() {
         if (list == nullptr) return;
         const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
@@ -1632,15 +1670,31 @@ struct ViewState {
             columnsLanguageRevision = languageRevision;
             columnsReady = true;
         }
+        // Бюджет ширины — клиентская область ЗАГОЛОВКА, а не GetClientRect
+        // списка: у списка с вертикальной полосой прокрутки (138 правил —
+        // полоса есть всегда) GetClientRect включает полосу в себя, сумма ширин
+        // столбцов уезжала за правый край на её ширину, и правый столбец
+        // обрезался. Панель столбцов как раз на это место и рисует.
         RECT client{};
-        if (::GetClientRect(list, &client) == FALSE) return;
+        const HWND header = reinterpret_cast<HWND>(::SendMessageW(list, LVM_GETHEADER, 0, 0));
+        const bool headerRectOk = header != nullptr && ::GetClientRect(header, &client) != FALSE;
+        if (!headerRectOk && ::GetClientRect(list, &client) == FALSE) return;
         const int total = client.right - client.left;
         // Места под значок риска ( рисуется NM_CUSTOMDRAW у правого края строки)
         // резервируем явно: иначе иконка ложилась бы на подпись уровня.
         const int iconSpace = scale.dip(20.0);
-        const int category = std::max(60, scale.dip(120.0));
-        const int safety = std::max(70, scale.dip(110.0));
-        ListView_SetColumnWidth(list, kColumnRule, std::max(60, total - category - safety - iconSpace));
+        // Отступы панели столбцов плюс зазор до текста: заголовок должен
+        // помещаться целиком, иначе он обрежется многоточием.
+        const int headerGap = std::max(8, scale.dip(12.0));
+        // Порядок убывания жёсткости: третий столбец и значок риска не
+        // ужимаются никогда (иначе «Уровень риска» снова уедет в многоточие и
+        // значок ляжет на подпись), дальше — категория, и только потом правило.
+        const int safety = std::max(std::max(70, scale.dip(110.0)), headerTextWidth(kColumnSafety) + headerGap);
+        const int wanted = std::max(std::max(60, scale.dip(120.0)), headerTextWidth(kColumnCategory) + headerGap);
+        const int rest = std::max(0, total - safety - iconSpace);
+        const int category = std::min(wanted, std::max(0, rest - std::min(rest, scale.dip(80.0))));
+        const int rule = std::max(0, rest - category);
+        ListView_SetColumnWidth(list, kColumnRule, rule);
         ListView_SetColumnWidth(list, kColumnCategory, category);
         ListView_SetColumnWidth(list, kColumnSafety, safety);
     }
@@ -1757,9 +1811,14 @@ struct ViewState {
         const SettingsRect listRect = current.listRect();
         const bool empty = model.ruleCount() == 0;
         const int pad = std::max(2, dipToPx(8.0, dpi));
+        // Прямоугольник ПОСИТЬЮЮ (x, y, ширина, высота), а не «левый-верхний,
+        // правый-нижний», как в RECT: третьим полем здесь стояло listRect.x +
+        // listRect.width, то есть при x=8 и ширине 700 подпись получала ширину
+        // 708 и вылезала за правый край окна содержимого — ровно тот отказ,
+        // который ловит обход страниц.
         const SettingsRect box{listRect.x + pad, listRect.y + pad,
-                               std::max(listRect.x + pad, listRect.x + listRect.width - pad),
-                               std::max(listRect.y + pad, listRect.y + listRect.height - pad)};
+                               std::max(0, listRect.width - 2 * pad),
+                               std::max(0, listRect.height - 2 * pad)};
         place(hint, empty ? box : SettingsRect{}, empty);
         if (empty) ::SetWindowPos(hint, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }

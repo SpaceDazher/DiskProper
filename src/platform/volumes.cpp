@@ -146,7 +146,7 @@ std::wstring_view trimTrailingSeparators(std::wstring_view text) noexcept {
     return text;
 }
 
-// Путь тома в том виде, в каком его ждут FindFirstVolumeMountPointW и
+// Путь тома в том виде, в каком его ждут GetVolumePathNamesForVolumeNameW и
 // GetVolumeInformationW: с завершающим разделителем.
 std::wstring withTrailingSeparator(std::wstring_view text) {
     if (text.empty()) return {};
@@ -437,41 +437,73 @@ struct MountPoints {
     std::uint32_t error{0};
 };
 
+// Точки монтирования тома: GetVolumePathNamesForVolumeNameW.
+//
+// Именно этот вызов, а не FindFirstVolumeMountPointW. Измерено на этой машине
+// (Windows 11 22631, с повышенными правами) на томе
+// "\\?\Volume{a07a2c80-863a-45e8-83e8-fb56de919bd1}\", смонтированном на C:::
+//
+//   FindFirstVolumeMountPointW("\\?\Volume{GUID}\")       -> INVALID_HANDLE_VALUE, 18 (ERROR_NO_MORE_FILES)
+//   FindFirstVolumeMountPointW("C:\")                        -> INVALID_HANDLE_VALUE, 18
+//   FindFirstVolumeMountPointW("\\?\Volume{GUID}")            -> INVALID_HANDLE_VALUE, 123
+//   GetVolumePathNamesForVolumeNameW("\\?\Volume{GUID}\")     -> TRUE, "C:\"
+//   GetVolumePathNamesForVolumeNameW("\\?\Volume{GUID}")      -> FALSE, 123
+//
+// Расхождение в семантике, а не в правах: FindFirstVolumeMountPointW
+// перечисляет точки монтирования ВНУТРИ корня, а не «на что смонтирован сам
+// том». У тома с единственной буквой внутри себя ничего нет, поэтому честный
+// ответ — «дальше нет», и старая ветка кода тихо отдавала пустой список.
+// Из-за этого у каждого тома было 0 точек монтирования, в карте висели четыре
+// «volume.no_mount_point», а `disks --strict` завершался кодом 4.
+//
+// Формат ответа — пути, разделённые NUL, с завершающим пустым элементом
+// ("C:\\0D:\\0\\0"). Завершающий разделитель в ИМЕНИ тома обязателен (без
+// него 123), поэтому путь приводится к виду с одним разделителем перед вызовом.
 MountPoints readMountPoints(const std::wstring& volumePath) noexcept {
     MountPoints result;
-    Handle find;
-    std::wstring buffer(kMountPointChars, L'\0');
-    // ВНИМАНИЕ, форма в SDK: FindFirstVolumeMountPointW возвращает HANDLE
-    // (INVALID_HANDLE_VALUE при отказе) и принимает ТРИ аргумента — ручку
-    // поиска он не отдаёт, в отличие от FindFirstVolumeW. MSDN описывает
-    // возвращаемый тип как BOOL; на x64 оба варианта разбираются одинаково
-    // (результат в RAX), а вот проверка «ненулевой результат» одинаково верна
-    // для обоих, поэтому она и написана такой.
-    find.reset(::FindFirstVolumeMountPointW(volumePath.c_str(), buffer.data(),
-                                            static_cast<DWORD>(buffer.size())));
-    if (!find.valid()) {
-        const DWORD code = ::GetLastError();
-        if (code == ERROR_NO_MORE_FILES) {
-            result.completed = true;
-            return result;
-        }
-        result.error = code;
+    if (volumePath.empty()) {
+        result.error = ERROR_INVALID_NAME;
         return result;
     }
 
+    // Ровно один завершающий разделитель: без него имя тома не принимается
+    // (измерено: 123), а с двумя открывается уже не том.
+    std::wstring volumeName = volumePath;
+    while (volumeName.size() > 1 && volumeName.back() == L'\\') {
+        volumeName.pop_back();
+    }
+    if (volumeName.size() != 2 || volumeName[1] != L':') {
+        // «C:» без разделителя — это «каталог диска C», а не корень тома.
+        volumeName.push_back(L'\\');
+    }
+
+    std::wstring buffer(kMountPointChars, L'\0');
     for (;;) {
-        const std::wstring point = normalizeMountPoint(buffer.c_str());
-        if (!point.empty()) result.items.push_back(core::toUtf8(point));
-        if (::FindNextVolumeMountPointW(find.get(), buffer.data(), static_cast<DWORD>(buffer.size()))) continue;
-        const DWORD code = ::GetLastError();
-        if (code == ERROR_MORE_DATA && buffer.size() < kMaxNameChars) {
-            buffer.resize(std::min(buffer.size() * 2, kMaxNameChars));
-            continue;
-        }
-        if (code == ERROR_NO_MORE_FILES) {
+        DWORD needed = 0;
+        const BOOL ok = ::GetVolumePathNamesForVolumeNameW(volumeName.c_str(), buffer.data(),
+                                                           static_cast<DWORD>(buffer.size()), &needed);
+        if (ok) {
+            const wchar_t* const first = buffer.data();
+            const wchar_t* cursor = first;
+            const wchar_t* const limit = first + buffer.size();
+            while (cursor < limit && *cursor != L'\0') {
+                std::wstring entry(cursor);
+                const std::wstring point = normalizeMountPoint(entry);
+                if (!point.empty()) result.items.push_back(core::toUtf8(point));
+                cursor += entry.size() + 1;
+            }
             result.completed = true;
             return result;
         }
+
+        const DWORD code = ::GetLastError();
+        if (code == ERROR_MORE_DATA && buffer.size() < kMaxNameChars) {
+            const std::size_t wanted = (needed > buffer.size()) ? needed : buffer.size() * 2;
+            buffer.assign(std::min(wanted, kMaxNameChars), L'\0');
+            continue;
+        }
+        // Имя тома в неприемлемом виде (например, не "\\?\Volume{...}\"): это
+        // не «точек нет», а отказ — различать обязательно (FR-1, §5).
         result.error = code;
         return result;
     }
@@ -482,10 +514,28 @@ MountPoints readMountPoints(const std::wstring& volumePath) noexcept {
 // ---------------------------------------------------------------------------
 
 void queryWide(std::string_view pathUtf8, const std::wstring& widePath, Probe& probe) noexcept {
-    const std::wstring win32Path = withTrailingSeparator(widePath);
+    // Два пути из одного источника, и разница между ними не косметическая.
+    // Измерено на этой машине (NVMe, 4 тома, Windows 11 22631):
+    //
+    //   CreateFileW("\\?\Volume{GUID}")       -> OK;  EXTENTS -> NumberOfDiskExtents=1 DiskNumber=0
+    //   CreateFileW("\\?\Volume{GUID}\")      -> OK;  EXTENTS -> ERROR_INVALID_PARAMETER (87)
+    //   CreateFileW("\\.\C:")                -> OK;  EXTENTS -> NumberOfDiskExtents=1 DiskNumber=0
+    //   CreateFileW("\\.\C:\")               -> OK;  EXTENTS -> ERROR_INVALID_PARAMETER (87)
+    //
+    // Разделитель под «\\?\» и после буквы не нормализуется: хендл открывается
+    // не на том, а «внутрь» него, и запрос уровня тома на таком хендле не
+    // отвечает. Именно отсюда был 0x00000057 (ERROR_INVALID_PARAMETER) в
+    // «volume_list: … (mountPoints|open|extents)» и нулевой extentCount.
+    //
+    // С завершающим разделителем остаётся ровно то, где он обязателен по
+    // документации: FindFirstVolumeMountPointW требует корень с «\», и
+    // GetVolumeInformationW тоже. Проверено: GetDiskFreeSpaceExW на обоих
+    // вариантах отвечает одинаково (на «\\?\Volume{GUID}\» без прав — total=126833651712).
+    const std::wstring rootPath = withTrailingSeparator(widePath);   // для точек монтирования и ФС
+    const std::wstring devicePath = std::wstring(trimTrailingSeparators(widePath));  // для CreateFileW
 
     // --- Точки монтирования ------------------------------------------------
-    const MountPoints mounts = readMountPoints(win32Path);
+    const MountPoints mounts = readMountPoints(rootPath);
     if (mounts.completed) {
         probe.volume.mountPoints = mounts.items;
         probe.mountPointsKnown = true;
@@ -497,16 +547,19 @@ void queryWide(std::string_view pathUtf8, const std::wstring& widePath, Probe& p
     }
 
     // --- Метка, ФС, флаги --------------------------------------------------
-    Handle reader = openVolume(win32Path, kReadAccess);
-    if (!reader.valid()) {
-        probe.errors |= Error::Open;
-        probe.lastError = ::GetLastError();
-    }
+    // Читающий хендл — ускорение, а не условие: queryInformation умеет и по
+    // пути (GetVolumeInformationW), и на этой машине без повышения прав
+    // GENERIC_READ на том не даётся (ERROR_ACCESS_DENIED, 5), хотя метка и ФС
+    // читаются. Поэтому отказ здесь — не пропуск данных, а неудачный путь
+    // к тем же данным: отмечать Error::Open можно только когда не открылся
+    // НИ ОДИН хендл, то есть когда действительно нечем спросить extent'ы.
+    Handle reader = openVolume(devicePath, kReadAccess);
+    const DWORD readerError = reader.valid() ? ERROR_SUCCESS : ::GetLastError();
 
     VolumeInfo info;
     // Не const: ветка «файловой системы нет» превращает отказ в успех, и
     // записывать это нужно здесь же, а не в прокси между вызовами.
-    bool informationKnown = queryInformation(win32Path, reader.get(), info);
+    bool informationKnown = queryInformation(rootPath, reader.get(), info);
     if (!informationKnown) {
         const DWORD code = ::GetLastError();
         if (code == ERROR_UNRECOGNIZED_VOLUME) {
@@ -533,17 +586,21 @@ void queryWide(std::string_view pathUtf8, const std::wstring& widePath, Probe& p
     // Запрос идёт на хендле с нулевым доступом: для IOCTL тома прав на том не
     // нужно, а открыть его на чтение может быть нельзя. Есть только такой
     // хендл — берём читающий.
-    Handle opener = reader.valid() ? Handle{} : openVolume(win32Path, kQueryAccess);
+    Handle opener = reader.valid() ? Handle{} : openVolume(devicePath, kQueryAccess);
     HANDLE device = INVALID_HANDLE_VALUE;
     if (opener.valid()) {
         device = opener.get();
     } else if (reader.valid()) {
         device = reader.get();
     } else {
-        const DWORD code = ::GetLastError();
+        // Ни читающего хендла, ни хендла с нулевым доступом: extent'ы спросить
+        // нечем, и это уже настоящий пробел в данных (в отличие от отказа
+        // открыться на чтение выше). Код от дескриптора важнее кода от
+        // читающего хендла: он отвечает на вопрос «почему нечем спросить».
+        const DWORD code = reader.valid() ? ERROR_SUCCESS : readerError;
         probe.errors |= Error::Open;
-        probe.lastError = code;
-        core::logWarn("volumes.open", "не удалось открыть том для запроса extent'ов", probeFields(pathUtf8, code));
+        probe.lastError = code != ERROR_SUCCESS ? code : ::GetLastError();
+        core::logWarn("volumes.open", "не удалось открыть том для запроса extent'ов", probeFields(pathUtf8, probe.lastError));
     }
 
     if (device != INVALID_HANDLE_VALUE) {

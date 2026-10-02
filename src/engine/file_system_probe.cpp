@@ -18,7 +18,10 @@
 #include <windows.h>  // NOLINT(bugprone-suspicious-include) — Win32-мост, единственное законное место
 
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <exception>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -98,6 +101,21 @@ struct ProbeCounters {
     std::atomic<std::uint64_t> rootRefused{0};
     std::atomic<std::uint64_t> elementErrors{0};
     std::atomic<std::uint64_t> pathRefused{0};
+    // Время по этапам. Те же атомики с relaxed: это счётчики, а не синхронизация
+    // (см. абзац выше про ProbeCounters).
+    std::atomic<std::uint64_t> allocCalls{0};
+    std::atomic<std::uint64_t> allocNs{0};
+    std::atomic<std::uint64_t> convertCalls{0};
+    std::atomic<std::uint64_t> convertNs{0};
+    std::atomic<std::uint64_t> convertAllocNs{0};
+    std::atomic<std::uint64_t> statCalls{0};
+    std::atomic<std::uint64_t> statNs{0};
+    std::atomic<std::uint64_t> listCalls{0};
+    std::atomic<std::uint64_t> listNs{0};
+    std::atomic<std::uint64_t> walkCalls{0};
+    std::atomic<std::uint64_t> walkNs{0};
+    std::atomic<std::uint64_t> visitCalls{0};
+    std::atomic<std::uint64_t> visitNs{0};
 };
 
 ProbeCounters g_counters;
@@ -105,6 +123,26 @@ ProbeCounters g_counters;
 void addRelaxed(std::atomic<std::uint64_t>& counter, std::uint64_t by = 1) noexcept {
     counter.fetch_add(by, std::memory_order_relaxed);
 }
+
+// Накопление интервала в счётчик. Два чтения steady_clock на элемент обхода —
+// это десятки наносекунд против миллисекунд, которые здесь считают: насытка
+// получается точной, а накладные расходы не видны на фоне измеряемого.
+class StageClock {
+public:
+    explicit StageClock(std::atomic<std::uint64_t>& sink) noexcept
+        : sink_(&sink), started_(std::chrono::steady_clock::now()) {}
+    ~StageClock() {
+        const std::chrono::nanoseconds elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started_);
+        sink_->fetch_add(static_cast<std::uint64_t>(elapsed.count()), std::memory_order_relaxed);
+    }
+    StageClock(const StageClock&) = delete;
+    StageClock& operator=(const StageClock&) = delete;
+
+private:
+    std::atomic<std::uint64_t>* sink_;
+    std::chrono::steady_clock::time_point started_;
+};
 
 // ---------------------------------------------------------------------------
 // Элемент обхода → ProbeEntry
@@ -162,8 +200,18 @@ void applySize(const mvfs::FileSize& size, ProbeEntry& out) {
     }
     // Один вызов на элемент: логический размер уже есть в записи каталога, и
     // platform::vfs::queryAllocatedSize — ровно тот путь, который vfs_size.hpp
-    // называет основным для обхода.
-    const mvfs::AllocatedSizeResult allocated = mvfs::queryAllocatedSize(source.path);
+    // называет основным для обхода. Время вызова считается ОТДЕЛЬНО от времени
+    // перевода записи: это единственный системный вызов на файл в горячем
+    // месте скана, и его цену надо знать числом, а не ощущением.
+    addRelaxed(g_counters.allocCalls);
+    const std::uint64_t allocNsBefore = g_counters.allocNs.load(std::memory_order_relaxed);
+    const mvfs::AllocatedSizeResult allocated = [&] {
+        const StageClock clock(g_counters.allocNs);
+        return mvfs::queryAllocatedSize(source.path);
+    }();
+    // allocNs накопительный, поэтому в convertAllocNs идёт ДЕЛЬТА одного вызова,
+    // а не значение счётчика: иначе сумма умножилась бы на число файлов.
+    addRelaxed(g_counters.convertAllocNs, g_counters.allocNs.load(std::memory_order_relaxed) - allocNsBefore);
     if (allocated.ok()) {
         out.allocatedKnown = true;
         out.allocatedBytes = allocated.bytes;
@@ -192,7 +240,12 @@ void applySize(const mvfs::FileSize& size, ProbeEntry& out) {
 [[nodiscard]] mvfs::WalkStep visitEntry(const VfsProbeOptions& options, const EntryVisitor& visit,
                                         const mvfs::WalkEntry& entry) {
     ProbeEntry converted;
-    if (!convertEntry(entry, options, converted)) {
+    addRelaxed(g_counters.convertCalls);
+    const bool convertedOk = [&] {
+        const StageClock clock(g_counters.convertNs);
+        return convertEntry(entry, options, converted);
+    }();
+    if (!convertedOk) {
         addRelaxed(g_counters.pathRefused);
         core::LogFields fields;
         fields.push_back(core::logField("name", entry.name));
@@ -201,7 +254,12 @@ void applySize(const mvfs::FileSize& size, ProbeEntry& out) {
     }
     addRelaxed(g_counters.entries);
     if (!converted.isDirectory) addRelaxed(g_counters.files);
-    return convertStep(visit(converted));
+    addRelaxed(g_counters.visitCalls);
+    const VisitStep step = [&] {
+        const StageClock clock(g_counters.visitNs);
+        return visit(converted);
+    }();
+    return convertStep(step);
 }
 
 // Отказ чтения корня обхода. WalkResult::completed в этом случае тоже true
@@ -227,6 +285,8 @@ void applySize(const mvfs::FileSize& size, ProbeEntry& out) {
 
 bool VfsFileSystemProbe::listDirectory(std::string_view directory, std::stop_token token,
                                        std::vector<ProbeEntry>& out) {
+    addRelaxed(g_counters.listCalls);
+    const StageClock listClock(g_counters.listNs);
     out.clear();
     if (directory.empty() || token.stop_requested()) return false;
 
@@ -288,6 +348,8 @@ bool VfsFileSystemProbe::listDirectory(std::string_view directory, std::stop_tok
 }
 
 bool VfsFileSystemProbe::statPath(std::string_view path, std::stop_token token, ProbeEntry& out) {
+    addRelaxed(g_counters.statCalls);
+    const StageClock statClock(g_counters.statNs);
     if (path.empty() || token.stop_requested()) return false;
 
     try {
@@ -368,6 +430,8 @@ bool VfsFileSystemProbe::statPath(std::string_view path, std::stop_token token, 
 }
 
 bool VfsFileSystemProbe::walk(std::string_view root, std::stop_token token, const EntryVisitor& visit) {
+    addRelaxed(g_counters.walkCalls);
+    const StageClock walkClock(g_counters.walkNs);
     if (root.empty() || !visit) {
         addRelaxed(g_counters.rootRefused);
         return false;
@@ -380,6 +444,7 @@ bool VfsFileSystemProbe::walk(std::string_view root, std::stop_token token, cons
             return false;
         }
 
+        addRelaxed(g_counters.walks);
         mvfs::WalkOptions walkOptions;
         walkOptions.maxDepth = options_.maxWalkDepth;
         // followReparsePoint остаётся false навсегда: FR-6 запрещает идти по
@@ -406,6 +471,80 @@ std::unique_ptr<FileSystemProbe> makeVfsFileSystemProbe(VfsProbeOptions options)
     return std::make_unique<VfsFileSystemProbe>(options);
 }
 
+// ---------------------------------------------------------------------------
+// Профиль по этапам (docs/scan-performance.md)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Путь файла профиля из переменной окружения. GetEnvironmentVariableW, а не
+// std::getenv: MSVC помечает узкий getenv как C4996, а сборка идёт с /WX, и
+// широкая функция отдаёт путь в UTF-8, а не в кодовой странице консоли.
+[[nodiscard]] std::string stageProfileTarget() {
+    wchar_t buffer[1024];
+    const DWORD written =
+        ::GetEnvironmentVariableW(L"MRPROPER_SCAN_PROFILE", buffer, static_cast<DWORD>(std::size(buffer)));
+    if (written == 0 || written >= std::size(buffer)) return {};
+    std::string out;
+    out.reserve(written);
+    for (DWORD index = 0; index < written; ++index) {
+        out.push_back(buffer[index] < 0x80 ? static_cast<char>(buffer[index]) : '?');
+    }
+    return out;
+}
+
+}  // namespace
+
+bool stageProfileEnabled() {
+    // Один раз на процесс: переменная окружения в горячем коде не читается, а
+    // на время работы она не меняется.
+    static const bool enabled = !stageProfileTarget().empty();
+    return enabled;
+}
+
+void appendVfsProbeProfileLine(const std::string& path, const std::string& line) {
+    if (path.empty() || !stageProfileEnabled()) return;
+    static std::mutex writeMutex;
+    const std::lock_guard<std::mutex> guard(writeMutex);
+    // fopen помечен в MSVC как небезопасный (C4996 при /W4 /WX), fopen_s есть
+    // только у CRT от Microsoft — ровно как в core/log.cpp и platform/vfs_walk.cpp.
+    std::FILE* file = nullptr;
+    if (::fopen_s(&file, (path + ".probe").c_str(), "ab") != 0 || file == nullptr) return;
+    std::fwrite(line.data(), 1, line.size(), file);
+    std::fclose(file);
+}
+
+namespace {
+
+// Сводка счётчиков слоя одной строкой «ключ=значение». Наносекунды печатаются
+// и в миллисекундах (для отчёта) и в наносекундах (для деления на элементы):
+// округление до миллисекунды на десятках тысяч вызовов съело бы всю разницу.
+std::string probeProfileLine(const char* tag, const VfsProbeStats& s) {
+    const auto ms = [](std::uint64_t ns) { return std::to_string(ns / 1000000ull); };
+    std::string line = tag;
+    line += " walks=" + std::to_string(s.walks);
+    line += " walkMs=" + ms(s.walkNs) + " walkNs=" + std::to_string(s.walkNs);
+    line += " listCalls=" + std::to_string(s.listCalls) + " listMs=" + ms(s.listNs);
+    line += " statCalls=" + std::to_string(s.statCalls) + " statMs=" + ms(s.statNs);
+    line += " convertCalls=" + std::to_string(s.convertCalls) + " convertMs=" + ms(s.convertNs);
+    line += " allocCalls=" + std::to_string(s.allocCalls) + " allocMs=" + ms(s.allocNs) +
+            " allocUs=" + std::to_string(s.allocCalls != 0 ? s.allocNs / s.allocCalls / 1000ull : 0ull);
+    line += " visitCalls=" + std::to_string(s.visitCalls) + " visitMs=" + ms(s.visitNs);
+    line += " entries=" + std::to_string(s.entries);
+    line += " files=" + std::to_string(s.files);
+    line += " dirsListed=" + std::to_string(s.directoriesListed);
+    line += " statsRead=" + std::to_string(s.statsRead);
+    line += " allocMeasured=" + std::to_string(s.allocatedMeasured);
+    line += " allocUnknown=" + std::to_string(s.allocatedUnknown);
+    line += " rootRefused=" + std::to_string(s.rootRefused);
+    line += " elementErrors=" + std::to_string(s.elementErrors);
+    line += " pathRefused=" + std::to_string(s.pathRefused);
+    line += "\n";
+    return line;
+}
+
+}  // namespace
+
 VfsProbeStats vfsProbeStats() noexcept {
     VfsProbeStats stats;
     stats.walks = g_counters.walks.load(std::memory_order_relaxed);
@@ -418,10 +557,29 @@ VfsProbeStats vfsProbeStats() noexcept {
     stats.rootRefused = g_counters.rootRefused.load(std::memory_order_relaxed);
     stats.elementErrors = g_counters.elementErrors.load(std::memory_order_relaxed);
     stats.pathRefused = g_counters.pathRefused.load(std::memory_order_relaxed);
+    stats.allocCalls = g_counters.allocCalls.load(std::memory_order_relaxed);
+    stats.allocNs = g_counters.allocNs.load(std::memory_order_relaxed);
+    stats.convertCalls = g_counters.convertCalls.load(std::memory_order_relaxed);
+    stats.convertNs = g_counters.convertNs.load(std::memory_order_relaxed);
+    stats.convertAllocNs = g_counters.convertAllocNs.load(std::memory_order_relaxed);
+    stats.statCalls = g_counters.statCalls.load(std::memory_order_relaxed);
+    stats.statNs = g_counters.statNs.load(std::memory_order_relaxed);
+    stats.listCalls = g_counters.listCalls.load(std::memory_order_relaxed);
+    stats.listNs = g_counters.listNs.load(std::memory_order_relaxed);
+    stats.walkCalls = g_counters.walkCalls.load(std::memory_order_relaxed);
+    stats.walkNs = g_counters.walkNs.load(std::memory_order_relaxed);
+    stats.visitCalls = g_counters.visitCalls.load(std::memory_order_relaxed);
+    stats.visitNs = g_counters.visitNs.load(std::memory_order_relaxed);
     return stats;
 }
 
 void resetVfsProbeStats() noexcept {
+    // Профиль: сброс — единственный момент, когда «предыдущая серия» уже не с
+    // чем смешать. Сводка пишется ДО обнуления, иначе это была бы пустая строка.
+    if (stageProfileEnabled()) {
+        appendVfsProbeProfileLine(stageProfileTarget(), probeProfileLine("PROBE", vfsProbeStats()));
+    }
+
     g_counters.walks.store(0, std::memory_order_relaxed);
     g_counters.entries.store(0, std::memory_order_relaxed);
     g_counters.files.store(0, std::memory_order_relaxed);
@@ -432,10 +590,32 @@ void resetVfsProbeStats() noexcept {
     g_counters.rootRefused.store(0, std::memory_order_relaxed);
     g_counters.elementErrors.store(0, std::memory_order_relaxed);
     g_counters.pathRefused.store(0, std::memory_order_relaxed);
+    g_counters.allocCalls.store(0, std::memory_order_relaxed);
+    g_counters.allocNs.store(0, std::memory_order_relaxed);
+    g_counters.convertCalls.store(0, std::memory_order_relaxed);
+    g_counters.convertNs.store(0, std::memory_order_relaxed);
+    g_counters.convertAllocNs.store(0, std::memory_order_relaxed);
+    g_counters.statCalls.store(0, std::memory_order_relaxed);
+    g_counters.statNs.store(0, std::memory_order_relaxed);
+    g_counters.listCalls.store(0, std::memory_order_relaxed);
+    g_counters.listNs.store(0, std::memory_order_relaxed);
+    g_counters.walkCalls.store(0, std::memory_order_relaxed);
+    g_counters.walkNs.store(0, std::memory_order_relaxed);
+    g_counters.visitCalls.store(0, std::memory_order_relaxed);
+    g_counters.visitNs.store(0, std::memory_order_relaxed);
 }
 
 std::string describeVfsProbeStats() {
     const VfsProbeStats stats = vfsProbeStats();
+    // Профиль печатается здесь тоже: resetVfsProbeStats вызывает не каждый
+    // вызывающий, а отчёт читается всегда. Флаг держит таблицу одноразовой,
+    // иначе она дописывалась бы в файл на каждый вызов.
+    if (stageProfileEnabled()) {
+        static std::atomic<bool> dumped{false};
+        if (!dumped.exchange(true, std::memory_order_relaxed)) {
+            appendVfsProbeProfileLine(stageProfileTarget(), probeProfileLine("PROBE", stats));
+        }
+    }
     if (!stats.degraded()) return {};
 
     std::string text = "скан прошёл в неполных условиях (нет прав админа или часть элементов исчезла):";

@@ -233,6 +233,74 @@ bool writeUiSettings(const NavStateStore& store) noexcept {
     }
 }
 
+// --- Флаг запуска --fresh-ui-state ------------------------------------------
+//
+// Что делает. Приложение стартует ровно как при первой установке: не читает
+// nav.current, settings.language и window.placement из HKCU\Software\MrProper\UI
+// и не пишет их обратно. Всё остальное (тема, масштаб шрифта, данные набора
+// правил) живёт своими ключами и флагом не трогается.
+//
+// Почему флаг, а не сброс ветки реестра воротами (замер: одна и та же команда
+// tools\ui-smoke.ps1 дала окно 1136x795 и 1280x720, чернила 127490 и 128149 —
+// см. docs/defects.md):
+//   * набор ключей, которые приложение сохраняет само, НЕ зафиксирован: он
+//     пополнялся уже трижды (nav.current, settings.language, window.placement).
+//     Скрипт, который удаляет «известные» ключи, молча устаревает при следующем
+//     новом ключе — и снова меряет чужое состояние, только тихо;
+//   * сброс на машине человека задевает его настройки: после прогона ворот у
+//     него исчезла бы выбранная страница и положение окна. Здесь ничего не
+//     удаляется и не пишется;
+//   * «свежее состояние» считает само приложение — ровно те правила по
+//     умолчанию, которые видит первый запуск. Скрипт, копирующий профиль
+//     настроек, обязан знать их снаружи и разойдётся с приложением при первой
+//     же правке умолчаний.
+//
+// Побочный эффект флага — в том, что он не может «сломаться молча»: если
+// разбор строки запуска отстанет от этого комментария, ворота получат чужое
+// состояние и это будет видно в числах, а не в логе.
+constexpr std::wstring_view kFreshUiStateFlag = L"--fresh-ui-state";
+
+// Разбор командной строки вручную, а не CommandLineToArgvW: та живёт в
+// shell32, а в списке системных библиотек слоя (src/ui/CMakeLists.txt) её нет,
+// а править CMakeLists.txt — не файл этого изменения. Свой разбор на два
+// правила (пробел и кавычки) короче, чем ещё одна системная зависимость.
+// Сравнение токена — посимвольное и с учётом регистра: контракт документирован
+// в tools\ui-smoke.ps1 и в шапке этого файла, а «--FRESH-UI-STATE» в ворота
+// не передают.
+bool commandLineHas(std::wstring_view flag) noexcept {
+    const wchar_t* raw = ::GetCommandLineW();
+    if (raw == nullptr) return false;
+    const std::wstring_view line(raw);
+    std::size_t index = 0;
+    while (index < line.size()) {
+        while (index < line.size() && line[index] == L' ') ++index;
+        const std::size_t start = index;
+        bool quoted = false;
+        while (index < line.size()) {
+            const wchar_t symbol = line[index];
+            if (symbol == L'"') {
+                quoted = !quoted;
+                ++index;
+                continue;
+            }
+            if (!quoted && symbol == L' ') break;
+            ++index;
+        }
+        if (line.substr(start, index - start) == flag) return true;
+    }
+    return false;
+}
+
+// Состояние флага вычисляется один раз: разбирать командную строку на каждый
+// вызов restoreUiState/saveUiState незачем, а значение обязано быть одним и тем
+// же в течение всего запуска — иначе приложение стартовало бы «свежим», а на
+// выходе записало бы своё состояние, и следующий запуск ворот увидел бы ровно
+// то, от чего мы уходим.
+[[nodiscard]] bool freshUiStateRequested() noexcept {
+    static const bool requested = commandLineHas(kFreshUiStateFlag);
+    return requested;
+}
+
 // Положение окна — пять чисел через «|», без заголовков: формат читается
 // глазами в отладчике реестра, а разбирать его должна только эта пара функций.
 std::string encodePlacement(const WINDOWPLACEMENT& placement) {
@@ -413,6 +481,16 @@ void AppShell::restoreUiState() noexcept {
         // ровно тем, ради чего он восстанавливается.
         if (!isInitialized()) (void)initialize();
 
+        // --fresh-ui-state: состояние не восстанавливается (см. шапку раздела
+        // о флаге). Именно здесь, а не в настройках каждого экрана: состояние
+        // одно, и разбирать его должны ровно в одном месте.
+        if (freshUiStateRequested()) {
+            layoutRail();
+            logEvent(core::LogLevel::Info, "ui.state.fresh",
+                     "состояние интерфейса не восстановлено: флаг запуска --fresh-ui-state");
+            return;
+        }
+
         std::vector<std::string> problems;
         const std::size_t applied = navigator_.importState(savedState_, &problems);
         for (const std::string& problem : problems) {
@@ -479,6 +557,15 @@ void AppShell::applyInterfaceLanguage(core::Language language) noexcept {
 
 void AppShell::saveUiState() noexcept {
     try {
+        // Пока идёт прогон с --fresh-ui-state, состояние НЕ пишется: ворота не
+        // имеют права оставлять после себя ни выбранной страницы, ни положения
+        // окна — иначе «сброс» сам бы и портил то, что измеряет.
+        if (freshUiStateRequested()) {
+            logEvent(core::LogLevel::Info, "ui.state.save_skipped",
+                     "состояние интерфейса не сохранено: флаг запуска --fresh-ui-state");
+            return;
+        }
+
         // Положение снимается здесь, а не берётся из lastPlacement_: закрытие
         // могло прийти не через WM_CLOSE (завершение сеанса), и тогда память о
         // нём ещё пустая.
@@ -1869,6 +1956,13 @@ int runApp(HINSTANCE instance, int showCommand) noexcept {
 
     int result = exitcode::ok;
     try {
+        // Состояние флага — до первого окна и до первого чтения реестра: пустая
+        // строка команды и флаг из ключа с настройками вели бы себя одинаково,
+        // но по разным причинам, а проверять это — в одном журнале.
+        logEvent(core::LogLevel::Info, "ui.shell.start",
+                 freshUiStateRequested()
+                     ? "приложение запущено со сбросом состояния интерфейса (--fresh-ui-state)"
+                     : "приложение запущено с восстановлением состояния интерфейса");
         // nCmdShow из wWinMain уважается: «показать свёрнутым» (запуск из
         // уведомления) нельзя потерять, подставив собственное значение.
         AppShell::Options options;

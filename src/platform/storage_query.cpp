@@ -35,6 +35,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -60,6 +61,27 @@ using ScopedHandle = platform::unique_handle<platform::KernelHandlePolicy>;
 // драйвере. Счётчик — только для отчёта и отладки (SPEC §12), на поведение
 // запросов не влияет.
 std::atomic<std::uint32_t> gAbandonedCalls{0};
+
+// Потерянные диагностики: отказ самой записи в журнал об отказе запроса к
+// устройству. Ловить его больше негде — журнал не записался именно потому, что
+// памяти не хватило, и повторная попытка дала бы тот же отказ. Причина запроса
+// (код Win32) лежит в полях результата, но и факт потери диагностики обязан быть
+// виден: иначе «отказ был, а в журнале пусто» неотличимо от «отказа не было».
+//
+// Счётчики локальны для модуля: единственный его канал вывода — тот же журнал.
+// Поэтому единственная дополнительная попытка идёт в stderr (не требует памяти и
+// потому переживает ту же нехватку), текст ASCII — чтобы кодовая страница
+// терминала не превратила его в мусор. Отказ самой этой записи тоже считается.
+std::atomic<std::uint64_t> gLostDiagnostics{0};
+std::atomic<std::uint64_t> gStderrWriteFailures{0};
+
+void noteLostDiagnostic(const char* event, std::uint32_t win32Error) noexcept {
+    gLostDiagnostics.fetch_add(1, std::memory_order_relaxed);
+    if (std::fprintf(stderr, "[mrproper] %s: log write failed (win32=%u)\n", event,
+                     static_cast<unsigned>(win32Error)) < 0) {
+        gStderrWriteFailures.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 // Сколько ждать после CancelIoEx, прежде чем признать отмену неудачной. Не
 // ноль: без этого ожидания буфер освободился бы под драйвером.
@@ -781,7 +803,10 @@ StoragePropertiesResult queryStorageProperties(std::wstring_view devicePath,
         }
     } catch (...) {
         // Сбой записи в лог (нехватка памяти) — не повод потерять результат
-        // опроса и не повод уронить процесс.
+        // опроса и не повод уронить процесс. Причина запроса уже в полях
+        // результата; потеря самой диагностики считается, чтобы отказ не выглядел
+        // так, будто его не было.
+        noteLostDiagnostic("platform.storage_query.collect", result.win32Error);
     }
     return result;
 }
@@ -798,7 +823,11 @@ StoragePropertiesResult queryStorageProperties(int diskNumber, std::chrono::mill
                              static_cast<std::int64_t>(ERROR_INVALID_PARAMETER), queryFields(result, timeout));
         } catch (...) {
             // Логирование не имеет права ронять вызывающего: нехватка памяти при
-            // сборке полей — единственное, что тут может вылететь.
+            // сборке полей — единственное, что тут может вылететь. Код отказа
+            // настолько же предсказуем, что и без журнала известен вызывающему
+            // из result.win32Error; сам факт потери записи всё равно считается.
+            noteLostDiagnostic("platform.storage_query.properties",
+                               static_cast<std::uint32_t>(ERROR_INVALID_PARAMETER));
         }
         return result;
     }

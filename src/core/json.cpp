@@ -23,9 +23,15 @@ void appendEscaped(std::string& out, const std::string& s) {
             case '\t': out += "\\t"; break;
             default:
                 if (c < 0x20) {
-                    char buf[7];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                    out += buf;
+                    char buf[7];  // ровно «\u001f» + '\0': c < 0x20 даёт не больше 4 hex-цифр
+                    // CERT ERR33-C: возврат snprintf не игнорируем. Усечения здесь
+                    // не бывает (см. размер буфера выше), но молча обрезанный
+                    // escape — это невалидный JSON: документ перестаёт разбираться
+                    // целиком, а не в одном месте. Поэтому при отказе пишется
+                    // \ufffd: получатель увидит, что байт не представлен, и
+                    // документ останется разбираемым.
+                    const int written = std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += (written < 0 || static_cast<std::size_t>(written) >= sizeof(buf)) ? "\\ufffd" : buf;
                 } else {
                     out.push_back(static_cast<char>(c));
                 }
@@ -41,13 +47,19 @@ void appendNumber(std::string& out, double n) {
     }
     if (n == static_cast<double>(static_cast<long long>(n))) {
         char buf[32];
-        std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(n));
-        out += buf;
+        // CERT ERR33-C: возврат snprintf не игнорируем. int64 в «%lld» занимает
+        // максимум 20 знаков при буфере 32 — усечения не бывает, но подставлять
+        // в документ частичную запись нельзя: получатель прочитал бы другое
+        // число. При отказе пишем null, тем же приёмом, что и для не-конечных
+        // значений выше: значение отсутствует, а не искажено.
+        const int written = std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(n));
+        out += (written < 0 || static_cast<std::size_t>(written) >= sizeof(buf)) ? "null" : buf;
         return;
     }
     char buf[40];
-    std::snprintf(buf, sizeof(buf), "%.17g", n);
-    out += buf;
+    // То же для дробного пути: «%.17g» даёт не больше 25 знаков при буфере 40.
+    const int written = std::snprintf(buf, sizeof(buf), "%.17g", n);
+    out += (written < 0 || static_cast<std::size_t>(written) >= sizeof(buf)) ? "null" : buf;
 }
 
 class Parser {
