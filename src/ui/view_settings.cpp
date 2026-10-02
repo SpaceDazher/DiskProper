@@ -66,114 +66,21 @@ void ensureStrings() noexcept {
 // Строки
 // ---------------------------------------------------------------------------
 //
-// Каталог строк (ui::locale, задача 69) содержит девять ключей settings.* —
-// ровно столько, сколько было задумано для первого каркаса экрана, и они уже
-// использованы в приведённом ниже виде. Ключей нужно больше (заголовки колонок,
-// подписи полей, формулировки статуса), а ui/locale.hpp — файл чужой: править
-// его из этой задачи нельзя, иначе сломается чужая работа.
+// Все 47 строк этого экрана лежат в каталоге (src/ui/locale.hpp, ключи
+// settings.*), а не в таблице экрана. Таблица kLocalTexts была здесь потому, что
+// ui/locale.hpp на момент её написания был чужим файлом, и строки с
+// ключами settings.* пришлось положить рядом с экраном. Побочный эффект был
+// измеримый: ключи были, переводы были, а selfCheck() их не видел — «каталог
+// полон» оставалось зелёным при 47 строках, которые переводчик править не мог.
 //
-// Поэтому недостающие строки лежат здесь, в таблице kLocalTexts, с честной
-// пометкой: как только каталог строк пополнится (это его задача, не эта), таблица
-// удаляется, а text() начинает отдавать перевод из каталога. Ключ при этом
-// остаётся прежним, поэтому переводы не «поедут» и в отчёте о непереведённом
-// (core::i18n, §12) ключи совпадут с теми, что в каталоге.
-struct LocalText {
-    std::string_view key;
-    std::string_view ru;
-    std::string_view en;
-};
-
-constexpr std::array<LocalText, 47> kLocalTexts{{
-    // Заголовки и сводка списка правил
-    {"settings.rules", "Правила", "Rules"},
-    {"settings.ruleColumn", "Правило", "Rule"},
-    {"settings.categoryColumn", "Категория", "Category"},
-    {"settings.safetyColumn", "Уровень риска", "Risk level"},
-    {"settings.rulesSummary", "Правил: {0} · включено: {1} · изменено: {2}",
-     "Rules: {0} · enabled: {1} · changed: {2}"},
-    {"settings.ruleEnabled", "Включено", "Enabled"},
-    {"settings.ruleDisabled", "Выключено", "Disabled"},
-    // Пояснение к выбранному правилу
-    {"settings.ruleIdLabel", "Идентификатор", "Identifier"},
-    {"settings.rulePathLabel", "Шаблон пути", "Path pattern"},
-    {"settings.ruleAgeLabel", "Минимальный возраст, дней", "Minimum age, days"},
-    {"settings.ruleCategoryLabel", "Категория", "Category"},
-    {"settings.ruleSetLevelLabel", "Уровень в наборе", "Level in rule set"},
-    {"settings.ruleNotSelected", "Правило не выбрано", "No rule selected"},
-    {"settings.detailsTemplate",
-     "{0} — категория: {1}; путь: {2}; возраст: {3} дн.; уровень: {4} (в наборе: {5}). {6}",
-     "{0} — category: {1}; path: {2}; age: {3} d; level: {4} (in rule set: {5}). {6}"},
-    {"settings.riskyConfirm", "Risky: нажмите ещё раз, чтобы подтвердить", "Risky: press again to confirm"},
-    // Фильтр
-    {"settings.filterLabel", "Фильтр", "Filter"},
-    {"settings.noRulesFound", "Ничего не найдено", "Nothing found"},
-    // Набор правил: состояние и действия
-    {"settings.builtinSet", "встроенный набор", "built-in rule set"},
-    {"settings.neverChecked", "ещё не проверялось", "never checked"},
-    {"settings.checking", "Проверка обновлений…", "Checking for updates…"},
-    {"settings.noRuleSet", "Набор правил не загружен", "Rule set is not loaded"},
-    {"settings.importRules", "Импорт набора правил", "Import rule set"},
-    {"settings.exportRules", "Экспортировать набор", "Export rule set"},
-    {"settings.exportStatistics", "Экспортировать статистику", "Export statistics"},
-    {"settings.safetyLevelLabel", "Уровень риска", "Risk level"},
-    {"settings.restoreDone", "Возвращён встроенный набор, автообновление выключено, решений сброшено: {0}",
-     "Built-in rule set restored, auto update disabled, decisions dropped: {0}"},
-    {"settings.overridesForgotten", "Решения по правилам возвращены к набору: сброшено {0}",
-     "Rule decisions reset to the rule set: {0} dropped"},
-    // О программе
-    {"settings.aboutApp", "О программе: {0} — {1}", "About: {0} — {1}"},
-    {"settings.aboutPrivacy", "Никакой телеметрии: статистика собирается только по кнопке",
-     "No telemetry: statistics is collected only on demand"},
-    {"settings.aboutAutostart", "Автозапуск и проверка по расписанию — в v1.2",
-     "Autostart and scheduled checks come in v1.2"},
-    // Статистика (FR-9, ADR-007)
-    {"settings.statisticsHeader", "MrProper: статистика (собрана вручную, телеметрии нет)",
-     "MrProper: statistics (collected on demand, no telemetry)"},
-    {"settings.statSource", "Источник", "Source"},
-    {"settings.statVersion", "Версия набора", "Rule set version"},
-    {"settings.statVerified", "Последняя проверенная версия", "Last verified version"},
-    {"settings.statInstalled", "Установлен", "Installed"},
-    {"settings.statChecked", "Последняя проверка", "Last check"},
-    {"settings.statResult", "Результат", "Result"},
-    {"settings.statAutoUpdate", "Автообновление", "Auto update"},
-    {"settings.statLanguage", "Язык интерфейса", "Interface language"},
-    {"settings.statRules", "Правил в наборе", "Rules in the set"},
-    {"settings.statEnabled", "Включено правил", "Enabled rules"},
-    {"settings.statChanged", "Изменено правил, всего", "Rules changed, total"},
-    {"settings.statFilter", "Фильтр", "Filter"},
-    {"settings.statSelected", "Выбранное правило", "Selected rule"},
-    // Пояснение к пустому списку правил: заголовок, причина, действие. Три
-    // отдельных ключа, потому что причина отказа и подсказка «что делать» —
-    // разные предложения, и склеенная строка читается как отписка.
-    {"settings.empty.title", "Набор правил не прочитан", "The rule set was not read"},
-    {"settings.empty.why",
-     "Правила лежат на диске (рядом с программой или в %LOCALAPPDATA%\\MrProper\\rules) и читаются в "
-     "фоновом потоке. Пока они не пришли, список пуст — и это не значит, что правил нет.",
-     "Rules live on disk (next to the program or in %LOCALAPPDATA%\\MrProper\\rules) and are read in a "
-     "background thread. Until they arrive the list is empty, which does not mean there are no rules."},
-    {"settings.empty.what",
-     "Если список не наполнился за несколько секунд, проверьте каталог правил и нажмите «Импорт» — "
-     "причина отказа остаётся в строке состояния и в журнале.",
-     "If the list stays empty for a few seconds, check the rules directory and press Import; the reason "
-     "stays in the status line and in the log."},
-}};
-
-// Перевод по ключу: сначала каталог строк, потом локальная таблица, потом сам
-// ключ (core::i18n отдаёт отсутствующий ключ как есть — это видно на экране и
-// находится поиском по исходникам, что лучше молчаливой пустой строки).
-std::string text(std::string_view key) {
-    const std::string fromCatalog = tr(key);
-    if (fromCatalog != key) return fromCatalog;
-    for (const LocalText& entry : kLocalTexts) {
-        if (entry.key != key) continue;
-        return currentLanguage() == Language::English ? std::string(entry.en) : std::string(entry.ru);
-    }
-    return fromCatalog;
-}
+// Поэтому ниже только чтение: ключ приходит из кода, перевод — из каталога.
+// Ключ, которого в каталоге нет, tr() отдаёт как есть: это видно на экране и
+// находится поиском по исходникам, что лучше молчаливой пустой строки.
+std::string text(std::string_view key) { return tr(key); }
 
 // Перевод с подстановкой. Шаблон берётся тем же text(), а формат — общий
 // core::formatTemplate, поэтому «{0}» одинаково работает и в строках каталога, и
-// в строках локальной таблицы.
+// в строках, собранных экраном.
 std::string text(std::string_view key, const core::StringArgs& args) {
     return core::formatTemplate(text(key), args);
 }

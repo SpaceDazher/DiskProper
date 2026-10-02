@@ -341,6 +341,9 @@ enum class StringId : std::uint16_t {
     kDumpAttempts,
     // Строка состояния и подпись сохранения. Пробел и разделитель « · » входят в
     // строку, поэтому склейка не зависит от языка и не может разъехаться.
+    // Единица времени в отчёте: миллисекунды пишутся по-разному в двух языках,
+    // и три места в коде держали «ms» мимо каталога.
+    kReportMs,
     kStatusFreed,
     kStatusOperations,
     kStatusErrors,
@@ -372,6 +375,8 @@ enum class StringId : std::uint16_t {
     kSummarySkipped,
     kSummaryErrors,
     kSummarySerials,
+    kSummarySerialsMasked,
+    kSummarySerialsPlain,
     // Подробности выбранной строки журнала.
     kDetailKind,
     kDetailEvent,
@@ -401,6 +406,7 @@ enum class StringId : std::uint16_t {
     kCleanupHintNoScan,
     kCleanupHintScanning,
     kCleanupHintIdle,
+    kCleanupHintRuleSetPrefix,
     kCleanupHintRuleCount,
     kCleanupHintCategoryCount,
     kCleanupHintRuleSetTail,
@@ -786,6 +792,8 @@ inline constexpr std::array<Translation, kStringCount> kTranslations{{
     {"report.dump.attempts", " попыток: ", " attempts: "},
 
     // Строка состояния и подпись сохранения. Пробел и разделитель « · » входят в
+    {"report.ms", "{0} мс", "{0} ms"},
+
     {"report.status.freed", "Освобождено: ", "Freed: "},
     {"report.status.operations", " · операций: ", " · operations: "},
     {"report.status.errors", " · ошибок: ", " · errors: "},
@@ -818,6 +826,8 @@ inline constexpr std::array<Translation, kStringCount> kTranslations{{
     {"report.summary.skipped", "Пропущено", "Skipped"},
     {"report.summary.errors", "Ошибки", "Errors"},
     {"report.summary.serials", "Серийники", "Serials"},
+    {"report.summary.serialsMasked", "замаскированы", "masked"},
+    {"report.summary.serialsPlain", "открыто", "plain"},
 
     // Подробности выбранной строки журнала.
     {"report.detail.kind", "Вид", "Kind"},
@@ -858,6 +868,7 @@ inline constexpr std::array<Translation, kStringCount> kTranslations{{
      "Дерево категорий заполняется результатами скана. Ничего не удаляется без вашего выбора.",
      "The category tree is filled from the scan results. Nothing is deleted without your"
      " selection."},
+    {"cleanup.hint.ruleSetPrefix", "Набор правил: ", "Rule set: "},
     {"cleanup.hint.ruleCount", "{0} правило|{0} правила|{0} правил", "{0} rule|{0} rules"},
     {"cleanup.hint.categoryCount",
      "{0} категория|{0} категории|{0} категорий",

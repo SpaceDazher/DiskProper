@@ -69,17 +69,22 @@ void logSave(std::string_view event, const platform::WinErrorInfo& info) noexcep
 // Словарь экрана
 // ---------------------------------------------------------------------------
 //
-// В ui::locale (задача 69, чужой файл) для экрана «Отчёт» есть семь строк
-// (report.title/saved/kept/exportHtml/exportJson/exportText/journal), но нет
-// подписей колонок журнала, видов строк и статусов операции: каталог закрывает
-// FR-8 кнопками и заголовком, а не содержимым таблицы.
+// Раньше 133 пары ru/en стояли прямо здесь, через pick(ru, en): словарь журнала,
+// имена действий плана, подписи текстового дампа, сводки и подробностей строки.
+// Следствия измеримы, а не теоретические: такие строки нельзя переопределить
+// ресурсом .rc, они не попадали в selfCheck(), и по ним критерий SPEC §12.9
+// «локализация полна» был слеп — каталог показывал 172 ключа и ни одного из них.
 //
-// Поэтому слова объявлены здесь, на обоих языках: интерфейс остаётся
-// двуязычным (§12 «русская и английская локализация полны»), а список ключей
-// для владельца каталога — «report.column.time», «report.kind.operation»,
-// «report.status.done» и т. д. Всё остальное подписывается штатными ключами
-// (safety.*, action.*, common.*) и именами core::toString, которые не
-// переводятся и потому одинаковы в обоих языках.
+// Теперь здесь только отображение «слово → ключ», ровно как на экранах «Диски» и
+// «Обзор» (wordKey(Word) -> tr(StringId)). Сами строки живут в ui/locale.hpp и
+// правятся переводчиком без сборки.
+//
+// Семь перечислений, а не одно, потому что слова берутся из разных мест экрана и
+// повторяются с разными оттенками: «Дисков» в итогах дампа и «Диски» в сводке —
+// разные слова русского языка, и склеивать их в один ключ значило бы выбрать одно
+// слово за счёт другого. Всё остальное подписывается штатными ключами (safety.*,
+// action.*, common.*) и именами core::toString, которые не переводятся.
+
 enum class Word : std::uint8_t {
     ColumnTime,
     ColumnKind,
@@ -103,53 +108,318 @@ enum class Word : std::uint8_t {
     OnlyProblems,
     EmptyWhy,
     EmptyWhat,
+    Unknown,
 };
 
-std::string_view pick(std::string_view ru, std::string_view en) {
-    return currentLanguage() == core::Language::English ? en : ru;
-}
+enum class LevelWord : std::uint8_t {
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Off,
+};
 
-std::string_view wordOf(Word value) noexcept {
+enum class PlanWord : std::uint8_t {
+    Delete,
+    Trash,
+    Keep,
+    SkipLocked,
+};
+
+enum class DumpWord : std::uint8_t {
+    Report,
+    Kind,
+    Generated,
+    Duration,
+    App,
+    Pid,
+    Ruleset,
+    Os,
+    OsBuild,
+    Arch,
+    Serials,
+    SerialsMasked,
+    SerialsPlain,
+    Notes,
+    Totals,
+    Disks,
+    Partitions,
+    Volumes,
+    Candidates,
+    Operations,
+    Untouched,
+    Freed,
+    NotFreed,
+    Succeeded,
+    Partial,
+    Failed,
+    Skipped,
+    Errors,
+    PartitionMap,
+    CandidatesHeading,
+    Files,
+    Process,
+    OperationsHeading,
+    UntouchedHeading,
+    ErrorsHeading,
+    ProblemsHeading,
+    Attempts,
+};
+
+enum class StatusWord : std::uint8_t {
+    Freed,
+    Operations,
+    Errors,
+    Hidden,
+    Reports,
+    Pruned,
+};
+
+enum class SummaryWord : std::uint8_t {
+    Kind,
+    Started,
+    Finished,
+    Duration,
+    App,
+    Pid,
+    Rules,
+    Os,
+    OsVersion,
+    Arch,
+    Disks,
+    Partitions,
+    Volumes,
+    Candidates,
+    Locked,
+    Operations,
+    Untouched,
+    Freed,
+    NotFreed,
+    Succeeded,
+    Failed,
+    Skipped,
+    Errors,
+    Serials,
+    SerialsMasked,
+    SerialsPlain,
+};
+
+enum class DetailWord : std::uint8_t {
+    Kind,
+    Event,
+    Level,
+    Message,
+    Scope,
+    Code,
+    Operation,
+    Path,
+    Repeats,
+    Category,
+    Name,
+    Status,
+    Action,
+    Safety,
+    Confidence,
+    Size,
+    SizeExact,
+    Attempts,
+    Started,
+    Finished,
+    Duration,
+};
+
+constexpr StringId wordKey(Word value) noexcept {
     switch (value) {
-    case Word::ColumnTime: return pick("Время", "Time");
-    case Word::ColumnKind: return pick("Вид", "Kind");
-    case Word::ColumnSource: return pick("Источник", "Source");
-    case Word::ColumnSubject: return pick("Что сделано", "Action");
-    case Word::ColumnStatus: return pick("Статус", "Status");
-    case Word::ColumnSize: return pick("Объём", "Size");
-    case Word::Operation: return pick("Операция", "Operation");
-    case Word::Error: return pick("Ошибка", "Error");
-    case Word::Event: return pick("Событие", "Event");
-    case Word::StatusDone: return pick("Выполнено", "Done");
-    case Word::StatusSkipped: return pick("Пропущено", "Skipped");
-    case Word::StatusPartial: return pick("Частично", "Partial");
-    case Word::StatusFailed: return pick("Не выполнено", "Failed");
-    case Word::JournalEmpty: return pick("Журнал пуст", "The log is empty");
-    case Word::NoReport: return pick("Отчёт ещё не получен", "No report yet");
-    case Word::Hidden: return pick("Скрыто фильтром", "Hidden by filters");
-    case Word::ProblemsFound: return pick("Замечания к отчёту", "Report problems");
-    case Word::DetailTitle: return pick("Подробности строки", "Row details");
-    // Галочки приватности и фильтра. Подпись «маскировать серийники» — это
-    // ровно то действие, о котором говорит §5 («пользователь может исключить их
-    // перед отправкой»), и переименовать её в «приватность» значило бы спрятать
-    // от человека, что именно он разрешает.
-    case Word::MaskSerials: return pick("Маскировать серийники", "Mask serials");
-    case Word::OnlyProblems: return pick("Только ошибки и предупреждения", "Errors and warnings only");
-    // Пояснение к пустому журналу: причина и действие. Склеивать их в одну
-    // строку нельзя — «ничего не найдено» без «что делать» это то же молчание,
-    // ради которого экран и переделывается.
-    case Word::EmptyWhy:
-        return pick("Операций ещё не было: журнал пишется при очистке и при каждой ошибке.",
-                    "No operations yet: the log is written during cleanup and on every error.");
-    case Word::EmptyWhat:
-        return pick("Запустите очистку на странице «Очистка» — строки появятся здесь сразу после каждой "
-                    "операции.",
-                    "Start a cleanup on the Cleanup page, rows appear here right after each operation.");
+    case Word::ColumnTime: return StringId::kWordColumnTime;
+    case Word::ColumnKind: return StringId::kWordColumnKind;
+    case Word::ColumnSource: return StringId::kWordColumnSource;
+    case Word::ColumnSubject: return StringId::kWordColumnSubject;
+    case Word::ColumnStatus: return StringId::kWordColumnStatus;
+    case Word::ColumnSize: return StringId::kWordColumnSize;
+    case Word::Operation: return StringId::kWordOperation;
+    case Word::Error: return StringId::kWordError;
+    case Word::Event: return StringId::kWordEvent;
+    case Word::StatusDone: return StringId::kWordStatusDone;
+    case Word::StatusSkipped: return StringId::kWordStatusSkipped;
+    case Word::StatusPartial: return StringId::kWordStatusPartial;
+    case Word::StatusFailed: return StringId::kWordStatusFailed;
+    case Word::JournalEmpty: return StringId::kWordJournalEmpty;
+    case Word::NoReport: return StringId::kWordNoReport;
+    case Word::Hidden: return StringId::kWordHidden;
+    case Word::ProblemsFound: return StringId::kWordProblemsFound;
+    case Word::DetailTitle: return StringId::kWordDetailTitle;
+    case Word::MaskSerials: return StringId::kWordMaskSerials;
+    case Word::OnlyProblems: return StringId::kWordOnlyProblems;
+    case Word::EmptyWhy: return StringId::kWordEmptyWhy;
+    case Word::EmptyWhat: return StringId::kWordEmptyWhat;
+    case Word::Unknown: return StringId::kWordUnknown;
     }
-    return pick("неизвестно", "unknown");
+    return StringId::kCommonUnknown;
 }
 
-std::string word(Word value) { return std::string(wordOf(value)); }
+std::string word(Word value) { return tr(wordKey(value)); }
+
+constexpr StringId wordKey(LevelWord value) noexcept {
+    switch (value) {
+    case LevelWord::Debug: return StringId::kLevelDebug;
+    case LevelWord::Info: return StringId::kLevelInfo;
+    case LevelWord::Warn: return StringId::kLevelWarn;
+    case LevelWord::Error: return StringId::kLevelError;
+    case LevelWord::Off: return StringId::kLevelOff;
+    }
+    return StringId::kCommonUnknown;
+}
+
+std::string word(LevelWord value) { return tr(wordKey(value)); }
+
+constexpr StringId wordKey(PlanWord value) noexcept {
+    switch (value) {
+    case PlanWord::Delete: return StringId::kPlanDelete;
+    case PlanWord::Trash: return StringId::kPlanTrash;
+    case PlanWord::Keep: return StringId::kPlanKeep;
+    case PlanWord::SkipLocked: return StringId::kPlanSkipLocked;
+    }
+    return StringId::kCommonUnknown;
+}
+
+std::string word(PlanWord value) { return tr(wordKey(value)); }
+
+constexpr StringId wordKey(DumpWord value) noexcept {
+    switch (value) {
+    case DumpWord::Report: return StringId::kDumpReport;
+    case DumpWord::Kind: return StringId::kDumpKind;
+    case DumpWord::Generated: return StringId::kDumpGenerated;
+    case DumpWord::Duration: return StringId::kDumpDuration;
+    case DumpWord::App: return StringId::kDumpApp;
+    case DumpWord::Pid: return StringId::kDumpPid;
+    case DumpWord::Ruleset: return StringId::kDumpRuleset;
+    case DumpWord::Os: return StringId::kDumpOs;
+    case DumpWord::OsBuild: return StringId::kDumpOsBuild;
+    case DumpWord::Arch: return StringId::kDumpArch;
+    case DumpWord::Serials: return StringId::kDumpSerials;
+    case DumpWord::SerialsMasked: return StringId::kDumpSerialsMasked;
+    case DumpWord::SerialsPlain: return StringId::kDumpSerialsPlain;
+    case DumpWord::Notes: return StringId::kDumpNotes;
+    case DumpWord::Totals: return StringId::kDumpTotals;
+    case DumpWord::Disks: return StringId::kDumpDisks;
+    case DumpWord::Partitions: return StringId::kDumpPartitions;
+    case DumpWord::Volumes: return StringId::kDumpVolumes;
+    case DumpWord::Candidates: return StringId::kDumpCandidates;
+    case DumpWord::Operations: return StringId::kDumpOperations;
+    case DumpWord::Untouched: return StringId::kDumpUntouched;
+    case DumpWord::Freed: return StringId::kDumpFreed;
+    case DumpWord::NotFreed: return StringId::kDumpNotFreed;
+    case DumpWord::Succeeded: return StringId::kDumpSucceeded;
+    case DumpWord::Partial: return StringId::kDumpPartial;
+    case DumpWord::Failed: return StringId::kDumpFailed;
+    case DumpWord::Skipped: return StringId::kDumpSkipped;
+    case DumpWord::Errors: return StringId::kDumpErrors;
+    case DumpWord::PartitionMap: return StringId::kDumpPartitionMap;
+    case DumpWord::CandidatesHeading: return StringId::kDumpCandidatesHeading;
+    case DumpWord::Files: return StringId::kDumpFiles;
+    case DumpWord::Process: return StringId::kDumpProcess;
+    case DumpWord::OperationsHeading: return StringId::kDumpOperationsHeading;
+    case DumpWord::UntouchedHeading: return StringId::kDumpUntouchedHeading;
+    case DumpWord::ErrorsHeading: return StringId::kDumpErrorsHeading;
+    case DumpWord::ProblemsHeading: return StringId::kDumpProblemsHeading;
+    case DumpWord::Attempts: return StringId::kDumpAttempts;
+    }
+    return StringId::kCommonUnknown;
+}
+
+std::string word(DumpWord value) { return tr(wordKey(value)); }
+
+constexpr StringId wordKey(StatusWord value) noexcept {
+    switch (value) {
+    case StatusWord::Freed: return StringId::kStatusFreed;
+    case StatusWord::Operations: return StringId::kStatusOperations;
+    case StatusWord::Errors: return StringId::kStatusErrors;
+    case StatusWord::Hidden: return StringId::kStatusHidden;
+    case StatusWord::Reports: return StringId::kStatusReports;
+    case StatusWord::Pruned: return StringId::kSavedPruned;
+    }
+    return StringId::kCommonUnknown;
+}
+
+std::string word(StatusWord value) { return tr(wordKey(value)); }
+
+constexpr StringId wordKey(SummaryWord value) noexcept {
+    switch (value) {
+    case SummaryWord::Kind: return StringId::kSummaryKind;
+    case SummaryWord::Started: return StringId::kSummaryStarted;
+    case SummaryWord::Finished: return StringId::kSummaryFinished;
+    case SummaryWord::Duration: return StringId::kSummaryDuration;
+    case SummaryWord::App: return StringId::kSummaryApp;
+    case SummaryWord::Pid: return StringId::kSummaryPid;
+    case SummaryWord::Rules: return StringId::kSummaryRules;
+    case SummaryWord::Os: return StringId::kSummaryOs;
+    case SummaryWord::OsVersion: return StringId::kSummaryOsVersion;
+    case SummaryWord::Arch: return StringId::kSummaryArch;
+    case SummaryWord::Disks: return StringId::kSummaryDisks;
+    case SummaryWord::Partitions: return StringId::kSummaryPartitions;
+    case SummaryWord::Volumes: return StringId::kSummaryVolumes;
+    case SummaryWord::Candidates: return StringId::kSummaryCandidates;
+    case SummaryWord::Locked: return StringId::kSummaryLocked;
+    case SummaryWord::Operations: return StringId::kSummaryOperations;
+    case SummaryWord::Untouched: return StringId::kSummaryUntouched;
+    case SummaryWord::Freed: return StringId::kSummaryFreed;
+    case SummaryWord::NotFreed: return StringId::kSummaryNotFreed;
+    case SummaryWord::Succeeded: return StringId::kSummarySucceeded;
+    case SummaryWord::Failed: return StringId::kSummaryFailed;
+    case SummaryWord::Skipped: return StringId::kSummarySkipped;
+    case SummaryWord::Errors: return StringId::kSummaryErrors;
+    case SummaryWord::Serials: return StringId::kSummarySerials;
+    case SummaryWord::SerialsMasked: return StringId::kSummarySerialsMasked;
+    case SummaryWord::SerialsPlain: return StringId::kSummarySerialsPlain;
+    }
+    return StringId::kCommonUnknown;
+}
+
+std::string word(SummaryWord value) { return tr(wordKey(value)); }
+
+constexpr StringId wordKey(DetailWord value) noexcept {
+    switch (value) {
+    case DetailWord::Kind: return StringId::kDetailKind;
+    case DetailWord::Event: return StringId::kDetailEvent;
+    case DetailWord::Level: return StringId::kDetailLevel;
+    case DetailWord::Message: return StringId::kDetailMessage;
+    case DetailWord::Scope: return StringId::kDetailScope;
+    case DetailWord::Code: return StringId::kDetailCode;
+    case DetailWord::Operation: return StringId::kDetailOperation;
+    case DetailWord::Path: return StringId::kDetailPath;
+    case DetailWord::Repeats: return StringId::kDetailRepeats;
+    case DetailWord::Category: return StringId::kDetailCategory;
+    case DetailWord::Name: return StringId::kDetailName;
+    case DetailWord::Status: return StringId::kDetailStatus;
+    case DetailWord::Action: return StringId::kDetailAction;
+    case DetailWord::Safety: return StringId::kDetailSafety;
+    case DetailWord::Confidence: return StringId::kDetailConfidence;
+    case DetailWord::Size: return StringId::kDetailSize;
+    case DetailWord::SizeExact: return StringId::kDetailSizeExact;
+    case DetailWord::Attempts: return StringId::kDetailAttempts;
+    case DetailWord::Started: return StringId::kDetailStarted;
+    case DetailWord::Finished: return StringId::kDetailFinished;
+    case DetailWord::Duration: return StringId::kDetailDuration;
+    }
+    return StringId::kCommonUnknown;
+}
+
+std::string word(DetailWord value) { return tr(wordKey(value)); }
+
+// Подробности строки: единственное слово экрана с параметром. « ({0} Б)» /
+// « ({0} B)» — склейка аллоцированного размера с точным числом байт.
+std::string word(DetailWord value, std::string_view arg0) {
+    return tr(wordKey(value), arg0);
+}
+
+// Единица времени в отчёте. Русский «мс» и английский «ms» — разные слова,
+// поэтому в коде их больше нет: три места собирали строку вручную.
+std::string msText(std::uint64_t value) { return tr(StringId::kReportMs, std::to_string(value)); }
+
+// Разделитель частей строки состояния. Он одинаков в обоих языках, поэтому ключа
+// в каталоге у него нет: каталог хранит слова, а не типографию. Но и в коде он
+// живёт один раз с именем, а не в двух вызовах с двумя одинаковыми литералами.
+constexpr std::string_view kStatusSeparator = " · ";  // точка-разделитель с пробелами, байтами
 
 // Прочерк вместо пустого значения. Пустая ячейка в таблице читается как «забыли
 // заполнить», а прочерк — как «значения нет»: в отчёте это разные вещи (§12:
@@ -161,13 +431,13 @@ std::string_view dash() noexcept { return "\xE2\x80\x94"; }  // — U+2014, ба
 std::string levelText(core::LogLevel level) {
     switch (level) {
     case core::LogLevel::Trace:
-    case core::LogLevel::Debug: return std::string(pick("Отладка", "Debug"));
-    case core::LogLevel::Info: return std::string(pick("Инфо", "Info"));
-    case core::LogLevel::Warn: return std::string(pick("Внимание", "Warning"));
-    case core::LogLevel::Error: return std::string(pick("Ошибка", "Error"));
-    case core::LogLevel::Off: return std::string(pick("Выключен", "Off"));
+    case core::LogLevel::Debug: return word(LevelWord::Debug);
+    case core::LogLevel::Info: return word(LevelWord::Info);
+    case core::LogLevel::Warn: return word(LevelWord::Warn);
+    case core::LogLevel::Error: return word(LevelWord::Error);
+    case core::LogLevel::Off: return word(LevelWord::Off);
     }
-    return std::string(pick("неизвестно", "unknown"));
+    return word(Word::Unknown);
 }
 
 std::string kindText(RowKind kind) {
@@ -393,14 +663,12 @@ std::vector<core::PhysicalDisk> maskedDisks(const std::vector<core::PhysicalDisk
 // ожидая чужую правку core.
 std::string actionName(core::PlanAction action) {
     switch (action) {
-    // std::string, а не std::string_view: pick отдаёт представление, а функция
-    // возвращает владеющий тип — C2440 иначе.
-    case core::PlanAction::Delete: return std::string(pick("удалить", "delete"));
-    case core::PlanAction::Trash: return std::string(pick("в корзину", "trash"));
-    case core::PlanAction::Keep: return std::string(pick("оставить", "keep"));
-    case core::PlanAction::SkipLocked: return std::string(pick("пропуск (занято)", "skip (locked)"));
+    case core::PlanAction::Delete: return word(PlanWord::Delete);
+    case core::PlanAction::Trash: return word(PlanWord::Trash);
+    case core::PlanAction::Keep: return word(PlanWord::Keep);
+    case core::PlanAction::SkipLocked: return word(PlanWord::SkipLocked);
     }
-    return std::string(pick("оставить", "keep"));
+    return word(PlanWord::Keep);
 }
 
 // Строка операции в дампе: действие, результат, объём, имя — потом путь и
@@ -426,13 +694,13 @@ std::string operationLine(const core::ReportOperation& operation) {
         tail = std::to_string(operation.confidence) + "% " + tail;
     }
     if (operation.attempts > 1) {
-        tail += std::string(pick(" попыток: ", " attempts: ")) + std::to_string(operation.attempts);
+        tail += word(DumpWord::Attempts) + std::to_string(operation.attempts);
     }
     if (!operation.transactionId.empty()) {
         tail += " tx=" + operation.transactionId;
     }
     if (operation.finishedAtUnix > 0 && operation.startedAtUnix > 0) {
-        tail += " " + std::to_string((operation.finishedAtUnix - operation.startedAtUnix) * 1000) + " ms";
+        tail += " " + msText(static_cast<std::uint64_t>(operation.finishedAtUnix - operation.startedAtUnix) * 1000);
     }
     if (!operation.detail.empty()) {
         tail += "  ";
@@ -453,30 +721,30 @@ std::string renderTextDump(const core::Report& report, const core::ReportOptions
     // --- Шапка --------------------------------------------------------------
     out += "MrProper";
     out += " \xE2\x80\x94 ";  // — U+2014
-    out += pick("отчёт", "report");
+    out += word(DumpWord::Report);
     out += "\n";
-    out += lineOf(pick("Вид", "Kind"), core::toString(report.kind)) + "\n";
+    out += lineOf(word(DumpWord::Kind), core::toString(report.kind)) + "\n";
     const std::int64_t generatedAt =
         report.timing.finishedAtUnix > 0 ? report.timing.finishedAtUnix : report.timing.startedAtUnix;
-    out += lineOf(pick("Сформирован", "Generated"), core::formatUnixUtc(generatedAt, htmlLanguage())) + "\n";
+    out += lineOf(word(DumpWord::Generated), core::formatUnixUtc(generatedAt, htmlLanguage())) + "\n";
     if (report.timing.startedAtUnix > 0 && report.timing.finishedAtUnix > 0) {
         const std::int64_t millis = (report.timing.finishedAtUnix - report.timing.startedAtUnix) * 1000;
-        out += lineOf(pick("Длительность", "Duration"), std::to_string(millis) + " ms") + "\n";
+        out += lineOf(word(DumpWord::Duration), msText(static_cast<std::uint64_t>(millis))) + "\n";
     }
-    out += lineOf(pick("Приложение", "App"), report.environment.appVersion) + "\n";
-    out += lineOf(pick("Процесс", "PID"), std::to_string(report.environment.pid)) + "\n";
+    out += lineOf(word(DumpWord::App), report.environment.appVersion) + "\n";
+    out += lineOf(word(DumpWord::Pid), std::to_string(report.environment.pid)) + "\n";
     if (!report.environment.rulesVersion.empty()) {
-        out += lineOf(pick("Набор правил", "Ruleset"), report.environment.rulesVersion) + "\n";
+        out += lineOf(word(DumpWord::Ruleset), report.environment.rulesVersion) + "\n";
     }
-    out += lineOf(pick("ОС", "OS"), report.environment.osCaption + " " + report.environment.osVersion) + "\n";
+    out += lineOf(word(DumpWord::Os), report.environment.osCaption + " " + report.environment.osVersion) + "\n";
     if (report.environment.osBuild != 0) {
-        out += lineOf(pick("Сборка ОС", "OS build"), std::to_string(report.environment.osBuild)) + "\n";
+        out += lineOf(word(DumpWord::OsBuild), std::to_string(report.environment.osBuild)) + "\n";
     }
-    out += lineOf(pick("Архитектура", "Arch"), report.environment.architecture) + "\n";
-    out += lineOf(pick("Серийники", "Serials"),
-                  options.maskSerials ? pick("замаскированы", "masked") : pick("открыто", "plain")) + "\n";
+    out += lineOf(word(DumpWord::Arch), report.environment.architecture) + "\n";
+    out += lineOf(word(DumpWord::Serials),
+                  options.maskSerials ? word(DumpWord::SerialsMasked) : word(DumpWord::SerialsPlain)) + "\n";
     if (!report.notes.empty()) {
-        out += pick("Заметки", "Notes");
+        out += word(DumpWord::Notes);
         out += ":\n";
         out += report.notes;
         out += "\n";
@@ -485,34 +753,34 @@ std::string renderTextDump(const core::Report& report, const core::ReportOptions
 
     // --- Итоги --------------------------------------------------------------
     const core::ReportTotals totals = core::summarizeReport(report);
-    out += heading(pick("Итоги", "Totals")) + "\n";
-    out += lineOf(pick("Дисков", "Disks"), std::to_string(totals.diskCount)) + "\n";
-    out += lineOf(pick("Разделов", "Partitions"), std::to_string(totals.partitionCount)) + "\n";
-    out += lineOf(pick("Томов", "Volumes"), std::to_string(totals.volumeCount)) + "\n";
-    out += lineOf(pick("Кандидатов", "Candidates"), std::to_string(totals.candidateCount)) + "\n";
-    out += lineOf(pick("Операций", "Operations"), std::to_string(totals.operationCount)) + "\n";
-    out += lineOf(pick("Не тронуто", "Untouched"), std::to_string(totals.untouchedCount)) + "\n";
-    out += lineOf(pick("Освобождено", "Freed"), core::formatBytes(totals.freedBytes)) + "\n";
+    out += heading(word(DumpWord::Totals)) + "\n";
+    out += lineOf(word(DumpWord::Disks), std::to_string(totals.diskCount)) + "\n";
+    out += lineOf(word(DumpWord::Partitions), std::to_string(totals.partitionCount)) + "\n";
+    out += lineOf(word(DumpWord::Volumes), std::to_string(totals.volumeCount)) + "\n";
+    out += lineOf(word(DumpWord::Candidates), std::to_string(totals.candidateCount)) + "\n";
+    out += lineOf(word(DumpWord::Operations), std::to_string(totals.operationCount)) + "\n";
+    out += lineOf(word(DumpWord::Untouched), std::to_string(totals.untouchedCount)) + "\n";
+    out += lineOf(word(DumpWord::Freed), core::formatBytes(totals.freedBytes)) + "\n";
     if (totals.failedBytes > 0) {
-        out += lineOf(pick("Не освобождено", "Not freed"), core::formatBytes(totals.failedBytes)) + "\n";
+        out += lineOf(word(DumpWord::NotFreed), core::formatBytes(totals.failedBytes)) + "\n";
     }
-    out += lineOf(pick("Выполнено", "Succeeded"), std::to_string(totals.succeededCount)) + "\n";
-    out += lineOf(pick("Частично", "Partial"), std::to_string(totals.partialCount)) + "\n";
-    out += lineOf(pick("Провалено", "Failed"), std::to_string(totals.failedCount)) + "\n";
-    out += lineOf(pick("Пропущено", "Skipped"), std::to_string(totals.skippedCount)) + "\n";
-    out += lineOf(pick("Ошибок", "Errors"), std::to_string(totals.errorCount)) + "\n";
+    out += lineOf(word(DumpWord::Succeeded), std::to_string(totals.succeededCount)) + "\n";
+    out += lineOf(word(DumpWord::Partial), std::to_string(totals.partialCount)) + "\n";
+    out += lineOf(word(DumpWord::Failed), std::to_string(totals.failedCount)) + "\n";
+    out += lineOf(word(DumpWord::Skipped), std::to_string(totals.skippedCount)) + "\n";
+    out += lineOf(word(DumpWord::Errors), std::to_string(totals.errorCount)) + "\n";
     out += "\n";
 
     // --- Карта разделов (FR-2, FR-8) ---------------------------------------
     if (options.includeDisks && !report.disks.empty()) {
-        out += heading(pick("Карта разделов", "Partition map")) + "\n";
+        out += heading(word(DumpWord::PartitionMap)) + "\n";
         out += core::toText(maskedDisks(report.disks, options));
         out += "\n";
     }
 
     // --- Кандидаты с оценками (FR-4, G4) ------------------------------------
     if (options.includeCandidates && !report.candidates.empty()) {
-        out += heading(pick("Кандидаты", "Candidates")) + "\n";
+        out += heading(word(DumpWord::CandidatesHeading)) + "\n";
         for (const core::CleanupCandidate& candidate : report.candidates) {
             out += "  ";
             out += pad(core::toString(candidate.safety), 8);
@@ -522,7 +790,7 @@ std::string renderTextDump(const core::Report& report, const core::ReportOptions
             out += pad(core::formatBytes(candidate.allocatedBytes), 10);
             out += " ";
             out += std::to_string(candidate.fileCount);
-            out += pick(" файлов", " files");
+            out += word(DumpWord::Files);
             out += "  ";
             out += candidate.displayName.empty() ? candidate.category : candidate.displayName;
             out += "\n";
@@ -536,7 +804,7 @@ std::string renderTextDump(const core::Report& report, const core::ReportOptions
             }
             for (const core::ProcessRef& process : candidate.lockedBy) {
                 out += "      ! ";
-                const std::string_view holder = process.name.empty() ? pick("процесс", "process") : process.name;
+                const std::string_view holder = process.name.empty() ? word(DumpWord::Process) : process.name;
                 out += lineOf(holder, std::to_string(process.pid));
                 out += "\n";
             }
@@ -546,7 +814,7 @@ std::string renderTextDump(const core::Report& report, const core::ReportOptions
 
     // --- Выполненные операции -----------------------------------------------
     if (options.includeOperations && !report.operations.empty()) {
-        out += heading(pick("Операции", "Operations")) + "\n";
+        out += heading(word(DumpWord::OperationsHeading)) + "\n";
         for (const core::ReportOperation& operation : report.operations) {
             out += operationLine(operation);
         }
@@ -555,7 +823,7 @@ std::string renderTextDump(const core::Report& report, const core::ReportOptions
 
     // --- Намеренно не тронуто -----------------------------------------------
     if (options.includeUntouched && !report.untouched.empty()) {
-        out += heading(pick("Не тронуто", "Untouched")) + "\n";
+        out += heading(word(DumpWord::UntouchedHeading)) + "\n";
         for (const core::ReportOperation& operation : report.untouched) {
             out += operationLine(operation);
         }
@@ -564,7 +832,7 @@ std::string renderTextDump(const core::Report& report, const core::ReportOptions
 
     // --- Ошибки (FR-6: не фатальны, но объясняют недобор) -------------------
     if (options.includeErrors && !report.errors.empty()) {
-        out += heading(pick("Ошибки", "Errors")) + "\n";
+        out += heading(word(DumpWord::ErrorsHeading)) + "\n";
         for (const core::ReportError& error : report.errors) {
             out += "  [";
             out += error.scope;
@@ -591,7 +859,7 @@ std::string renderTextDump(const core::Report& report, const core::ReportOptions
     // --- Замечания к самому отчёту ------------------------------------------
     const std::vector<std::string> problems = core::validateReport(report);
     if (!problems.empty()) {
-        out += heading(pick("Замечания к отчёту", "Report problems")) + "\n";
+        out += heading(word(DumpWord::ProblemsHeading)) + "\n";
         for (const std::string& problem : problems) {
             out += "  - ";
             out += problem;
@@ -1246,18 +1514,18 @@ std::string ReportViewModel::statusText() const {
     }
     const core::ReportTotals totals = core::summarizeReport(*impl_->report);
     std::string out;
-    out += pick("Освобождено: ", "Freed: ");
+    out += word(StatusWord::Freed);
     out += core::formatBytes(totals.freedBytes);
-    out += pick(" · операций: ", " · operations: ");
+    out += word(StatusWord::Operations);
     out += core::formatCount(static_cast<std::uint64_t>(totals.operationCount));
-    out += pick(" · ошибок: ", " · errors: ");
+    out += word(StatusWord::Errors);
     out += core::formatCount(static_cast<std::uint64_t>(totals.errorCount));
     if (impl_->hidden != 0) {
-        out += pick(" · скрыто: ", " · hidden: ");
+        out += word(StatusWord::Hidden);
         out += core::formatCount(static_cast<std::uint64_t>(impl_->hidden));
     }
     if (impl_->kept != 0) {
-        out += pick(" · отчётов: ", " · reports: ");
+        out += word(StatusWord::Reports);
         out += std::to_string(impl_->kept);
     }
     return out;
@@ -1272,38 +1540,38 @@ std::vector<std::string> ReportViewModel::summaryLines() const {
     }
     const core::ReportTotals totals = core::summarizeReport(*snapshot);
     const core::ReportEnvironment& env = snapshot->environment;
-    lines.push_back(field(pick("Вид", "Kind"), core::toString(snapshot->kind)));
-    lines.push_back(field(pick("Начало", "Started"), stampText(snapshot->timing.startedAtUnix)));
-    lines.push_back(field(pick("Конец", "Finished"), stampText(snapshot->timing.finishedAtUnix)));
+    lines.push_back(field(word(SummaryWord::Kind), core::toString(snapshot->kind)));
+    lines.push_back(field(word(SummaryWord::Started), stampText(snapshot->timing.startedAtUnix)));
+    lines.push_back(field(word(SummaryWord::Finished), stampText(snapshot->timing.finishedAtUnix)));
     if (snapshot->timing.durationMs != 0) {
-        lines.push_back(field(pick("Длительность", "Duration"),
+        lines.push_back(field(word(SummaryWord::Duration),
                               core::formatDurationMs(snapshot->timing.durationMs, htmlLanguage())));
     }
-    lines.push_back(field(pick("Приложение", "App"), env.appVersion));
-    lines.push_back(field(pick("Процесс", "PID"), std::to_string(env.pid)));
-    if (!env.rulesVersion.empty()) lines.push_back(field(pick("Правила", "Rules"), env.rulesVersion));
-    lines.push_back(field(pick("ОС", "OS"), env.osCaption));
-    if (!env.osVersion.empty()) lines.push_back(field(pick("Версия ОС", "OS version"), env.osVersion));
-    lines.push_back(field(pick("Архитектура", "Arch"), env.architecture));
-    lines.push_back(field(pick("Диски", "Disks"), std::to_string(totals.diskCount)));
-    lines.push_back(field(pick("Разделы", "Partitions"), std::to_string(totals.partitionCount)));
-    lines.push_back(field(pick("Тома", "Volumes"), std::to_string(totals.volumeCount)));
-    lines.push_back(field(pick("Кандидаты", "Candidates"), std::to_string(totals.candidateCount)));
+    lines.push_back(field(word(SummaryWord::App), env.appVersion));
+    lines.push_back(field(word(SummaryWord::Pid), std::to_string(env.pid)));
+    if (!env.rulesVersion.empty()) lines.push_back(field(word(SummaryWord::Rules), env.rulesVersion));
+    lines.push_back(field(word(SummaryWord::Os), env.osCaption));
+    if (!env.osVersion.empty()) lines.push_back(field(word(SummaryWord::OsVersion), env.osVersion));
+    lines.push_back(field(word(SummaryWord::Arch), env.architecture));
+    lines.push_back(field(word(SummaryWord::Disks), std::to_string(totals.diskCount)));
+    lines.push_back(field(word(SummaryWord::Partitions), std::to_string(totals.partitionCount)));
+    lines.push_back(field(word(SummaryWord::Volumes), std::to_string(totals.volumeCount)));
+    lines.push_back(field(word(SummaryWord::Candidates), std::to_string(totals.candidateCount)));
     if (totals.lockedCandidateCount != 0) {
-        lines.push_back(field(pick("Держат файлы", "Locked"), std::to_string(totals.lockedCandidateCount)));
+        lines.push_back(field(word(SummaryWord::Locked), std::to_string(totals.lockedCandidateCount)));
     }
-    lines.push_back(field(pick("Операции", "Operations"), std::to_string(totals.operationCount)));
-    lines.push_back(field(pick("Не тронуто", "Untouched"), std::to_string(totals.untouchedCount)));
-    lines.push_back(field(pick("Освобождено", "Freed"), core::formatBytes(totals.freedBytes)));
+    lines.push_back(field(word(SummaryWord::Operations), std::to_string(totals.operationCount)));
+    lines.push_back(field(word(SummaryWord::Untouched), std::to_string(totals.untouchedCount)));
+    lines.push_back(field(word(SummaryWord::Freed), core::formatBytes(totals.freedBytes)));
     if (totals.failedBytes != 0) {
-        lines.push_back(field(pick("Не освобождено", "Not freed"), core::formatBytes(totals.failedBytes)));
+        lines.push_back(field(word(SummaryWord::NotFreed), core::formatBytes(totals.failedBytes)));
     }
-    lines.push_back(field(pick("Выполнено", "Succeeded"), std::to_string(totals.succeededCount)));
-    lines.push_back(field(pick("Провалено", "Failed"), std::to_string(totals.failedCount)));
-    lines.push_back(field(pick("Пропущено", "Skipped"), std::to_string(totals.skippedCount)));
-    lines.push_back(field(pick("Ошибки", "Errors"), std::to_string(totals.errorCount)));
-    lines.push_back(field(pick("Серийники", "Serials"),
-                          impl_->options.maskSerials ? pick("замаскированы", "masked") : pick("открыто", "plain")));
+    lines.push_back(field(word(SummaryWord::Succeeded), std::to_string(totals.succeededCount)));
+    lines.push_back(field(word(SummaryWord::Failed), std::to_string(totals.failedCount)));
+    lines.push_back(field(word(SummaryWord::Skipped), std::to_string(totals.skippedCount)));
+    lines.push_back(field(word(SummaryWord::Errors), std::to_string(totals.errorCount)));
+    lines.push_back(field(word(SummaryWord::Serials),
+                          impl_->options.maskSerials ? word(SummaryWord::SerialsMasked) : word(SummaryWord::SerialsPlain)));
     const std::vector<std::string> issues = problems();
     if (!issues.empty()) {
         lines.push_back(field(word(Word::ProblemsFound), std::to_string(issues.size())));
@@ -1320,56 +1588,56 @@ std::vector<std::string> ReportViewModel::detailLines() const {
         }
         return lines;
     }
-    lines.push_back(field(pick("Вид", "Kind"), row->kindText));
+    lines.push_back(field(word(DetailWord::Kind), row->kindText));
     lines.push_back(field(word(Word::ColumnTime), row->timeText));
     if (row->kind == RowKind::Event) {
-        lines.push_back(field(pick("Событие", "Event"), row->event));
-        lines.push_back(field(pick("Уровень", "Level"), row->statusText));
-        lines.push_back(field(pick("Сообщение", "Message"), row->message));
+        lines.push_back(field(word(DetailWord::Event), row->event));
+        lines.push_back(field(word(DetailWord::Level), row->statusText));
+        lines.push_back(field(word(DetailWord::Message), row->message));
         for (const core::LogField& entry : row->fields) {
             lines.push_back(field(entry.key, entry.value));
         }
         return lines;
     }
     if (row->kind == RowKind::Error) {
-        lines.push_back(field(pick("Этап", "Scope"), row->scope));
+        lines.push_back(field(word(DetailWord::Scope), row->scope));
         lines.push_back(field(tr(StringId::kCommonError), row->message));
-        lines.push_back(field(pick("Код", "Code"), row->code));
-        lines.push_back(field(pick("Операция", "Operation"), row->detail));
-        lines.push_back(field(pick("Путь", "Path"), row->path));
+        lines.push_back(field(word(DetailWord::Code), row->code));
+        lines.push_back(field(word(DetailWord::Operation), row->detail));
+        lines.push_back(field(word(DetailWord::Path), row->path));
         if (row->occurrences > 1) {
-            lines.push_back(field(pick("Повторов", "Attempts"), std::to_string(row->occurrences)));
+            lines.push_back(field(word(DetailWord::Repeats), std::to_string(row->occurrences)));
         }
         return lines;
     }
-    lines.push_back(field(pick("Категория", "Category"), row->category));
-    lines.push_back(field(pick("Название", "Name"), row->displayName));
-    lines.push_back(field(pick("Путь", "Path"), row->path));
-    lines.push_back(field(pick("Статус", "Status"), row->statusText));
-    lines.push_back(field(pick("Действие", "Action"), row->actionText));
-    lines.push_back(field(pick("Уровень риска", "Safety"), row->safetyText));
+    lines.push_back(field(word(DetailWord::Category), row->category));
+    lines.push_back(field(word(DetailWord::Name), row->displayName));
+    lines.push_back(field(word(DetailWord::Path), row->path));
+    lines.push_back(field(word(DetailWord::Status), row->statusText));
+    lines.push_back(field(word(DetailWord::Action), row->actionText));
+    lines.push_back(field(word(DetailWord::Safety), row->safetyText));
     if (row->confidence != 0) {
-        lines.push_back(field(pick("Уверенность", "Confidence"), std::to_string(row->confidence) + "%"));
+        lines.push_back(field(word(DetailWord::Confidence), std::to_string(row->confidence) + "%"));
     }
     if (row->bytes != 0) {
         // И аллоцированный размер словами, и точный в байтах: «1,2 ГБ (1 234 567
         // Б)» — тот случай, когда отчёт потом считают вручную.
-        const std::string size = core::formatBytes(row->bytes) + std::string(pick(" (", " (")) +
-                                  std::to_string(row->bytes) + std::string(pick(" Б)", " B)"));
-        lines.push_back(field(pick("Объём", "Size"), size));
+        const std::string size =
+            core::formatBytes(row->bytes) + word(DetailWord::SizeExact, std::to_string(row->bytes));
+        lines.push_back(field(word(DetailWord::Size), size));
     }
     if (row->attempts > 1) {
-        lines.push_back(field(pick("Попыток", "Attempts"), std::to_string(row->attempts)));
+        lines.push_back(field(word(DetailWord::Attempts), std::to_string(row->attempts)));
     }
     if (!row->transactionId.empty()) {
         lines.push_back(field(tr(StringId::kCleanupTrashLabel), row->transactionId));
     }
-    lines.push_back(field(pick("Начало", "Started"), stampText(row->startedAtUnix)));
-    lines.push_back(field(pick("Конец", "Finished"), stampText(row->finishedAtUnix)));
+    lines.push_back(field(word(DetailWord::Started), stampText(row->startedAtUnix)));
+    lines.push_back(field(word(DetailWord::Finished), stampText(row->finishedAtUnix)));
     if (row->finishedAtUnix > 0 && row->startedAtUnix > 0) {
-        const std::string duration = std::to_string((row->finishedAtUnix - row->startedAtUnix) * 1000) +
-                                     std::string(pick(" мс", " ms"));
-        lines.push_back(field(pick("Длительность", "Duration"), duration));
+        const std::string duration =
+            msText(static_cast<std::uint64_t>(row->finishedAtUnix - row->startedAtUnix) * 1000);
+        lines.push_back(field(word(DetailWord::Duration), duration));
     }
     if (!row->detail.empty()) {
         lines.push_back(field(tr(StringId::kCommonError), row->detail));
@@ -1381,7 +1649,7 @@ std::string ReportViewModel::savedText() const {
     if (impl_->savedPath.empty()) return {};
     std::string out = tr(StringId::kReportSaved, impl_->savedPath);
     if (impl_->pruned != 0) {
-        out += pick(" · удалено старых: ", " · pruned: ");
+        out += word(StatusWord::Pruned);
         out += std::to_string(impl_->pruned);
     }
     return out;
@@ -2385,11 +2653,11 @@ struct ViewState {
         std::string text = model.statusText();
         const std::string saved = model.savedText();
         if (!saved.empty()) {
-            text += pick(" · ", " · ");
+            text += kStatusSeparator;
             text += saved;
         }
         if (!lastProblem.empty()) {
-            text += pick(" · ", " · ");
+            text += kStatusSeparator;
             text += lastProblem;
         }
         setChildText(status, text);

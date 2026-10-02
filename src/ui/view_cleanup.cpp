@@ -230,13 +230,13 @@ std::string categoryTitle(std::string_view categoryId) {
     return std::string(categoryId);
 }
 
-// Двуязычный выбор для слов, которых нет в каталоге строк. Экран «Обзор»
-// больше не пользуется этим приёмом: его тринадцать пар перенесены в
-// ui::locale (см. kOverview*). Осталось только пояснение пустого дерева на
-// экране «Очистке» — там слова ещё лежат в коде.
-std::string_view pick(std::string_view ru, std::string_view en) {
-    return currentLanguage() == core::Language::English ? en : ru;
-}
+// Слов «в коде» на этом экране больше нет. Раньше здесь стоял двуязычный выбор
+// pick(ru, en): четыре пояснения пустого дерева категорий жили в исходнике, а
+// строка про набор правил не имела английского варианта вообще — на английском
+// экране она оставалась русской. Теперь все они в каталоге строк
+// (cleanup.hint.* в src/ui/locale.hpp), вместе с формами множественного числа
+// для двух счётчиков: «1 правило, 5 категорий» и «5 правил, 1 категория» —
+// разные предложения, и одна форма на оба числа дала бы «1 правило, 1 категорий».
 
 const char* toString(CheckState state) noexcept {
     switch (state) {
@@ -2501,25 +2501,26 @@ LRESULT drawHint(ViewState& state, const DRAWITEMSTRUCT& draw) {
     const std::size_t categories = state.ruleCategoryCount();
 
     std::vector<std::wstring> lines;
-    lines.push_back(toWide(pick("Скан ещё не выполнялся", "No scan has run yet")));
+    lines.push_back(toWide(tr(StringId::kCleanupHintNoScan)));
     if (scanning) {
-        lines.push_back(toWide(pick("Идёт обход: файлы и кэши считаются в фоне, дерево появится само.",
-                                    "The walk is running: files and caches are counted in the background, the "
-                                    "tree appears on its own.")));
+        lines.push_back(toWide(tr(StringId::kCleanupHintScanning)));
     } else {
-        lines.push_back(toWide(pick("Дерево категорий заполняется результатами скана. Ничего не удаляется без "
-                                    "вашего выбора.",
-                                    "The category tree is filled from the scan results. Nothing is deleted "
-                                    "without your selection.")));
+        lines.push_back(toWide(tr(StringId::kCleanupHintIdle)));
     }
     if (rules > 0) {
-        lines.push_back(toWide("Набор правил: " + std::to_string(rules) + " правил, " +
-                               std::to_string(categories) + " категорий — по ним и будет искаться мусор."));
+        // Два счётчика — две строки с формой множественного числа. Запятая между
+        // ними одинакова в обоих языках и в каталоге не лежит: каталог хранит
+        // слова, а не типографику.
+        const std::string ruleSet =
+            tr(StringId::kCleanupHintRuleSetPrefix) +
+            trPlural(StringId::kCleanupHintRuleCount, static_cast<std::uint64_t>(rules)) + ", " +
+            trPlural(StringId::kCleanupHintCategoryCount, static_cast<std::uint64_t>(categories)) +
+            tr(StringId::kCleanupHintRuleSetTail);
+        lines.push_back(toWide(ruleSet));
     } else {
-        lines.push_back(toWide(pick("Набор правил ещё читается с диска (фоновый поток).",
-                                    "The rule set is still being read from disk (background thread).")));
+        lines.push_back(toWide(tr(StringId::kOverviewNoteRulesLoading)));
     }
-    lines.push_back(toWide(std::string("Нажмите «") + tr(StringId::kActionRescan) + "»."));
+    lines.push_back(toWide(tr(StringId::kCleanupHintPressRescan, tr(StringId::kActionRescan))));
 
     ::SetBkMode(dc, TRANSPARENT);
     if (state.fonts[0] != nullptr) ::SelectObject(dc, state.fonts[0]);

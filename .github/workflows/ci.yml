@@ -490,13 +490,18 @@ jobs:
       - name: База компиляции для clang-tidy (Ninja + clang-cl)
         shell: pwsh
         run: |
+          # Пути со слешем вперёд — обязательны, а не stylistic: CMake 3.20
+          # записывает значение CMAKE_CXX_COMPILER в CMakeCXXCompiler.cmake как
+          # строку CMake, и обратный слеш в «C:\Program Files\...» даёт
+          # «Invalid character escape '\P'» — конфигурация падает целиком.
+          # Локально это воспроизведено на CMake 3.20 из состава Visual Studio.
           $cmakeArgs = @(
             "-S", "."
             "-B", "build/tidy"
             "-G", "Ninja"
-            "-DCMAKE_MAKE_PROGRAM=$env:NINJA_EXE"
+            "-DCMAKE_MAKE_PROGRAM=$($env:NINJA_EXE -replace '\\', '/')"
             "-DCMAKE_BUILD_TYPE=Release"
-            "-DCMAKE_CXX_COMPILER=$env:CLANG_CL"
+            "-DCMAKE_CXX_COMPILER=$($env:CLANG_CL -replace '\\', '/')"
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
           )
           cmake @cmakeArgs
@@ -515,7 +520,15 @@ jobs:
       - name: Прогнать clang-tidy по всем файлам базы
         shell: pwsh
         run: |
-          $db = Get-Content -LiteralPath "build/tidy/compile_commands.json" -Raw | ConvertFrom-Json
+          # ConvertFrom-Json вызывается параметром и результат присваивается
+          # напрямую. Конвейерная форма на Windows PowerShell 5.1 отдаёт
+          # JSON-массив верхнего уровня как ОДИН объект, у которого .file —
+          # массив всех путей: $files.Count печатал бы «1» вместо реального
+          # числа файлов, а проверка «база пуста» не могла сработать никогда,
+          # то есть ворота молча врали бы о своём объёме. В pwsh на образе
+          # GitHub это воспроизвести нельзя, поэтому форма выбрана по замеру
+          # на 5.1 и одинаково верна на 7+.
+          $db = ConvertFrom-Json -InputObject (Get-Content -LiteralPath "build/tidy/compile_commands.json" -Raw)
           $files = @($db | ForEach-Object { $_.file } | Sort-Object -Unique)
           if ($files.Count -eq 0) {
             throw "compile_commands.json пуст: clang-tidy нечего проверять"

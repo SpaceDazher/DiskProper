@@ -353,6 +353,14 @@ public:
         objects_ = std::move(batch);
     }
 
+    // Принятое владение для чтения. После adopt() исходный batch пуст (вектор
+    // перемещён), поэтому читать из него нельзя: код, который это делал, брал
+    // элемент за границей пустого вектора, а в Debug с включённым
+    // _ITERATOR_DEBUG_LEVEL это assert. Нашли clang-tidy и разбор волны P1.
+    [[nodiscard]] const std::vector<IWbemClassObject*>& objects() const noexcept {
+        return objects_;
+    }
+
 private:
     IEnumWbemClassObject* value_{nullptr};
     std::vector<IWbemClassObject*> objects_;
@@ -713,8 +721,10 @@ QueryOutcome forEachRow(IWbemServices* services, const wchar_t* wql, Reader&& re
             break;
         }
         enumerator.adopt(batch);
-        for (ULONG index = 0; index < returned; ++index) {
-            IWbemClassObject* const object = batch[index];
+        // Читаем ПРИНЯТОЕ владение, а не перемещённый batch: после adopt() он пуст.
+        const std::vector<IWbemClassObject*>& adopted = enumerator.objects();
+        for (ULONG index = 0; index < returned && index < adopted.size(); ++index) {
+            IWbemClassObject* const object = adopted[index];
             if (object == nullptr) continue;
             reader(object);
             ++outcome.rows;
