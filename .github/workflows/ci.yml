@@ -155,7 +155,7 @@ jobs:
 
       - name: Артефакты сборки
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mrproper-${{ matrix.tag }}
           if-no-files-found: error
@@ -179,7 +179,7 @@ jobs:
       # попадает в артефакты даже при красном job.
       - name: Лог тестов при падении
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mrproper-test-log-${{ matrix.tag }}
           if-no-files-found: warn
@@ -280,7 +280,7 @@ jobs:
       # очередь.
       - name: Журналы пропусков e2e
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-artifacts
           if-no-files-found: warn
@@ -421,7 +421,7 @@ jobs:
       # именно прогон их породил.
       - name: Снимки окна
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ui-smoke-shots
           if-no-files-found: error
@@ -545,7 +545,7 @@ jobs:
 
       - name: Приложить протокол tidy
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: clang-tidy-log
           if-no-files-found: ignore
@@ -616,7 +616,7 @@ jobs:
           }
 
       - name: Приложить SBOM к прогону
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-cyclonedx
           path: sbom.cdx.json
