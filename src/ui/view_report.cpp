@@ -2501,6 +2501,10 @@ struct ViewState {
                          "bottom row labels squeezed to minimum width");
             }
         }
+        // Ширины столбцов — ПОСЛЕ раскладки: только сейчас у списка есть
+        // окончательный размер и известно, сколько места останется на столбцы
+        // при этом DPI. Так же устроен список «Дисков» (layout → syncColumnWidths).
+        syncColumnWidths();
     }
 
     // --- Тема ---------------------------------------------------------------
@@ -2565,6 +2569,72 @@ struct ViewState {
             ListView_InsertColumn(list, column, &entry);
         }
         columnsReady = true;
+    }
+
+    // Ширины столбцов — по текущей полосе и текущему DPI, как на «Дисках»
+    // (syncColumnWidths там). Раньше ширины задавались ОДИН РАЗ в syncColumns и
+    // больше не трогались: смена масштаба оставляла «Отчёт» в ширинах 96 DPI,
+    // то есть при 150 % полоса 1320 px держала шесть столбцов по 852 px и
+    // справа висел хвост в 468 px — ровно то, что ворота (Measure-HeaderColumns)
+    // читают как отрезанный последний столбец.
+    void syncColumnWidths() {
+        if (list == nullptr || !columnsReady) return;
+        const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
+        // Бюджет — клиентская область ПОЛОСЫ ЗАГОЛОВКА, а не GetClientRect
+        // списка: вертикальная полоса прокрутки лежит в клиентской области
+        // списка и в полосу заголовка не входит, а рисуются столбцы именно по
+        // ней (то же рассуждение, что в view_disks.cpp, columnRoomPx).
+        RECT room{};
+        const HWND header = reinterpret_cast<HWND>(::SendMessageW(list, LVM_GETHEADER, 0, 0));
+        bool known = header != nullptr && ::GetClientRect(header, &room) != FALSE;
+        if (!known) {
+            RECT client{};
+            if (::GetClientRect(list, &client) == FALSE) return;
+            room = client;
+            if ((::GetWindowLongPtrW(list, GWL_STYLE) & WS_VSCROLL) != 0) {
+                room.right -= ::GetSystemMetrics(SM_CXVSCROLL);
+            }
+        }
+        const int available = room.right - room.left;
+        if (available <= 0) return;  // список ещё не получил размер
+        // Запас справа: комctl32 рисует разделитель между столбцами, а после
+        // ПОСЛЕДНЕГО столбца рисовать нечего. Если сумма ширин равна полосе, то
+        // последний столбец упирается в край полосы и на снимке неотличим от
+        // свободного места — ворота читают его как «хвост» шириной во весь
+        // столбец и объявляют вёрстку сломанной. Поэтому жмём не в полосу, а в
+        // полосу минус запас: тогда последний разделитель нарисован и хвост
+        // измеряется как запас.
+        const int margin = std::max(4, scale.dip(12.0));
+        std::array<int, kColumnCount> widths{};
+        int wanted = 0;
+        for (int i = 0; i < kColumnCount; ++i) {
+            widths[static_cast<std::size_t>(i)] =
+                std::max(1, scale.dip(kColumnWidthDip[static_cast<std::size_t>(i)]));
+            wanted += widths[static_cast<std::size_t>(i)];
+        }
+        if (wanted > available) {
+            const int budget = std::max(static_cast<int>(kColumnCount), available - margin);
+            // Полосы не хватает (минимальное окно 900×600 при 96 % даёт полосу
+            // 642 px на шесть столбцов по 852 px). Жмём пропорционально, а не
+            // оставляем хвост за краем: иначе последние два столбца уезжают за
+            // правый край и ворота получают код 10. Каждому столбцу остаётся
+            // минимум один пиксель, а последний добирает остаток — иначе доля
+            // округления съела бы его целиком.
+            int used = 0;
+            for (int i = 0; i < kColumnCount - 1; ++i) {
+                const std::size_t index = static_cast<std::size_t>(i);
+                const int reserved = kColumnCount - 1 - i;  // минимумы для оставшихся
+                const long long share =
+                    (static_cast<long long>(budget) * widths[index]) / static_cast<long long>(wanted);
+                const int capped = static_cast<int>(std::min<long long>(share, budget - used - reserved));
+                widths[index] = std::max(1, capped);
+                used += widths[index];
+            }
+            widths[static_cast<std::size_t>(kColumnCount - 1)] = std::max(1, budget - used);
+        }
+        for (int column = 0; column < kColumnCount; ++column) {
+            ListView_SetColumnWidth(list, column, widths[static_cast<std::size_t>(column)]);
+        }
     }
 
     void syncTexts() {
@@ -3049,16 +3119,24 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
                 if (state->model.journalSequence() != before) state->refreshAll();
             }
             return 0;
-        case WM_DPICHANGED: {
-            const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+        case WM_DPICHANGED:
+        case WM_DPICHANGED_BEFOREPARENT:
+        case WM_DPICHANGED_AFTERPARENT: {
+            // lParameter — прямоугольник ТОЛЬКО у WM_DPICHANGED; в паре
+            // BEFORE/AFTERPARENT там мусор, и размер окна пересчитывает система
+            // (та же разборка, что в CleanupScreen).
+            const bool hasSuggested = (message == WM_DPICHANGED);
+            const auto* suggested = hasSuggested ? reinterpret_cast<const RECT*>(lParam) : nullptr;
             if (HIWORD(wParam) > 0) state->dpi = HIWORD(wParam);
             state->theme.setDpi(static_cast<unsigned>(state->dpi));
-            if (suggested != nullptr) {
+            if (suggested != nullptr && suggested->right > suggested->left && suggested->bottom > suggested->top) {
                 ::SetWindowPos(window, nullptr, suggested->left, suggested->top, suggested->right - suggested->left,
                                suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
             }
             state->applyPalette();
             state->applyFonts();
+            // syncColumns() создаёт столбцы один раз, а ширины пересчитываются
+            // в layout() — без этого колонки остались бы в ширинах 96 DPI.
             state->refreshAll();
             return 0;
         }

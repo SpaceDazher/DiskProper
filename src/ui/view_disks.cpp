@@ -286,20 +286,22 @@ bool lowSpaceOn(std::uint64_t totalBytes, std::uint64_t freeBytes, bool known) {
 // Проценты свободного и занятого
 // ---------------------------------------------------------------------------
 //
-// Считаются здесь, а не берутся готовыми полями core::InventoryUsage. Причина
-// конкретная: inventoryUsage (src/core/disk_model.cpp:384) пишет
-//     usage.usedFraction = usedRatio(usage.volumeBytes, usage.usedBytes),
-// а usedRatio(total, free) возвращает (total - free) / total (там же, строка
-// 292). При usedBytes = volumeBytes - freeBytes это РОВНО freeFraction, то есть
-// оба поля несут одну и ту же долю свободного. На диске 1,0 ТБ с 47 ГБ
-// свободными строка состояния печатала «Свободно: 47 ГБ (4,6 %) · Занято:
-// 977 ГБ (4,6 %)»: две одинаковые цифры, и вторая читается как «занято 4,6 %».
-// Правка core — не моя строка, поэтому доля считается на своём слое, из тех же
-// байтов, что и сами числа в строке.
+// Берутся из core: там inventoryUsage (src/core/disk_model.cpp) пишет
+//     usage.usedFraction = 1 - usage.freeFraction,
+// и обе доли приводятся к [0, 1]. Нулевой объём даёт нули в обеих, потому что
+// «размер томов не пришёл» — это не «занято всё»: прочерк рисует вызывающий.
+//
+// Раньше доля считалась здесь, потому что core отдавал в usedFraction ту же
+// величину, что и в freeFraction: usedRatio(total, free) ждёт на втором месте
+// СВОБОДНЫЕ байты, а inventoryUsage подставлял туда usedBytes, то есть
+// вычислял (volumeBytes - usedBytes) / volumeBytes. Обход был правильным ответом
+// на неверное поле, но он чинил симптом в одном экране: любое другое место,
+// читавшее поле, получало ложь. Корень починен в core, и обход больше не нужен.
 //
 // Сумма — ровно 100. Округление каждой доли по отдельности расходится на
 // половинах (5,25 % → 5,3 и 94,8, сумма 100,1), поэтому округляется одна доля,
-// а вторая — её дополнение до 100.
+// а вторая — её дополнение до 100. Это свойство ВЫВОДА, а не полей: поля хранят
+// точные доли, и между ними ровно единица.
 struct UsagePercents {
     bool known{};
     std::string freeText;
@@ -314,7 +316,7 @@ UsagePercents usagePercents(const core::InventoryUsage& usage) noexcept {
     // Размеры томов не пришли — процентов нет, а не «0,0 %»: §10 требует, чтобы
     // экран говорил «не ответило», а не показывал выдуманный ноль.
     if (!usage.freeKnown || usage.volumeBytes == 0) return out;
-    const double free = std::clamp(core::freeRatio(usage.volumeBytes, usage.freeBytes), 0.0, 1.0);
+    const double free = std::clamp(usage.freeFraction, 0.0, 1.0);
     const int freeTenths =
         std::clamp(static_cast<int>(std::lround(free * static_cast<double>(kPercentTenths))), 0, kPercentTenths);
     out.known = true;
@@ -586,7 +588,7 @@ std::vector<int> DisksLayout::fitWidths(int availablePx, const std::vector<int>&
 }
 
 DisksLayout DisksLayout::compute(const DisksMetrics& metrics, int dpi, int clientWidthPx, int clientHeightPx,
-                                 int mapHeightPx, int cardLineCount,
+                                 int mapHeightPx, int cardLineCount, int statusLineHeightPx, int statusLineCount,
                                  const std::vector<int>& filterWidthsPx, const std::vector<int>& actionWidthsPx) {
     DisksLayout out;
     out.width_ = std::max(0, clientWidthPx);
@@ -598,7 +600,20 @@ DisksLayout DisksLayout::compute(const DisksMetrics& metrics, int dpi, int clien
     out.buttonHeight_ = std::max(1, dipToPx(metrics.buttonHeightDip, dpi));
     out.contentLeft_ = pad;
     out.contentWidth_ = std::max(0, out.width_ - 2 * pad);
-    out.statusHeight_ = std::max(0, dipToPx(metrics.statusHeightDip, dpi));
+    // Высота строки состояния — по её СОБСТВЕННОМУ шрифту, а не по одной
+    // константе. Раньше здесь стоял ровно statusHeightDip (20 px при 96 dpi), и
+    // пользовательский масштаб шрифта её не трогал: при FontScalePercent 200
+    // строка высотой 29 px рисовалась в полосе 20 px. Нативный Static с
+    // SS_ENDELLIPSIS отдаёт DrawText флаги DT_WORDBREAK|DT_END_ELLIPSIS, то есть
+    // переносит текст по словам; перенос требует высоты, а многоточие рисуется
+    // только при обрезке по ШИРИНЕ. Ни того, ни другого при нехватке высоты не
+    // происходит — хвост просто срезается, без многоточия и без полосы
+    // прокрутки (D-79, замерено: 1267 px текста в полосе 648x20).
+    // Поэтому высота = пол из метрики И столько строк, сколько нужно тексту.
+    const int statusFloor = std::max(0, dipToPx(metrics.statusHeightDip, dpi));
+    const int statusLine = std::max(statusLineHeightPx, statusFloor);
+    const int statusLines = std::clamp(statusLineCount, 1, kDisksStatusMaxLines);
+    out.statusHeight_ = statusLine > 0 ? statusLine * statusLines : statusFloor;
 
     // Ширины кнопок: измеренные подписи, а при их отсутствии (первый расчёт до
     // создания контролов) — равные доли. Ровно kDisksFilterCount и
@@ -2164,6 +2179,52 @@ struct ViewState {
         return true;
     }
 
+    // Высота ОДНОЙ строки текста в заданном шрифте: tmHeight, то есть ровно то,
+    // чем DrawText будет мерить перенос. Константа была бы угадкой о шрифте, а
+    // строка состояния печатается шрифтом пользователя, и он меняется вместе
+    // с FontScalePercent.
+    [[nodiscard]] int fontLineHeightPx(HFONT font) const noexcept {
+        if (font == nullptr || window == nullptr) return 0;
+        HDC dc = ::GetDC(window);
+        if (dc == nullptr) return 0;
+        if (font != nullptr) ::SelectObject(dc, font);
+        TEXTMETRICW text{};
+        const bool got = ::GetTextMetricsW(dc, &text) != FALSE;
+        ::ReleaseDC(window, dc);
+        return got ? static_cast<int>(text.tmHeight) : 0;
+    }
+
+    // Сколько строк займёт строка состояния в полосе шириной contentWidthPx.
+    //
+    // Считается РОВНО так, как считает DrawText с DT_WORDBREAK: перенос идёт по
+    // пробелам, слово не делится. Поэтому деление ширины на ширину полосы
+    // здесь не годится — оно даёт нижнюю границу, а не число строк, и на
+    // длинном слове у края дало бы на строку меньше, и хвост срезался бы снова.
+    // Слова меряются тем же шрифтом, которым печатается строка.
+    [[nodiscard]] int statusLineCount(int contentWidthPx) const {
+        const int room = std::max(1, contentWidthPx);
+        const HFONT font = fonts[1];
+        const std::string text = model.statusText();
+        std::size_t at = 0;
+        int lines = 1;
+        int used = 0;
+        while (at < text.size()) {
+            std::size_t space = text.find(' ', at);
+            const std::size_t end = space == std::string::npos ? text.size() : space;
+            const int word = measureTextPx(toWide(text.substr(at, end - at)), font);
+            if (word <= 0) break;  // мерить нечем — держим одну строку и не рискуем
+            if (used > 0 && used + measureTextPx(L" ", font) + word > room) {
+                ++lines;
+                used = word;
+            } else {
+                used += (used > 0 ? measureTextPx(L" ", font) : 0) + word;
+            }
+            if (space == std::string::npos) break;
+            at = space + 1;
+        }
+        return std::clamp(lines, 1, kDisksStatusMaxLines);
+    }
+
     [[nodiscard]] DisksLayout currentLayout() const {
         RECT client{};
         if (window == nullptr || ::GetClientRect(window, &client) == FALSE) return DisksLayout{};
@@ -2185,9 +2246,14 @@ struct ViewState {
         const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
         int mapHeightPx = static_cast<int>(model.mapHeightDip(mapMetrics));
         if (mapWillBeEmpty()) mapHeightPx += scale.dip(72.0);
+        // Полоса строки состояния — ширина минус поле слева и справа: ровно
+        // contentWidth_, который раскладка и вычислит. Считаем здесь тем же
+        // paddingDip, поэтому числа сходятся, а не совпадают случайно.
+        const int padPx = std::max(0, dipToPx(metrics.paddingDip, dpi));
+        const int statusWidthPx = static_cast<int>(client.right) - 2 * padPx;
         return DisksLayout::compute(metrics, dpi, static_cast<int>(client.right), static_cast<int>(client.bottom),
                                     mapHeightPx, static_cast<int>(model.cardLines().size()),
-                                    filters, actions);
+                                    fontLineHeightPx(fonts[1]), statusLineCount(statusWidthPx), filters, actions);
     }
 
     // Ширина кнопки по её подписи: раскладка не знает шрифтов, а фиксированная
@@ -2921,7 +2987,16 @@ struct ViewState {
                                  childVisible | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS |
                                      LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER,
                                  0, 0, 0, 0, window, reinterpret_cast<HMENU>(kChildList), instance, this);
-        status = ::CreateWindowExW(0, L"STATIC", nullptr, childVisible | SS_LEFT | SS_ENDELLIPSIS | SS_NOPREFIX, 0,
+        // SS_ENDELLIPSIS СНЯТ сознательно. Нативный Static с этим стилем рисует
+        // текст ОДНОЙ строкой и режет её по ширине многоточием: переноса не
+        // происходит вовсе: проверено снимком при FontScalePercent 200 (текст
+        // 1267 px в полосе 648x58) — вторая строка осталась пустой, а хвост
+        // («4 тома», «Предупреждение (3)») исчез за многоточием. Многоточие честнее обрезки, но перенос
+        // сохраняет и число разделов, и число томов, и число замечаний, то есть
+        // ровно то, ради чего строка и нужна. Теперь высоты хватает всем строкам
+        // (statusLineCount считает перенос так же, как DrawText), а если места
+        // не хватит совсем, раскладка убирает строку целиком, а не режет её.
+        status = ::CreateWindowExW(0, L"STATIC", nullptr, childVisible | SS_LEFT | SS_NOPREFIX, 0,
                                    0, 0, 0, window, reinterpret_cast<HMENU>(kChildStatus), instance, this);
         card = ::CreateWindowExW(0, L"STATIC", nullptr, childVisible | SS_OWNERDRAW, 0, 0, 0, 0, window,
                                  reinterpret_cast<HMENU>(kChildCard), instance, this);
@@ -3190,11 +3265,24 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             }
             return 0;
         }
-        case WM_DPICHANGED: {
-            const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+        case WM_DPICHANGED:
+        case WM_DPICHANGED_BEFOREPARENT:
+        case WM_DPICHANGED_AFTERPARENT: {
+            // В паре BEFORE/AFTERPARENT lParameter НЕ прямоугольник (см.
+            // CleanupScreen — там та же разборка и она же приведена первой):
+            // размер окна пересчитывает система, от экрана нужны DPI, шрифты и
+            // раскладка. Экран — внук главного окна, и per-monitor v2 шлёт эту
+            // пару в том числе ему, поэтому читать lParam как RECT здесь
+            // нельзя: SetWindowPos получил бы мусор.
+            const bool hasSuggested = (message == WM_DPICHANGED);
+            const auto* suggested = hasSuggested ? reinterpret_cast<const RECT*>(lParam) : nullptr;
             if (HIWORD(wParam) > 0) state->dpi = HIWORD(wParam);
             state->theme.setDpi(static_cast<unsigned>(state->dpi));
-            if (suggested != nullptr) {
+            if (state->renderer.ready() && state->dpi > 0) {
+                const float value = static_cast<float>(state->dpi);
+                state->renderer.setDpi(value, value);
+            }
+            if (suggested != nullptr && suggested->right > suggested->left && suggested->bottom > suggested->top) {
                 ::SetWindowPos(window, nullptr, suggested->left, suggested->top, suggested->right - suggested->left,
                                suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
             }
@@ -3545,7 +3633,19 @@ void DisksScreen::setDpi(int dpi) {
     auto& state = *impl_;
     if (dpi > 0) state.dpi = dpi;
     state.theme.setDpi(static_cast<unsigned>(state.dpi));
+    // Цель Direct2D у карты привязана к DPI окна, а Renderer::create() читает
+    // GetDpiForWindow один раз — при создании. Системный масштаб при переносе
+    // окна на другой монитор (и при эмуляции 150 % в воротах) GetDpiForWindow не
+    // меняет, поэтому без этого шага карта навсегда осталась бы в 96 DPI.
+    if (state.renderer.ready()) {
+        const float value = static_cast<float>(state.dpi);
+        state.renderer.setDpi(value, value);
+    }
     if (state.window == nullptr) return;
+    // applyPalette() внутри пересоздаёт и ресурсы карты (applyMapResources) уже
+    // под новым DPI, applyFonts() перевешивает шрифты на все контролы, а
+    // refreshAll() честно пересчитывает раскладку: DisksLayout::compute по
+    // новому dpi → layout() → syncColumnWidths() по новой полосе.
     state.applyPalette();
     state.applyFonts();
     state.refreshAll();

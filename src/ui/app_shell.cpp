@@ -370,6 +370,81 @@ HWND AppShell::screenWindow(PageId page) const noexcept {
     return nullptr;
 }
 
+void AppShell::applyInterfaceDpi(const DpiScale& dpi, const char* reason) noexcept {
+    // Ноль — это «DPI неизвестен», и молчаливые 96 здесь означали бы скачок
+    // содержимого (то же рассуждение, что в handleDpiChanged).
+    const int value = static_cast<int>(dpi.x != 0 ? dpi.x : kBaseDpi);
+    if (!screensReady_) {
+        // Экранов ещё нет — запоминать нечего, но и жаловаться незачем: они
+        // получат масштаб в create() из того же поля dpi_.
+        screensDpi_ = static_cast<UINT>(value);
+        return;
+    }
+    int updated = 0;
+    int stale = 0;
+    // Все пять, а не только активный: скрытый экран получает setDpi заранее и
+    // показывается уже в новом масштабе, иначе переключение страницы рисовало
+    // бы содержимое в 96 DIP поверх окна в 150 %.
+    auto apply = [&](auto& screen, PageId page) noexcept {
+        if (screen == nullptr) return;
+        if (!screenDpi(page)) ++stale;
+        try {
+            screen->setDpi(value);
+            ++updated;
+        } catch (...) {
+            // Один экран не пересчитал масштаб — остальные четыре обязаны:
+            // иначе сломанный экран утащил бы за собой весь интерфейс (§5: ни
+            // один отказ не роняет процесс и не оставляет окно пустым).
+            MRP_LOG_ERROR("ui.dpi.screen_failed", "экран не пересчитан под новый DPI");
+            logEvent(core::LogLevel::Error, "ui.dpi.screen_failed", "экран не пересчитан под новый DPI", "page",
+                     pageKey(page), "dpi", value);
+        }
+    };
+    apply(disksScreen_, PageId::Disks);
+    apply(cleanupScreen_, PageId::Cleanup);
+    apply(overviewScreen_, PageId::Overview);
+    apply(reportScreen_, PageId::Report);
+    apply(settingsScreen_, PageId::Settings);
+    screensDpi_ = static_cast<UINT>(value);
+    // Рельс и хост — после экранов: экранная раскладка считается по размеру
+    // хоста, а хост получает размер от layoutContentHost.
+    layoutRail();
+    layoutContentHost();
+    refreshActiveScreen();
+    invalidateChrome();
+    logEvent(core::LogLevel::Info, "ui.dpi.screens_applied", "масштаб содержимого пересчитан", "dpi", value,
+             "screens", static_cast<long long>(updated), "stale", static_cast<long long>(stale),
+             "reason", std::string(reason != nullptr ? reason : "unknown"));
+}
+
+void AppShell::applyInterfaceAppearance(const char* reason) noexcept {
+    if (screensReady_) {
+        // У каждого экрана своя копия темы: перечитываем её (схема, кегли,
+        // пользовательский масштаб текста) и заново навешиваем шрифты и палитру.
+        auto reload = [](auto& screen) noexcept {
+            if (screen == nullptr) return;
+            try {
+                screen->reloadTheme();
+            } catch (...) {
+                MRP_LOG_ERROR("ui.theme.screen_failed", "экран не перечитал тему");
+            }
+        };
+        reload(disksScreen_);
+        reload(cleanupScreen_);
+        reload(overviewScreen_);
+        reload(reportScreen_);
+        reload(settingsScreen_);
+    }
+    // applyInterfaceDpi следом и сразу с новым шрифтом: перечитанная тема без
+    // пересчёта раскладки дала бы новые кегли в старых координатах.
+    applyInterfaceDpi(dpi_, reason);
+}
+
+bool AppShell::screenDpi(PageId page) noexcept {
+    if (!screensReady_) return false;
+    return screenWindow(page) != nullptr && screensDpi_ == dpi_.x;
+}
+
 void AppShell::mountScreens() {
     if (screensReady_ || contentHost_ == nullptr) return;
     const int dpi = static_cast<int>(dpi_.x);
@@ -429,6 +504,9 @@ void AppShell::mountScreens() {
         settingsScreen_->refresh();
     }
     screensReady_ = true;
+    // create() каждого экрана получил dpi_.x и применил его, поэтому дальше
+    // «экраны живут по текущему масштабу» — правда, а не первое же сравнение.
+    screensDpi_ = static_cast<UINT>(dpi_.x);
     showActiveScreen(navigator_.current());
     logEvent(core::LogLevel::Info, "ui.screens.mounted",
              "экраны созданы в хосте содержимого", "count", static_cast<long long>(std::size(slots)));
@@ -1064,6 +1142,9 @@ LRESULT AppShell::handleMessage(HWND window, UINT message, WPARAM wParam, LPARAM
             theme_.setDpi(dpi_.x);
             layoutRail();
             layoutContentHost();
+            // Экраны — тоже: монитор мог смениться без WM_DPICHANGED (например,
+            // окно осталось на месте, а под ним сменился экран).
+            applyInterfaceDpi(dpi_, "display_change");
             invalidateChrome();
             logEvent(core::LogLevel::Info, "ui.dpi.display_changed", "сменилась топология мониторов", "dpi", dpi_.x);
         }
@@ -1078,6 +1159,12 @@ LRESULT AppShell::handleMessage(HWND window, UINT message, WPARAM wParam, LPARAM
     case WM_SYSCOLORCHANGE:
         if (theme_.applyMessage(message, wParam, lParam)) {
             applyWindowDarkMode(window);
+            // Только по главному окну: WM_SETTINGCHANGE получают и главное окно,
+            // и хост содержимого, а пересчитать экраны дважды — значит создать
+            // шрифты дважды. Экраны — дети хоста и сообщение этой рассылки не
+            // получают, поэтому без этого шага они остались бы в прежней схеме
+            // и прежних кеглях, пока кто-то не откроет их заново.
+            if (isMainWindow(window)) applyInterfaceAppearance("settings_change");
             invalidateChrome();
         }
         return 0;
@@ -1380,6 +1467,13 @@ void AppShell::handleDpiChanged(HWND window, UINT dpiX, UINT dpiY, const RECT* s
     ::InvalidateRect(window, nullptr, FALSE);
 
     logEvent(core::LogLevel::Info, "ui.dpi.changed", "масштаб интерфейса изменился", "dpi", dpiX);
+    // Экраны пересчитываются и когда DPI не изменился (screensDpi_ != dpi_.x):
+    // так добивается первый WM_DPICHANGED, пришедший раньше, чем экраны смонтиро-
+    // ваны или обновились. Без этой проверки экран, получивший DPI мимо
+    // handleDpiChanged (своё создание, чужой хук), навсегда остался бы в 96 DIP.
+    if (changed || screensDpi_ != dpi_.x) {
+        applyInterfaceDpi(dpi_, "window_dpi_changed");
+    }
     if (changed) {
         // suggested для дочернего окна нет — подставляем текущий прямоугольник,
         // чтобы обработчик всегда получал одинаковый вид аргумента.

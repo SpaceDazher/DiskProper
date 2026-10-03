@@ -2061,12 +2061,18 @@ LRESULT CALLBACK viewProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             }
             return 0;
         }
-        case WM_DPICHANGED: {
-            const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+        case WM_DPICHANGED:
+        case WM_DPICHANGED_BEFOREPARENT:
+        case WM_DPICHANGED_AFTERPARENT: {
+            // lParameter — прямоугольник ТОЛЬКО у WM_DPICHANGED; в паре
+            // BEFORE/AFTERPARENT там мусор, а размер окна пересчитывает система
+            // (та же разборка, что в CleanupScreen).
+            const bool hasSuggested = (message == WM_DPICHANGED);
+            const auto* suggested = hasSuggested ? reinterpret_cast<const RECT*>(lParam) : nullptr;
             const int newDpi = HIWORD(wParam);
             if (newDpi > 0) state->dpi = newDpi;
             state->theme.setDpi(static_cast<unsigned>(state->dpi));
-            if (suggested != nullptr) {
+            if (suggested != nullptr && suggested->right > suggested->left && suggested->bottom > suggested->top) {
                 ::SetWindowPos(window, nullptr, suggested->left, suggested->top, suggested->right - suggested->left,
                                suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
             }

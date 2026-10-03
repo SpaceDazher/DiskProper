@@ -304,7 +304,12 @@ VolumeUsage volumeUsage(const Volume& volume) noexcept {
     usage.sizesKnown = volume.totalBytes > 0;
     usage.consistent = volume.freeBytes <= volume.totalBytes;
     usage.freeFraction = freeRatio(volume.totalBytes, volume.freeBytes);
-    usage.usedFraction = usedRatio(volume.totalBytes, volume.freeBytes);
+    // Доля занятого — ДОПОЛНЕНИЕ доли свободного, а не вторая независимая
+    // величина: freeRatio и usedRatio считают одно и то же разными
+    // порядками, и на половинах расходились на единицу последнего бита, из-за
+    // чего 1 - free != used для одной и той же пары байтов. Нулевой размер —
+    // обе доли нулевые: «нет данных» это не «занято всё».
+    usage.usedFraction = volume.totalBytes == 0 ? 0.0 : 1.0 - usage.freeFraction;
     return usage;
 }
 
@@ -381,7 +386,18 @@ InventoryUsage inventoryUsage(const std::vector<PhysicalDisk>& disks) {
     }
     usage.unallocatedBytes = saturatingSub(usage.totalBytes, usage.volumeBytes);
     usage.freeFraction = freeRatio(usage.volumeBytes, usage.freeBytes);
-    usage.usedFraction = usedRatio(usage.volumeBytes, usage.usedBytes);
+    // Доля занятого = 1 - доля свободного, и это единственное верное определение:
+    // usedBytes = volumeBytes - freeBytes уже записано выше, а usedRatio(total, free)
+    // ждёт на втором месте СВОБОДНЫЕ байты. Сюда раньше подставлялись usedBytes, то
+    // есть usedRatio(usage.volumeBytes, usage.usedBytes) = (volumeBytes - usedBytes)
+    // / volumeBytes — ровно freeFraction, и оба поля несли одну долю свободного
+    // (D-79, строка состояния печатала «Занято: 962 ГБ (6,1 %)»).
+    //
+    // Нулевой объём — обе доли нулевые: размер томов не пришёл, показывать
+    // «занято 100 %» от несуществующего знаменателя нельзя (§10). То же и при
+    // knownVolumeCount == 0: freeKnown для UI остаётся ложью, и прочерк рисует
+    // он, а не доля.
+    usage.usedFraction = usage.volumeBytes == 0 ? 0.0 : 1.0 - usage.freeFraction;
     usage.freeKnown = usage.volumeCount > 0 && usage.unknownVolumeCount == 0;
     return usage;
 }

@@ -353,6 +353,12 @@ struct MapLayout {
 inline constexpr int kDisksFilterCount = 3;
 inline constexpr int kDisksActionCount = 5;
 
+// Потолок строк у строки состояния. Строка переносится, но не бесконечно: иначе
+// при крупном шрифте она съела бы окно целиком, и раскладка убрала бы её совсем —
+// строка, которой нет, хуже строки, которая обрезана: про неё хотя бы известно,
+// что она должна быть.
+inline constexpr int kDisksStatusMaxLines = 4;
+
 struct DisksMetrics {
     double paddingDip{6.0};
     double buttonHeightDip{26.0};
@@ -427,12 +433,18 @@ enum class HitTarget : std::uint8_t {
 // фиксированная ширина кнопки означала бы либо обрезанную подпись (§12), либо
 // пустое место. Здесь они только распределяются: если места не хватает, все
 // кнопки сжимаются пропорционально, но не ниже buttonMinWidthDip.
+//
+// statusLineHeightPx и statusLineCount приходят по той же причине: высоту строки
+// состояния задаёт не метрика, а её собственный шрифт. statusHeightDip остаётся
+// полом (одна строка при 100 % шрифта), а сверху добавляется столько строк,
+// сколько тексту нужно при текущей ширине полосы.
 class DisksLayout {
 public:
     DisksLayout() = default;
 
     static DisksLayout compute(const DisksMetrics& metrics, int dpi, int clientWidthPx, int clientHeightPx,
-                               int mapHeightPx, int cardLineCount,
+                               int mapHeightPx, int cardLineCount, int statusLineHeightPx = 0,
+                               int statusLineCount = 1,
                                const std::vector<int>& filterWidthsPx = {},
                                const std::vector<int>& actionWidthsPx = {});
 

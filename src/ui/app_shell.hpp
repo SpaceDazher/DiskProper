@@ -310,6 +310,14 @@ protected:
 
     // Смена DPI: suggested — прямоугольник, который система предлагает занять.
     // Он уже применён окном к этому моменту, переносить его повторно не нужно.
+    //
+    // Порядок вызова важен и теперь зафиксирован: к этому моменту каркас УЖЕ
+    // пересчитал все пять экранов (applyInterfaceDpi), рельс и активную
+    // страницу, поэтому переопределение видит уже согласованное состояние и не
+    // обязано повторять раскладку. Раньше хук звался, но не вызывался никем, а
+    // экраны не пересчитывал никто: при 150 % окно и рельс ехали в новом
+    // масштабе, а содержимое оставалось в метриках 96 DPI (столбцы 92 px вместо
+    // 138, шрифты и отступы те же).
     virtual void onDpiChanged(const DpiScale& /*dpi*/, const RECT& /*suggested*/) {}
 
     // WM_COMMAND от меню, рельса и кнопок. controlId — идентификатор команды или
@@ -474,6 +482,11 @@ private:
     std::unique_ptr<report::ReportScreen> reportScreen_;
     std::unique_ptr<settings::SettingsScreen> settingsScreen_;
     bool screensReady_{false};
+    // DPI, под который последний раз пересчитаны экраны (0 — ни разу).
+    // Отдельное поле, а не dpi_.x: окно может получить DPI раньше, чем экраны
+    // дойдут до своей точки пересчёта (создание, первый WM_DPICHANGED), и тогда
+    // «dpi_.x == screensDpi_» сказало бы «всёapplied», хотя экраны ещё в 96 DIP.
+    UINT screensDpi_{0};
 
     // Создать все пять и показать стартовую страницу. Вызывается один раз, когда
     // хост содержимого уже создан и размеры известны.
@@ -483,6 +496,28 @@ private:
     void showActiveScreen(PageId page);
     void refreshActiveScreen();
     [[nodiscard]] HWND screenWindow(PageId page) const noexcept;
+
+    // --- Масштаб содержимого: единственная точка, где он пересчитывается ------
+    //
+    // DPI приходит тремя разными путями (перенос окна между мониторами,
+    // WM_DPICHANGED_AFTERPARENT дочернему хосту и WM_DISPLAYCHANGE при смене
+    // топологии), и ни один из них не приходит в экран: окно экрана — внук
+    // главного, а per-monitor v2 сообщает BEFOREPARENT/AFTERPARENT только
+    // прямым детям. Поэтому список экранов и порядок вызовов живут здесь, а не
+    // в трёх обработчиках.
+    //
+    // applyInterfaceDpi: пересчитать все пять экранов под новый dpi, потом
+    // рельс, активный экран и перерисовку. reason — короткое имя источника
+    // («window_dpi_changed», «display_change», «settings_change»), оно идёт в
+    // журнал: по журналю видно, КТО привёл экран к новому масштабу.
+    void applyInterfaceDpi(const DpiScale& dpi, const char* reason) noexcept;
+    // То же плюс перечитывание схемы и пользовательского масштаба текста из
+    // темы (WM_SETTINGCHANGE/WM_THEMECHANGED/WM_SYSCOLORCHANGE): у каждого
+    // экрана своя копия темы, и без этого вызова она осталась бы в прежней
+    // палитре и прежних кеглях.
+    void applyInterfaceAppearance(const char* reason) noexcept;
+    // Экран страницы создан и живёт по текущему DPI каркаса. Ложь — либо
+    // окна ещё нет, либо масштаб содержимого отстал от окна.
     [[nodiscard]] bool screenDpi(PageId page) noexcept;
     bool railFocused_{false};              // клавиатурный фокус на рельсе
     bool railMouseTracked_{false};         // WM_MOUSELEAVE уже подписан
