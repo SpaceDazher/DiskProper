@@ -11,6 +11,8 @@
 #   ... -Width 1280 -Height 720                    окно 1280x720 логических пикселей
 #   ... -Width 1280 -Height 720 -DpiPercent 150    то же при 150 % (окно 1920x1080)
 #   ... -ThemeMode light -ExpectBackground light   палитра пришла из темы, а не из константы
+#   ... -Page disks -ThemeMode dark                страница выбрана состоянием (БЕЗ фокуса),
+#                                                 проверка кода 14 работает и без -AllPages
 #
 # -Width/-Height заданы в логических пикселях (DIP, 96 DPI = 1.0), а не в
 # физических: при -DpiPercent 150 окно 1280x720 DIP становится окном 1920x1080
@@ -195,7 +197,34 @@
 #       той же команды не совпали (окно, клиент, чернила, цвета, страница);
 #  14 — строки списка или дерева нарисованы невидимыми: список непустой, а
 #       текста в области строк меньше -MinListTextPixels или он занимает
-#       полосу уже -MinListTextSpanPercent % ширины (только при -AllPages).
+#       полосу уже -MinListTextSpanPercent % ширины. Применяется к СТАРТОВОЙ
+#       странице всегда (страница выбирается ключом -Page — см. «СТРАНИЦА БЕЗ
+#       ФОКУСА»), а к остальным четырём — при -AllPages.
+#
+# СТРАНИЦА БЕЗ ФОКУСА (ключ -Page). Проверка невидимых строк меряет область
+# строк списка на ОТКРЫТОЙ странице, а открыть страницу по-старому можно было
+# только обходом -AllPages: он жмёт Ctrl+1..5 настоящим вводом (keybd_event)
+# после ALT-приёма, то есть крадёт фокус, а переднее окно на машине человека
+# почти всегда занято чужим приложением (chrome). Локально -AllPages честно
+# даёт код 11, и числа проверки кода 14 оказываются недостижимы — а именно
+# локально их и надо уметь получать: отсутствие числа не отличить от «дефекта
+# нет». Измерено (docs/defects.md §3.18.1): ни в одном локальном прогоне волн
+# S и T проверка не выполнилась ни разу, тогда как в CI она выполняется.
+#
+# Решение — выбрать страницу состоянием, а не вводом. Приложение само
+# восстанавливает сохранённую страницу из HKCU\Software\MrProper\UI\nav.current
+# (Navigator::importState, src/ui/nav.cpp; ключ формата — «disks», то есть ровно
+# pageKey() из src/ui/nav.hpp), поэтому ворота пишут это значение и запускают
+# приложение БЕЗ --fresh-ui-state. Ни SetForegroundWindow, ни ALT, ни keybd_event
+# при этом не вызываются: переднее окно остаётся прежним, ворота ничего не
+# крадут и не печатают. Ключ -Page <overview|disks|cleanup|report|settings>
+# делает ровно это, проверяет по -ExpectPage, что страница действительно
+# открылась (иначе код 12), и возвращает прежнее значение nav.current после
+# прогона — включая состояние «значения не было».
+#
+# Что -Page НЕ заменяет: обход -AllPages нужен, чтобы проверить все пять
+# страниц за один прогон, и он по-прежнему требует переднего плана (код 11).
+# -Page даёт одну страницу честно и без фокуса.
 #
 # СОСТОЯНИЕ ИНТЕРФЕЙСА: почему ворота приводят его к известному (Q3).
 #
@@ -266,6 +295,10 @@ param(
     # --- состояние интерфейса: сброс по умолчанию (см. шапку выше) -------------
     [switch]$KeepUiState,
     [string]$ExpectPage = '',
+    # Страница для замера, выбранная СОСТОЯНИЕМ, а не вводом: см. шапку,
+    # «СТРАНИЦА БЕЗ ФОКУСА». Пусто — страница не выбирается, запуск идёт как
+    # обычно (с --fresh-ui-state, то есть на «Обзоре»).
+    [string]$Page = '',
     [int]$DeterminismRuns = 1,
     [int]$KeepFontScale = 100,
     # --- обход всех страниц (см. шапку) ---------------------------------------
@@ -436,6 +469,26 @@ if ($ExpectPage -ne '' -and @($script:pages | Where-Object { $_.Name -eq $Expect
     exit 2
 }
 
+if ($Page -ne '') {
+    # -Page пишется в nav.current буквально, поэтому опечатка здесь означала бы
+    # «страница не найдена» в журнале приложения, а тихий возврат к «Обзору» —
+    # то есть замер чужой страницы. Имя проверяется по тому же списку рельса.
+    if (@($script:pages | Where-Object { $_.Name -eq $Page }).Count -eq 0) {
+        Write-Host "[ui] -Page ожидает overview|disks|cleanup|report|settings, получено '$Page'"
+        exit 2
+    }
+    if ($ExpectPage -ne '' -and $ExpectPage -ne $Page) {
+        # Два ключа о разном противоречат друг другу: -Page выбирает страницу,
+        # -ExpectPage проверяет, какая открылась. Молча брать одну из них —
+        # это замер не того, что человек попросил.
+        Write-Host "[ui] -Page '$Page' и -ExpectPage '$ExpectPage' называют разные страницы"
+        exit 2
+    }
+    # Страница выбрана — проверять надо именно её, иначе ворота напечатают
+    # «стартовая страница: overview» и промолчат о невидимых строках.
+    $ExpectPage = $Page
+}
+
 # --- состояние темы в реестре: запомнить, поставить, вернуть как было ---------
 $script:themePath = 'HKCU:\Software\MrProper\UI'
 $script:themeName = 'ThemeMode'
@@ -484,6 +537,82 @@ function Restore-AppThemeMode {
         }
     } catch {
         Write-Host "[ui] ВНИМАНИЕ: прежний ThemeMode не восстановлен ($($_.Exception.Message))"
+        return 7
+    }
+    return 0
+}
+
+# --- состояние страницы в реестре: nav.current (см. шапку, «СТРАНИЦА БЕЗ ФОКУСА») ---
+#
+# Почему скрипт, а не ключ запуска приложения: приложение пишет и читает
+# nav.current само (Navigator::importState), то есть согласованный ключ запуска
+# уже есть по построению, и добавлять второй ради ворот означало бы менять
+# приложение под инструмент. Флаг --fresh-ui-state при этом не подходит: он
+# именно СБРАСЫВАЕТ состояние, то есть выбранную страницу вместе с ним.
+$script:navCurrentName = 'nav.current'
+$script:navCurrentSaved = $false
+$script:navCurrentSavedValue = ''
+
+# Запомнить прежнее значение nav.current, включая состояние «значения не было».
+function Save-NavCurrentState {
+    $script:navCurrentSaved = $false
+    $script:navCurrentSavedValue = ''
+    try {
+        if (-not (Test-Path -LiteralPath $script:themePath)) { return }
+        $key = Get-Item -LiteralPath $script:themePath
+        $value = $key.GetValue($script:navCurrentName, $null)
+        if ($null -ne $value) {
+            $script:navCurrentSaved = $true
+            $script:navCurrentSavedValue = [string]$value
+        }
+    } catch {
+        # Ключа нет — это не ошибка: «страница не задана» тоже состояние.
+    }
+}
+
+# Поставить страницу на время прогона. Значение — ровно pageKey() из
+# src/ui/nav.hpp: «overview», «disks», «cleanup», «report», «settings».
+function Set-AppNavCurrent([string]$page) {
+    if (-not (Test-Path -LiteralPath $script:themePath)) {
+        New-Item -Path $script:themePath -Force | Out-Null
+    }
+    New-ItemProperty -Path $script:themePath -Name $script:navCurrentName -Value $page `
+        -PropertyType String -Force | Out-Null
+}
+
+# Вернуть прежнее значение. Вызывается ПОСЛЕ закрытия приложения: само
+# приложение пишет nav.current при выходе, и возврат раньше закрытия был бы
+# зачёркнут следующей записью.
+function Restore-AppNavCurrent {
+    if ($Page -eq '') { return 0 }
+    try {
+        if ($script:navCurrentSaved) {
+            New-ItemProperty -Path $script:themePath -Name $script:navCurrentName `
+                -Value $script:navCurrentSavedValue -PropertyType String -Force | Out-Null
+        } elseif (Test-Path -LiteralPath $script:themePath) {
+            Remove-ItemProperty -LiteralPath $script:themePath -Name $script:navCurrentName `
+                -ErrorAction SilentlyContinue
+        }
+        # Возврат ПРОВЕРЯЕТСЯ чтением, а не считается выполненным по факту записи.
+        # На машине, где параллельно работают другие агенты, чужой запуск того же
+        # приложения дописывает nav.current при своём закрытии — то есть настройка
+        # общая, и «ворота вернули своё» может оказаться неправдой через секунду.
+        # Тихая неудача здесь хуже явной: она выглядела бы как «состояние цело».
+        $current = $null
+        try { $current = (Get-Item -LiteralPath $script:themePath).GetValue($script:navCurrentName, $null) } catch { }
+        $expected = if ($script:navCurrentSaved) { $script:navCurrentSavedValue } else { $null }
+        $same = if ($null -eq $expected) { $null -eq $current } else { [string]$current -eq [string]$expected }
+        if ($same) {
+            Write-Host ("[ui] nav.current возвращён: {0}" -f `
+                $(if ($script:navCurrentSaved) { "'$($script:navCurrentSavedValue)'" } else { 'значения не было' }))
+        } else {
+            Write-Host ("[ui] ВНИМАНИЕ: nav.current после возврата = '{0}', а ожидалось '{1}' — состояние переписал чужой запуск приложения" -f `
+                $(if ($null -eq $current) { '<нет>' } else { $current }), `
+                $(if ($script:navCurrentSaved) { $script:navCurrentSavedValue } else { '<нет>' }))
+            return 7
+        }
+    } catch {
+        Write-Host "[ui] ВНИМАНИЕ: прежний nav.current не восстановлен ($($_.Exception.Message))"
         return 7
     }
     return 0
@@ -1251,7 +1380,15 @@ function Measure-ListItem($shot, $windowRect, [IntPtr]$hwnd, [string]$class,
 # Violations — массив строк с классом, подписью, прямоугольником в координатах
 # хоста и величиной вылета по каждой стороне, а Hidden — строки списка и
 # дерева, нарисованные невидимыми (отдельный отказ, отдельный код 14).
-function Measure-PageLayout([IntPtr]$hostWindow, [int]$tolerance, $shot, $windowRect) {
+#
+# $listsOnly — режим «только невидимые строки» (D-77). Обход раскладки ждёт
+# переднего плана и потому недостижим локально, а мера строк — нет: она читает
+# снимок уже открытой страницы. Флаг отбрасывает вылет элементов (код 10),
+# оставляя ровно то, что нужно стартовой странице: обход всех страниц по-прежнему
+# получает обе меры целиком. Измерение при этом ОДНО и то же — второй код
+# измерения разошёлся бы с первым через месяц.
+function Measure-PageLayout([IntPtr]$hostWindow, [int]$tolerance, $shot, $windowRect,
+                            [bool]$listsOnly = $false) {
     $client = New-Object MrWin+RECT
     [void][MrWin]::GetClientRect($hostWindow, [ref]$client)
     $origin = New-Object MrWin+POINT
@@ -1333,7 +1470,7 @@ function Measure-PageLayout([IntPtr]$hostWindow, [int]$tolerance, $shot, $window
                 if ($why -eq '') { $why = $list.ColumnWhy }
                 $hiddenWhy = $list.RowsWhy
             }
-            if ($why -ne '') { [void]$violations.Add($head + $why.TrimStart(';').Trim()) }
+            if ($why -ne '' -and -not $listsOnly) { [void]$violations.Add($head + $why.TrimStart(';').Trim()) }
             if ($hiddenWhy -ne '') { [void]$hidden.Add($head + $hiddenWhy) }
         }
     }
@@ -1357,9 +1494,20 @@ function Stop-AppProcess($proc) {
 # интерфейса (см. шапку): приложение стартует как при первой установке и
 # ничего не пишет обратно в HKCU. -KeepUiState оставляет привычное поведение
 # для того, кто СПЕЦИАЛЬНО хочет померить своё сохранённое состояние.
+#
+# -Page — третий случай, и он важнее обоих: страницу выбрать иначе нечем (см.
+# шапку, «СТРАНИЦА БЕЗ ФОКУСА»). Выбранная страница лежит в nav.current, а
+# --fresh-ui-state это значение как раз стирает, поэтому с -Page флаг не
+# передаётся. Побочный эффект тот же, что у -KeepUiState: приложение
+# восстанавливает и window.placement, и настроенные ранее страницы, — но размер
+# окна ворота всё равно задают сами (-Width/-Height плюс MoveWindow).
 function Start-AppProcess {
-    if ($KeepUiState) {
-        Write-Host '[ui] состояние интерфейса НЕ сбрасывается (-KeepUiState): окно может прийти из HKCU'
+    if ($KeepUiState -or $Page -ne '') {
+        if ($Page -ne '') {
+            Write-Host ("[ui] страница '{0}' выбрана состоянием (nav.current), состояние интерфейса НЕ сбрасывается — фокус не трогаем" -f $Page)
+        } else {
+            Write-Host '[ui] состояние интерфейса НЕ сбрасывается (-KeepUiState): окно может прийти из HKCU'
+        }
         return Start-Process $Exe -PassThru
     }
     Write-Host '[ui] состояние интерфейса сброшено флагом запуска --fresh-ui-state'
@@ -1374,6 +1522,11 @@ $script:lastRun = @{}
 function Invoke-Smoke {
     $proc = Start-AppProcess
     try {
+        # pid прогоняемого процесса печатается рядом с владельцем переднего плана
+        # (Get-ForegroundOwner тоже печатает pid): без него в логе не видно, чей
+        # это процесс, когда на машине параллельно запущено ещё одно окно того же
+        # приложения, и чужой прогон ворота можно спутать со своим.
+        Write-Host ("[ui] процесс приложения: pid {0}" -f $proc.Id)
         Start-Sleep -Seconds $SettleSeconds
         if ($proc.HasExited) { Write-Host "[ui] процесс упал, код $($proc.ExitCode)"; return 6 }
 
@@ -1653,6 +1806,40 @@ function Invoke-Smoke {
             }
         }
 
+        # --- невидимые строки списка на СТАРТОВОЙ странице (код 14, D-77) -------
+        # Живёт здесь, а не только в обходе -AllPages: обход требует переднего
+        # плана, то есть локально (переднее окно занято чужим приложением) он
+        # даёт код 11 и числа этой проверки недостижимы — а это ровно тот режим,
+        # в котором их и надо получать. Страница при этом выбирается состоянием
+        # (-Page -> nav.current), а не вводом, поэтому ворота не крадут фокус.
+        #
+        # Под -AllPages проверка НЕ повторяется: обход начинается с той же
+        # стартовой страницы и меряет её целиком (вместе с раскладкой).
+        #
+        # Отказ здесь — самый важный из кодов содержимого: элемент, нарисованный
+        # белым по белому, пользователь не видит, и никакие счётчики чернил его
+        # не показывают. Пустой список (строк 0) проверку не вызывает — «ничего
+        # не найдено» законно, см. Measure-ListItem.
+        if (-not $AllPages) {
+            $startListHost = Find-ContentHost $hwnd $rect
+            if (-not $startListHost.Found) {
+                Write-Host '[ui] ПРОВАЛ: окно содержимого не найдено — негде искать списки'
+                return 9
+            }
+            $startShot = @{ Bytes = $bytes; Stride = $stride }
+            $startLayout = Measure-PageLayout $startListHost.Hwnd $LayoutTolerance $startShot $rect $true
+            Write-Host ("[ui] страница '{0}': проверено видимых элементов {1}, невидимых списков {2} (без -AllPages)" -f `
+                $startPage, $startLayout.Checked, $startLayout.Hidden.Count)
+            if ($startLayout.Hidden.Count -gt 0) {
+                Write-Host '[ui] ПРОВАЛ: строки списка нарисованы невидимыми на стартовой странице'
+                foreach ($line in $startLayout.Hidden) { Write-Host $line }
+                Write-Host ("[ui] Хост содержимого: клиентская область {0}x{1}, окно содержимого {2}x{3}" -f `
+                    $startListHost.W, $startListHost.H, $cw, $ch)
+                Write-Host ("[ui] страница выбрана ключом -Page '{0}' (nav.current), фокус не перехватывался" -f $Page)
+                return 14
+            }
+        }
+
         # --- обход всех страниц: раскладка каждой (ключ -AllPages) --------------
         # Стоит ПОСЛЕ проверок чернил: они смотрят на стартовую страницу, и
         # их отказ не должен мешать обходу поставить свой, более точный.
@@ -1799,6 +1986,20 @@ function Invoke-DeterminismRuns {
 $themeReady = 0
 Save-ThemeState
 Save-FontScaleState
+if ($Page -ne '') {
+    # Страница ставится ДО запуска приложения и снимается ПОСЛЕ его закрытия
+    # (Invoke-DeterminismRuns закрывает процесс сам). Причина порядка названа
+    # в Restore-AppNavCurrent: приложение пишет nav.current при выходе.
+    try {
+        Save-NavCurrentState
+        Set-AppNavCurrent $Page
+        Write-Host ("[ui] страница '{0}': nav.current поставлен, прежнее значение '{1}' (было: {2})" -f `
+            $Page, $script:navCurrentSavedValue, $(if ($script:navCurrentSaved) { 'да' } else { 'нет' }))
+    } catch {
+        Write-Host "[ui] ПРОВАЛ: не удалось выбрать страницу через nav.current: $($_.Exception.Message)"
+        $themeReady = 7
+    }
+}
 if ($ThemeMode -ne '') {
     try {
         Set-AppThemeMode $ThemeMode
@@ -1821,6 +2022,8 @@ if ($themeReady -eq 0 -and -not $KeepUiState) {
 $code = if ($themeReady -eq 0) { Invoke-DeterminismRuns } else { $themeReady }
 $restored = Restore-AppThemeMode
 $fontRestored = Restore-AppFontScale
+$navRestored = Restore-AppNavCurrent
 if ($code -eq 0 -and $restored -ne 0) { $code = $restored }
 if ($code -eq 0 -and $fontRestored -ne 0) { $code = $fontRestored }
+if ($code -eq 0 -and $navRestored -ne 0) { $code = $navRestored }
 exit $code

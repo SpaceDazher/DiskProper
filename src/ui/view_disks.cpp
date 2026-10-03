@@ -282,6 +282,48 @@ bool lowSpaceOn(std::uint64_t totalBytes, std::uint64_t freeBytes, bool known) {
     return totalBytes > 0 && core::freeRatio(totalBytes, freeBytes) < core::kLowFreeFraction;
 }
 
+// ---------------------------------------------------------------------------
+// Проценты свободного и занятого
+// ---------------------------------------------------------------------------
+//
+// Считаются здесь, а не берутся готовыми полями core::InventoryUsage. Причина
+// конкретная: inventoryUsage (src/core/disk_model.cpp:384) пишет
+//     usage.usedFraction = usedRatio(usage.volumeBytes, usage.usedBytes),
+// а usedRatio(total, free) возвращает (total - free) / total (там же, строка
+// 292). При usedBytes = volumeBytes - freeBytes это РОВНО freeFraction, то есть
+// оба поля несут одну и ту же долю свободного. На диске 1,0 ТБ с 47 ГБ
+// свободными строка состояния печатала «Свободно: 47 ГБ (4,6 %) · Занято:
+// 977 ГБ (4,6 %)»: две одинаковые цифры, и вторая читается как «занято 4,6 %».
+// Правка core — не моя строка, поэтому доля считается на своём слое, из тех же
+// байтов, что и сами числа в строке.
+//
+// Сумма — ровно 100. Округление каждой доли по отдельности расходится на
+// половинах (5,25 % → 5,3 и 94,8, сумма 100,1), поэтому округляется одна доля,
+// а вторая — её дополнение до 100.
+struct UsagePercents {
+    bool known{};
+    std::string freeText;
+    std::string usedText;
+};
+
+// 100 % в десятых долях процента: одна единица счёта — 0,1 %.
+constexpr int kPercentTenths = 1000;
+
+UsagePercents usagePercents(const core::InventoryUsage& usage) noexcept {
+    UsagePercents out;
+    // Размеры томов не пришли — процентов нет, а не «0,0 %»: §10 требует, чтобы
+    // экран говорил «не ответило», а не показывал выдуманный ноль.
+    if (!usage.freeKnown || usage.volumeBytes == 0) return out;
+    const double free = std::clamp(core::freeRatio(usage.volumeBytes, usage.freeBytes), 0.0, 1.0);
+    const int freeTenths =
+        std::clamp(static_cast<int>(std::lround(free * static_cast<double>(kPercentTenths))), 0, kPercentTenths);
+    out.known = true;
+    out.freeText = formatPercent(static_cast<double>(freeTenths) / static_cast<double>(kPercentTenths), 1);
+    out.usedText =
+        formatPercent(static_cast<double>(kPercentTenths - freeTenths) / static_cast<double>(kPercentTenths), 1);
+    return out;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1227,10 +1269,12 @@ bool DisksViewModel::handleKeyDown(std::uint32_t virtualKey, bool controlDown, b
 std::string DisksViewModel::statusText() const {
     if (!impl_->inventory) return tr(StringId::kStatusIdle);
     const core::InventoryUsage& usage = impl_->inventory->usage();
+    const UsagePercents percent = usagePercents(usage);
+    const std::string unknownPercent = std::string(kNoData);
     std::string status = tr(StringId::kDisksFree) + ": " + formatBytes(usage.freeBytes) + " (" +
-                         formatPercent(usage.freeFraction) + ")";
+                         (percent.known ? percent.freeText : unknownPercent) + ")";
     status += " · " + tr(StringId::kDisksUsed) + ": " + formatBytes(usage.usedBytes) + " (" +
-              formatPercent(usage.usedFraction) + ")";
+              (percent.known ? percent.usedText : unknownPercent) + ")";
 
     std::size_t partitions = 0;
     std::size_t volumes = 0;
@@ -1483,6 +1527,12 @@ inline constexpr int kIndentLevels = 3;
 inline constexpr int kNumericColumnFloorPx = 72;
 inline constexpr int kNameColumnFloorPx = 160;
 inline constexpr int kBadgeColumnFloorPx = 16;
+
+// Поле шапки столбцов с каждой стороны плюс запас на округление. Шесть — не
+// догадка, а измерение: при 900x600 подпись «Свободно» начинается на 5 px от
+// края столбца (снимок, шкала 1:1).
+inline constexpr double kHeaderMarginDip = 6.0;
+inline constexpr int kHeaderMarginSlackPx = 2;
 
 // Подстадии отрисовки подпункта в NM_CUSTOMDRAW списка. В commctrl.h этого SDK
 // объявлены только CDDS_PREPAINT/CDDS_ITEMPREPAINT/CDDS_ITEMPOSTPAINT, а
@@ -1869,22 +1919,88 @@ struct ViewState {
         const int numericMin = std::max(kNumericColumnFloorPx, scale.dip(metrics.numericColumnMinDip));
         const int nameMin = std::max(kNameColumnFloorPx, scale.dip(metrics.nameColumnMinDip));
         const int reserve = std::max(kBadgeColumnFloorPx, scale.dip(metrics.badgeColumnDip));
-        const std::array<int, kColumnCount> widths = fitColumnWidths(
-            room, std::max(numericMin, scale.dip(metrics.numericColumnDip)), numericMin, nameMin, reserve);
+        // Числовой столбец — не только метрика, но и ИЗМЕРЕННЫЙ заголовок. При
+        // увеличенном масштабе текста (FontScalePercent, §5 доступность) «Занято»
+        // перестаёт помещаться в 96 px, и syncHeaders сокращал его до «Заня…»:
+        // метрика 96 DIP — это догадка о шрифте, а столбец обязан поместиться в
+        // подпись, которую сам же и рисует (§12: нет обрезанных подписей).
+        const int headerWant = std::max(columnHeaderWidthPx(1), columnHeaderWidthPx(2));
+        const int numericWant = std::max(std::max(numericMin, scale.dip(metrics.numericColumnDip)), headerWant);
+        const std::array<int, kColumnCount> widths =
+            fitColumnWidths(room, numericWant, numericMin, nameMin, reserve);
         for (int i = 0; i < kColumnCount; ++i) {
             ListView_SetColumnWidth(list, i, widths[static_cast<std::size_t>(i)]);
         }
     }
 
-    // Ширина текста тем шрифтом, которым нарисован список. Без неё подпись в
-    // столбце не сократить, а обрезанный заголовок не меняет ни размер окна, ни
-    // размер элементов — поэтому проверка прямоугольников его не видит, и
-    // ворота Measure-ListColumns видят (tools/ui-smoke.ps1, D-71).
-    [[nodiscard]] int textWidthPx(const std::wstring& text) const {
+    // Подпись столбца: имя и, если сортируют по нему, стрелка. Один источник и
+    // для ширины столбца, и для текста заголовка: если они разойдутся, столбец
+    // окажется уже подписи и заголовок станет «Заня…».
+    [[nodiscard]] std::string headerLabel(int column) const {
+        static const std::array<SortKey, kColumnCount> keys{SortKey::Number, SortKey::FreeSpace, SortKey::Size};
+        std::string text = column == 0 ? tr(StringId::kDisksTitle)
+                                       : (column == 1 ? tr(StringId::kDisksFree) : tr(StringId::kDisksUsed));
+        const SortOrder order = model.sort();
+        if (column >= 0 && column < kColumnCount && order.key == keys[static_cast<std::size_t>(column)]) {
+            // Стрелка сортировки — знак, а не слово: она одинакова в обоих
+            // языках и не требует ключа в каталоге строк.
+            text += order.direction == SortDirection::Ascending ? " \xE2\x96\xB2" : " \xE2\x96\xBC";
+        }
+        return text;
+    }
+
+    // Запас под подпись заголовка — на ОБЕ стороны. Шапка рисует текст между
+    // своими внутренними полями (замерено на снимке при 900x600: «Свободно»
+    // начинается на 5 px от края столбца), и если места не хватает, многоточие
+    // дописывает САМА comctl32: при FontScalePercent 200 текст шириной 138 px
+    // в столбец 144 px наш код считал помещающимся, а шапка рисовала «Свобод…».
+    // Одно поле с одной стороны означало ровно этот отказ.
+    [[nodiscard]] int headerInsetPx() const {
+        const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
+        return 2 * std::max(2, scale.dip(kHeaderMarginDip)) + kHeaderMarginSlackPx;
+    }
+
+    // Шрифт, которым нарисован заголовок. Это НЕ fonts[0] — шрифт строк.
+    // SysListView32 создаёт шапку раньше, чем окно получает WM_SETFONT, и
+    // comctl32 оставляет у неё системный шрифт по умолчанию. Мерять «Свободно»
+    // шрифтом строк даёт занижение (замерено при FontScalePercent 200: мерка
+    // 134 px против 138 px подписи на снимке), и столбец, посчитанный по такой
+    // мерке, оказывается уже заголовка: тот и сокращался до «Свобод…».
+    [[nodiscard]] HFONT headerFont() const noexcept {
+        if (list != nullptr) {
+            const HWND header = ListView_GetHeader(list);
+            if (header != nullptr) {
+                const HFONT font = reinterpret_cast<HFONT>(::SendMessageW(header, WM_GETFONT, 0, 0));
+                if (font != nullptr) return font;
+            }
+        }
+        // Шапки нет — список ещё не создан. Меряем шрифтом строк: это хуже,
+        // чем точный ответ, но лучше, чем ничего, и ровно то, что было до
+        // разделения на два шрифта.
+        return fonts[0];
+    }
+
+    // Ширина столбца, в которую его заголовок помещается целиком. Ноль, если
+    // мерять нечем: тогда ширину задаёт метрика, и первый кадр не зависит от
+    // того, успел ли applyFonts отработать.
+    [[nodiscard]] int columnHeaderWidthPx(int column) const {
+        if (column < 0 || column >= kColumnCount) return 0;
+        const HFONT font = headerFont();
+        if (font == nullptr) return 0;
+        const int text = measureTextPx(toWide(headerLabel(column)), font);
+        if (text <= 0) return 0;
+        return text + headerInsetPx();
+    }
+
+    // Ширина текста заданным шрифтом. Без неё подпись в столбце не сократить, а
+    // обрезанный заголовок не меняет ни размер окна, ни размер элементов —
+    // поэтому проверка прямоугольников его не видит, и ворота
+    // Measure-ListColumns видят (tools/ui-smoke.ps1, D-71).
+    [[nodiscard]] int measureTextPx(const std::wstring& text, HFONT font) const {
         if (text.empty() || window == nullptr) return 0;
         HDC dc = ::GetDC(window);
         if (dc == nullptr) return 0;
-        if (fonts[0] != nullptr) ::SelectObject(dc, fonts[0]);
+        if (font != nullptr) ::SelectObject(dc, font);
         SIZE measured{};
         ::GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &measured);
         ::ReleaseDC(window, dc);
@@ -1896,35 +2012,28 @@ struct ViewState {
     // «Свободно» молчит о том, что столбец стал уже, чем нужно (§12).
     [[nodiscard]] std::string ellipsized(std::string_view text, int columnPx) const {
         if (text.empty()) return {};
-        const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
-        const int room = columnPx - std::max(2, scale.dip(4.0));
+        const int room = columnPx - headerInsetPx();
         if (room <= 0) return {};
         const std::wstring wide = toWide(text);
-        if (textWidthPx(wide) <= room) return std::string(text);
+        const HFONT font = headerFont();
+        const auto fits = [this, font, room](const std::wstring& candidate) {
+            return measureTextPx(candidate, font) <= room;
+        };
+        if (fits(wide)) return std::string(text);
         const std::wstring dots = L"…";  // многоточие, а не три точки: одна буква
         for (std::size_t length = wide.size(); length > 0; --length) {
             const std::wstring cut = wide.substr(0, length - 1) + dots;
-            if (textWidthPx(cut) <= room) return toUtf8(cut);
+            if (fits(cut)) return toUtf8(cut);
         }
         return {};
     }
 
     void syncHeaders() {
         if (list == nullptr || !columnsReady) return;
-        const SortOrder order = model.sort();
-        const std::array<SortKey, kColumnCount> keys{
-            SortKey::Number, SortKey::FreeSpace, SortKey::Size};
         for (int i = 0; i < kColumnCount; ++i) {
-            std::string text = i == 0 ? tr(StringId::kDisksTitle)
-                                      : (i == 1 ? tr(StringId::kDisksFree) : tr(StringId::kDisksUsed));
-            if (order.key == keys[static_cast<std::size_t>(i)]) {
-                // Стрелка сортировки — знак, а не слово: она одинакова в обоих
-                // языках и не требует ключа в каталоге строк.
-                text += order.direction == SortDirection::Ascending ? " \xE2\x96\xB2" : " \xE2\x96\xBC";
-            }
             // Подпись приходит по итоговой ширине столбца и не должна вылезать
             // за неё: системный контрол обрезает её молча, без многоточия.
-            setColumnText(i, ellipsized(text, ListView_GetColumnWidth(list, i)));
+            setColumnText(i, ellipsized(headerLabel(i), ListView_GetColumnWidth(list, i)));
         }
     }
 

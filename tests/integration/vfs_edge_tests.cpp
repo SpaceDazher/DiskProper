@@ -176,6 +176,20 @@ std::atomic<unsigned> g_fixtureCounter{0u};
 
 // Записать файл ровно заданным содержимым. Короткая запись означала бы, что тест
 // меряет не то, что создал, поэтому проверяется весь буфер.
+//
+// ДОСЫЛКА ПЕРЕД ЗАКРЫТИЕМ (D-78) — обязательная часть записи, а не украшение.
+// GetCompressedFileSizeW открывает файл заново и читает ОПУБЛИКОВАННОЕ
+// значение, а файловая система публикует метаданные свежезаписанного файла не
+// сразу. Досылка делает состояние файла наблюдаемым сразу после close():
+// замерено, что после FlushFileBuffers значение отдаётся с первой попытки
+// (попыток публикации 1), то есть окно «метаданные ещё не опубликованы» в
+// обычном случае не тратит время. Основной источник недетерминизма исходной
+// проверки — не этот, а сжатие NTFS в %TEMP%; см. комментарий у
+// measurePublishedAllocated, там корень и измерения.
+// Отдельно от этого writeFile честно отдаёт ERROR_DISK_FULL: на томе без
+// свободного места (в этой задаче измерен C: с нулём свободных байт, из-за
+// чего фикстуры не создавались и проверка уходила в видимый пропуск) файл не
+// создаётся — это тоже должно быть видно, а не «красный на пустом месте».
 [[nodiscard]] bool writeFile(const std::wstring& path, std::string_view content, std::uint32_t& win32Error) {
     const std::wstring ext = extended(path);
     ScopedHandle file(::CreateFileW(ext.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
@@ -198,8 +212,127 @@ std::atomic<unsigned> g_fixtureCounter{0u};
         }
         written += done;
     }
+    // Сброс до закрытия: см. комментарий над функцией (D-78). Отказ досылки —
+    // это отказ записи, а не повод продолжать: тест меряет файл, который должен
+    // существовать целиком.
+    if (!::FlushFileBuffers(file.get())) {
+        win32Error = ::GetLastError();
+        return false;
+    }
     win32Error = ERROR_SUCCESS;
     return true;
+}
+
+// Опубликованный аллоцированный размер (D-78).
+//
+// КОРЕНЬ ДЕФЕКТА ИЗМЕРЕН, а не угадан (проба через Add-Type: GetFileAttributesW,
+// CreateFileW/WriteFile/FlushFileBuffers, GetCompressedFileSizeW, SetFileAttributesW,
+// FSCTL_SET_COMPRESSION на этой машине). %TEMP% здесь равен C:\Users\Daniil\AppData\Local\Temp, и его
+// КАТАЛОГ помечен NTFS-сжатием (GetFileAttributesW -> 0x00002810, бит
+// FILE_ATTRIBUTE_COMPRESSED). Файл, созданный в таком каталоге, наследует
+// сжатие: замер — файл 5000 байт, GetCompressedFileSizeW -> 4096 при logical
+// 5000 и флаге compressed. Снять сжатие не помогает НИЧЕГО из проверенного:
+// SetFileAttributesW(FILE_ATTRIBUTE_NORMAL) и на пустом файле, и после записи,
+// и при открытом дескрипторе — возвращает TRUE, а признак остаётся;
+// FSCTL_SET_COMPRESSION(COMPRESSION_FORMAT_NONE) — то же; снятие признака с
+// самого каталога отказывает (win32 2).
+//
+// То есть «allocated >= logical» для такой фикстуры — НЕВЕРНОЕ утверждение:
+// это ровно тот случай, который vfs_size.hpp описывает словами «у сжатого файла
+// она меньше логического размера». А недетерминированным его сделало то, что
+// NTFS сжимает данные НЕ сразу: сжатие идёт своим рабочим потоком, и к моменту
+// замера файл успевает сжаться или не успеть. Отсюда и частота исходного
+// дефекта — 1 красный прогон набора из 14 (docs/defects.md §3.18.3): это гонка
+// с потоком сжатия, а не ошибка кода.
+//
+// Отсюда три части решения, и все три нужны:
+//
+//   1. Инвариант «allocated >= logical» проверяется ТОЛЬКО там, где он
+//      верен: файл не сжат и не разрежен. Для сжатого/разреженного выводится
+//      строка с числами, а из сумм такой файл исключается (см. места
+//      использования). Молча исключать нельзя: иначе на машине со сжатым
+//      %TEMP% проверка молча перестаёт что-либо проверять.
+//
+//   2. Стабильность опубликованного значения: два замера подряд обязаны дать
+//      одну и ту же пару. Это ловит остаточную гонку — «allocated >= logical»
+//      может сойтись и на значении, которое через миллисекунду изменится.
+//
+//   3. Ожидание публикации с ограниченным сроком: значение 0 (или
+//      allocatedKnown == false) означает, что метаданные ещё не опубликованы —
+//      это состояние тома, а не результат кода, и оно обязано быть видимым
+//      строкой пропуска с числами, а не красным прогоном. Досылка в writeFile
+//      убирает это окно в обычном случае: замерено, что после FlushFileBuffers
+//      GetCompressedFileSizeW отдаёт значение сразу (попыток публикации 1).
+//
+// Второе измерение на D: (NTFS, кластер 4096, тот же файл 5000 байт, та же проба
+// плюс GetFileInformationByHandleEx/FileStandardInfo) нужно, чтобы не приписать
+// vfs_size чужое ожидание:
+//   GetCompressedFileSizeW (то, чем меряет vfs_size)              -> 5000 (ровно EOF);
+//   GetFileInformationByHandleEx/FileStandardInfo/AllocationSize  -> 8192.
+// То есть по пути файловая система отдаёт НЕ округлённое до кластера значение,
+// поэтому проверка «кратно кластеру» здесь была бы неверной: это утверждение о
+// другом API. Проверяемое свойство одно: значение опубликовано, известно,
+// устойчиво, и не меньше логического там, где это обязано быть.
+constexpr int kAllocatedProbeTries = 40;
+constexpr int kAllocatedProbeSleepMs = 25;
+
+struct AllocatedProbe {
+    vfs::FileSize size{};
+    int attempts{0};
+    bool published{false};
+};
+
+// Ждёт, пока том опубликует аллоцированный размер непустого файла.
+// «Опубликован» = значение известно и ненулевое. Ненулевое — потому, что у
+// сжатого файла allocated МЕНЬШЕ логического (см. выше), и ждать «>= logical»
+// на сжатой фикстуре бессмысленно: она не сойдётся никогда.
+[[nodiscard]] AllocatedProbe measurePublishedAllocated(const std::wstring& path) {
+    AllocatedProbe probe{};
+    for (int attempt = 1; attempt <= kAllocatedProbeTries; ++attempt) {
+        probe.attempts = attempt;
+        probe.size = vfs::measurePath(path);
+        if (probe.size.ok() && probe.size.allocatedKnown && probe.size.allocatedBytes > 0u) {
+            probe.published = true;
+            return probe;
+        }
+        if (attempt < kAllocatedProbeTries) {
+            ::Sleep(kAllocatedProbeSleepMs);
+        }
+    }
+    return probe;
+}
+
+// Применимо ли к файлу округление «allocated >= logical». Единственное, что его
+// отменяет, — сжатие и разреженность: оба означают, что аллоцированного размера
+// МОЖЕТ быть меньше логического, и это по контракту, а не отказ.
+[[nodiscard]] bool roundingApplies(const vfs::FileSize& size) noexcept {
+    return size.ok() && size.allocatedKnown && size.logicalBytes > 0u &&
+           !hasFlag(size.flags, vfs::FileFlags::Sparse) &&
+           !hasFlag(size.flags, vfs::FileFlags::Compressed);
+}
+
+// Почему файл исключён из проверки округления — одной строкой, с числами.
+// Строка [note], а не пропуск: остальные проверки файла при этом выполняются,
+// и молчать о сжатом %TEMP% нельзя — иначе на этой машине проверка выглядела
+// бы зелёной, ничего не делая.
+void noteRoundingNotApplicable(const char* testName, const std::wstring& path, const vfs::FileSize& size) {
+    std::printf("  [note] %s: файл %s — %s, поэтому «allocated >= logical» не проверяется:"
+                " logical=%llu allocated=%llu\n",
+                testName, mrproper::platform::toUtf8(path).c_str(),
+                mrproper::platform::toUtf8(vfs::describeFlags(size.flags)).c_str(),
+                static_cast<unsigned long long>(size.logicalBytes),
+                static_cast<unsigned long long>(size.allocatedBytes));
+}
+
+// Том не опубликовал значение за отведённый срок — это свойство машины, и
+// сказать о нём строкой пропуска с числами честнее, чем покраснеть.
+[[nodiscard]] std::string describeUnpublishedAllocation(const char* testName, const AllocatedProbe& probe) {
+    return std::string("том не опубликовал аллоцированный размер за ") +
+           std::to_string(kAllocatedProbeTries * kAllocatedProbeSleepMs) + " мс (попыток " +
+           std::to_string(probe.attempts) + "): logical=" + std::to_string(probe.size.logicalBytes) +
+           " allocated=" + std::to_string(probe.size.allocatedBytes) + " allocatedKnown=" +
+           (probe.size.allocatedKnown ? "да" : "нет") + " флаги=" +
+           mrproper::platform::toUtf8(vfs::describeFlags(probe.size.flags)) + " (" + testName + ")";
 }
 
 // Создать точку монтирования (junction) linkPath на каталог targetDir. Требует
@@ -534,13 +667,54 @@ TEST(vfsEdge_longPath_tree_beyond_max_path_is_visible) {
     CHECK_EQ(deepFileSeen, static_cast<std::size_t>(1));
 
     // 5) Размер файла на длинном пути совпадает с тем, что записали.
-    const vfs::FileSize fileSize = vfs::measurePath(deepFile);
+    //
+    // Аллоцированный размер берётся через measurePublishedAllocated (D-78).
+    // Инвариант «allocated >= logical» проверяется ТОЛЬКО для файла, который не
+    // сжат и не разрежен: на машине со сжатым %TEMP% (а он сжатый, см. комментарий
+    // у measurePublishedAllocated) allocated меньше логического ЗАКОННО, и
+    // исходная проверка была неверным утверждением о файловой системе, которое
+    // ещё и гонялось с её же рабочим потоком сжатия.
+    //
+    // Что здесь остаётся проверкой КОДА в любом случае: файл существует и он не
+    // каталог, логический размер совпадает с записанным, аллоцированный известен,
+    // reclaimBytes отдаёт то, что вернул замер, и значение УСТОЙЧИВО между двумя
+    // замерами подряд.
+    const AllocatedProbe probe = measurePublishedAllocated(deepFile);
+    if (!probe.published) {
+        // Том не опубликовал значение за отведённую секунду: это свойство
+        // машины, и сказать о нём строкой пропуска честнее, чем покраснеть.
+        reportSkip("vfsEdge_longPath_tree_beyond_max_path_is_visible",
+                   describeUnpublishedAllocation("vfsEdge_longPath_tree_beyond_max_path_is_visible", probe));
+        return;
+    }
+    const vfs::FileSize& fileSize = probe.size;
     CHECK(fileSize.ok());
     CHECK_EQ(fileSize.logicalBytes, static_cast<std::uint64_t>(data.size()));
     CHECK(fileSize.allocatedKnown);
-    CHECK(fileSize.allocatedBytes >= fileSize.logicalBytes);
     CHECK(!vfs::hasFlag(fileSize.flags, vfs::FileFlags::Directory));
+    CHECK(!vfs::hasFlag(fileSize.flags, vfs::FileFlags::ReparsePoint));
     CHECK_EQ(fileSize.reclaimBytes(), fileSize.allocatedBytes);
+    if (roundingApplies(fileSize)) {
+        CHECK(fileSize.allocatedBytes >= fileSize.logicalBytes);
+    } else {
+        // Сжатый или разреженный файл: округление не проверяется, но об этом
+        // печатается строка с числами — иначе на этой машине проверка была бы
+        // зелёной, ничего не делая.
+        noteRoundingNotApplicable("vfsEdge_longPath_tree_beyond_max_path_is_visible", deepFile, fileSize);
+    }
+
+    // 6) Опубликованное значение устойчиво: второй замер сразу после первого
+    //    обязан дать ту же пару. Это ловит остаточную гонку — «allocated >=
+    //    logical» сходится и на значении, которое через миллисекунду изменится.
+    const vfs::FileSize again = vfs::measurePath(deepFile);
+    CHECK(again.ok());
+    CHECK(again.allocatedKnown);
+    CHECK_EQ(again.logicalBytes, fileSize.logicalBytes);
+    CHECK_EQ(again.allocatedBytes, fileSize.allocatedBytes);
+    std::printf("  [note] длинный путь: logical=%llu allocated=%llu, попыток публикации %d, флаги %s\n",
+                static_cast<unsigned long long>(fileSize.logicalBytes),
+                static_cast<unsigned long long>(fileSize.allocatedBytes), probe.attempts,
+                mrproper::platform::toUtf8(vfs::describeFlags(fileSize.flags)).c_str());
 }
 
 // Длинный путь должен удаляться, и ровно внутри своего корня: удаление файла за
@@ -717,30 +891,66 @@ TEST(vfsEdge_unicode_names_survive_round_trip) {
 
     // 4) Сумма размеров сходится с числом записанных байт: имена в юникоде
     //    меняют длину пути, но не объём.
+    //
+    //    Аллоцированные берутся через measurePublishedAllocated, а инвариант
+    //    округления применяется ТОЛЬКО к несжатым и неразреженным файлам (D-78):
+    //    %TEMP% на этой машине — сжатый каталог NTFS, поэтому у части файлов
+    //    allocated законно меньше логического, и «сумма аллоцированных не меньше
+    //    суммы логических» по всем файлам было бы неверным утверждением.
+    //    Поэтому сумма логических берётся ТОЛЬКО по файлам, где округление
+    //    обязано выполняться, а по исключённым печатается строка с числами.
     std::uint64_t logicalTotal = 0;
     std::uint64_t allocatedTotal = 0;
+    std::uint64_t roundingLogical = 0;
     bool allMeasured = true;
+    std::size_t roundingSkipped = 0;
+    std::vector<bool> roundingOk;
+    roundingOk.reserve(created.size());
     for (const Created& item : created) {
-        const vfs::FileSize size = vfs::measurePath(tree.path(item.name));
+        const std::wstring itemPath = tree.path(item.name);
+        const AllocatedProbe probe = measurePublishedAllocated(itemPath);
+        if (!probe.published) {
+            reportSkip("vfsEdge_unicode_names_survive_round_trip",
+                       describeUnpublishedAllocation("vfsEdge_unicode_names_survive_round_trip", probe));
+            return;
+        }
+        const vfs::FileSize& size = probe.size;
         allMeasured = allMeasured && size.ok() && size.allocatedKnown;
         CHECK_EQ(size.logicalBytes, item.bytes);
         logicalTotal += size.logicalBytes;
         if (size.allocatedKnown) {
             allocatedTotal += size.allocatedBytes;
         }
+        if (roundingApplies(size)) {
+            roundingLogical += size.logicalBytes;
+            roundingOk.push_back(true);
+        } else {
+            ++roundingSkipped;
+            roundingOk.push_back(false);
+            noteRoundingNotApplicable("vfsEdge_unicode_names_survive_round_trip", itemPath, size);
+        }
     }
     CHECK(allMeasured);
     CHECK_EQ(logicalTotal, expectedTotal);
-    CHECK(allocatedTotal >= logicalTotal);
+    CHECK(allocatedTotal >= roundingLogical);
 
     // 5) Кластер тома известен: без него «занято на диске» остаётся гипотезой.
     const vfs::ClusterSize cluster = vfs::queryClusterSize(tree.root());
     CHECK(cluster.ok());
     CHECK(cluster.bytesPerCluster > 0u);
-    for (const Created& item : created) {
+    for (std::size_t index = 0; index < created.size(); ++index) {
+        const Created& item = created[index];
         const vfs::AllocatedSizeResult allocated = vfs::queryAllocatedSize(tree.path(item.name));
         CHECK(allocated.ok());
-        CHECK(allocated.bytes >= item.bytes);
+        // Как и выше: округление проверяется только там, где оно обязано быть.
+        if (index < roundingOk.size() && roundingOk[index]) {
+            CHECK(allocated.bytes >= item.bytes);
+        }
+    }
+    if (roundingSkipped > 0) {
+        std::printf("  [note] vfsEdge_unicode_names_survive_round_trip: округление проверено на %zu файлах из %zu"
+                    " (сжатие NTFS в %%TEMP%%, см. D-78)\n",
+                    created.size() - roundingSkipped, created.size());
     }
 
     // 6) Всё убирается одним проходом deleteTree, юникод не мешает.

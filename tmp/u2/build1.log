@@ -1,0 +1,175 @@
+[build] слот u2, конфигурация Debug: жду очереди на компиляцию
+-- Building for: Visual Studio 16 2019
+-- Selecting Windows SDK version 10.0.19041.0 to target Windows 10.0.22631.
+-- The CXX compiler identification is MSVC 19.29.30159.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: C:/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools/VC/Tools/MSVC/14.29.30133/bin/Hostx64/x64/cl.exe - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- [MrProper] CMAKE_BUILD_TYPE=Debug проигнорирован: генератор Visual Studio 16 2019 выбирает конфигурацию через --config
+-- [MrProper] санитайзеры включены: off (санитайзированная сборка не годится для поставки, только для проверки; в кэш значение не попало — обычная tools\build.bat Debug соберётся без санитайзеров)
+-- Performing Test MRPROPER_HAVE_STOP_TOKEN
+-- Performing Test MRPROPER_HAVE_STOP_TOKEN - Success
+-- Performing Test MRPROPER_HAVE_FORMAT
+-- Performing Test MRPROPER_HAVE_FORMAT - Success
+-- Performing Test MRPROPER_HAVE_FILESYSTEM
+-- Performing Test MRPROPER_HAVE_FILESYSTEM - Success
+-- Performing Test MRPROPER_HAVE_RANGES
+-- Performing Test MRPROPER_HAVE_RANGES - Success
+-- [MrProper] тулчейн MSVC 19.29.30159.0: все нужные возможности C++20 есть (std::stop_token/jthread=1, std::format=1, std::filesystem=1, std::ranges=1)
+-- [MrProper] цель mrproper_core: 15 модулей (переносимое ядро, без Windows API)
+-- [MrProper] цель mrproper_cli: 8 модулей (слой CLI, зависит от mrproper_core, mrproper_platform и mrproper_engine)
+-- [MrProper] цель mrproper_engine: 11 модулей (оркестрация, зависит от mrproper_core и mrproper_platform)
+-- [MrProper] цель mrproper_platform: 19 модулей (слой Win32, зависит от mrproper_core)
+-- [MrProper] цель mrproper_ui: 10 модулей (слой интерфейса, зависит от mrproper_core и mrproper_platform)
+-- [MrProper] цель mrproper: программа, точка входа в app_shell.cpp, ресурс версии из packaging/version.rc
+-- [MrProper] цель mrproper_unit_tests: 9 файлов тестов ядра (хост без Windows)
+-- [MrProper] цель mrproper_integration_tests: 4 файлов тестов Win32-слоя
+-- [MrProper] тесты: цели наборов [unit, integration]
+-- [MrProper] tests/e2e: зарегистрировано e2e_BadRules, e2e_EdgeCases, e2e_FullCycle, e2e_UndoRestore (метка e2e, PowerShell C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe)
+-- [MrProper] install: исполняемые файлы — mrproper, mrproper_cli
+-- [MrProper] CPack: генераторы NSIS;ZIP, установщик собирается явно: cpack -C Release --config CPackConfig.cmake
+-- [MrProper] установщик: ISCC.exe не найден, цель mrproper-installer объявлена и упадёт с инструкцией (см. -DMRPROPER_ISCC_EXE=...)
+-- [MrProper] зависимости: провайдер auto, сеть запрещена (MRPROPER_ALLOW_NETWORK=OFF), FetchContent обычный режим, vcpkg не используется
+-- [MrProper] конфигурация сборки:
+-- [MrProper]   проект:      MrProper 0.1.0
+-- [MrProper]   генератор:   Visual Studio 16 2019
+-- [MrProper]   платформа:   Windows/AMD64
+-- [MrProper]   компилятор:  MSVC 19.29.30159.0
+-- [MrProper]   C++:         20 (обязательный: ON, расширения: OFF)
+-- [MrProper]   тесты:       ON (mrproper_unit_tests собрана)
+-- [MrProper]   предупреждения как ошибки: да, строгий набор: OFF
+-- [MrProper]   санитайзеры: off
+-- [MrProper]   compile_commands.json: генератор «Visual Studio 16 2019» не пишет compile_commands.json
+-- [MrProper]    путь — пресет ninja-debug
+-- [MrProper]   install:     префикс «C:/Users/Daniil/AppData/Local/Programs/MrProper», тесты в составе: OFF, CPack: ON
+-- Configuring done
+-- Generating done
+-- Build files have been written to: D:/Project/MrProper/build/u2
+Microsoft (R) Build Engine ���ᨨ 16.11.6+a918ceb31 ��� .NET Framework
+(C) ��௮��� �������� (Microsoft Corporation). �� �ࠢ� ���饭�.
+
+  Checking File Globs
+  Checking Build System
+  Building Custom Rule D:/Project/MrProper/src/core/CMakeLists.txt
+  disk_model.cpp
+  glob.cpp
+  i18n.cpp
+  json.cpp
+  log.cpp
+  plan.cpp
+  report_html.cpp
+  report_json.cpp
+  rules.cpp
+  rulesync.cpp
+  scoring.cpp
+  sizing.cpp
+  trash.cpp
+  undo.cpp
+  units.cpp
+  �������� ����...
+  mrproper_core.vcxproj -> D:\Project\MrProper\build\u2\src\core\Debug\mrproper_core.lib
+Microsoft (R) Build Engine ���ᨨ 16.11.6+a918ceb31 ��� .NET Framework
+(C) ��௮��� �������� (Microsoft Corporation). �� �ࠢ� ���饭�.
+
+  Checking File Globs
+  mrproper_core.vcxproj -> D:\Project\MrProper\build\u2\src\core\Debug\mrproper_core.lib
+  Building Custom Rule D:/Project/MrProper/src/platform/CMakeLists.txt
+  bus_type.cpp
+  devices.cpp
+  gpt_kind.cpp
+  inventory.cpp
+  layout.cpp
+  net.cpp
+  process_control.cpp
+  restart_manager.cpp
+  rulesync_client.cpp
+  size_probe.cpp
+  storage_query.cpp
+  trim_cache.cpp
+  vfs_delete.cpp
+  vfs_paths.cpp
+  vfs_size.cpp
+  vfs_trash.cpp
+  vfs_walk.cpp
+  volumes.cpp
+  wmi.cpp
+  �������� ����...
+  mrproper_platform.vcxproj -> D:\Project\MrProper\build\u2\src\platform\Debug\mrproper_platform.lib
+Microsoft (R) Build Engine ���ᨨ 16.11.6+a918ceb31 ��� .NET Framework
+(C) ��௮��� �������� (Microsoft Corporation). �� �ࠢ� ���饭�.
+
+  Checking File Globs
+  mrproper_core.vcxproj -> D:\Project\MrProper\build\u2\src\core\Debug\mrproper_core.lib
+  mrproper_platform.vcxproj -> D:\Project\MrProper\build\u2\src\platform\Debug\mrproper_platform.lib
+  Building Custom Rule D:/Project/MrProper/src/engine/CMakeLists.txt
+  candidate_collector.cpp
+  executor.cpp
+  file_system_probe.cpp
+  journal.cpp
+  locks.cpp
+  plan_builder.cpp
+  scan_coordinator.cpp
+  scan_result.cpp
+  scoring_bridge.cpp
+  trash_service.cpp
+  undo_service.cpp
+  �������� ����...
+  mrproper_engine.vcxproj -> D:\Project\MrProper\build\u2\src\engine\Debug\mrproper_engine.lib
+Microsoft (R) Build Engine ���ᨨ 16.11.6+a918ceb31 ��� .NET Framework
+(C) ��௮��� �������� (Microsoft Corporation). �� �ࠢ� ���饭�.
+
+  Checking File Globs
+  mrproper_core.vcxproj -> D:\Project\MrProper\build\u2\src\core\Debug\mrproper_core.lib
+  Building Custom Rule D:/Project/MrProper/tests/unit/CMakeLists.txt
+  mrproper_platform.vcxproj -> D:\Project\MrProper\build\u2\src\platform\Debug\mrproper_platform.lib
+  Building Custom Rule D:/Project/MrProper/tests/integration/CMakeLists.txt
+  mrproper_engine.vcxproj -> D:\Project\MrProper\build\u2\src\engine\Debug\mrproper_engine.lib
+  core_tests.cpp
+  Building Custom Rule D:/Project/MrProper/src/ui/CMakeLists.txt
+  executor_manifest_tests.cpp
+  Building Custom Rule D:/Project/MrProper/src/cli/CMakeLists.txt
+  app_shell.cpp
+  args.cpp
+  i18n_tests.cpp
+  locale.cpp
+  plan_tests.cpp
+  cmd_apply.cpp
+  report_tests.cpp
+  trash_boundary_tests.cpp
+  mv_bridge.cpp
+  rules_fuzz_tests.cpp
+  vfs_edge_tests.cpp
+  rules_manifest_tests.cpp
+  nav.cpp
+  cmd_disks.cpp
+  vfs_walk_tests.cpp
+  renderer.cpp
+  rulesync_tests.cpp
+  theme.cpp
+  cmd_report.cpp
+  �������� ����...
+  mrproper_integration_tests.vcxproj -> D:\Project\MrProper\build\u2\Debug\mrproper_integration_tests.exe
+  sizing_tests.cpp
+  view_cleanup.cpp
+  trash_undo_tests.cpp
+  �������� ����...
+  cmd_rules.cpp
+  mrproper_unit_tests.vcxproj -> D:\Project\MrProper\build\u2\Debug\mrproper_unit_tests.exe
+  view_disks.cpp
+  cmd_scan.cpp
+  view_report.cpp
+  cmd_undo.cpp
+  view_settings.cpp
+  main.cpp
+  �������� ����...
+  �������� ����...
+  mrproper_ui.vcxproj -> D:\Project\MrProper\build\u2\src\ui\Debug\mrproper_ui.lib
+  Building Custom Rule D:/Project/MrProper/src/ui/CMakeLists.txt
+  app_shell.cpp
+  mrproper_cli.vcxproj -> D:\Project\MrProper\build\u2\Debug\mrproper_cli.exe
+  mrproper.vcxproj -> D:\Project\MrProper\build\u2\src\ui\Debug\mrproper.exe
+  Building Custom Rule D:/Project/MrProper/CMakeLists.txt
+[build] ok: build\u2
+BUILD_EXIT=0 
