@@ -2612,8 +2612,14 @@ struct ViewState {
                 std::max(1, scale.dip(kColumnWidthDip[static_cast<std::size_t>(i)]));
             wanted += widths[static_cast<std::size_t>(i)];
         }
+        // Бюджет — полоса минус запас справа, одна цель для обеих ветвей:
+        // и жать до неё, и тянуть к ней. Раньше жать сжимало к budget,
+        // а тянуть никто не тянул: лишнее оставалось мёртвым хвостом
+        // шапки (170 px при 96 DPI, 264 px при 144 DPI — хвост шире
+        // самого узкого столбца, ровно тот случай, который ворота
+        // Measure-HeaderColumns объявляют отрезанным столбцом).
+        const int budget = std::max(static_cast<int>(kColumnCount), available - margin);
         if (wanted > available) {
-            const int budget = std::max(static_cast<int>(kColumnCount), available - margin);
             // Полосы не хватает (минимальное окно 900×600 при 96 % даёт полосу
             // 642 px на шесть столбцов по 852 px). Жмём пропорционально, а не
             // оставляем хвост за краем: иначе последние два столбца уезжают за
@@ -2631,6 +2637,26 @@ struct ViewState {
                 used += widths[index];
             }
             widths[static_cast<std::size_t>(kColumnCount - 1)] = std::max(1, budget - used);
+        } else if (wanted < budget) {
+            // Полосы больше, чем шести столбцам нужно (окно 1280x720 даёт
+            // полосу 1022 px при сумме столбцов 852 px). Лишнее делится
+            // между «источником» и «что сделано» — ровно то, чем они и
+            // должны быть по kColumnWidthDip: объём и вид фиксированы,
+            // а длинный путь важнее ровных колонок. Доля — по натуральной
+            // ширине, остаток второму, чтобы сумма сходилась точно. Шапка
+            // занимает всю полосу при любом масштабе, хвост — ровно запас
+            // margin, и он растёт с DPI только как шрифт, а не накапливает
+            // ошибку раскладки; пустой список выглядит как область под
+            // будущий отчёт, а не как обрезанная таблица.
+            const int stretch = budget - wanted;
+            const int stretchWant =
+                widths[static_cast<std::size_t>(kColumnSource)] +
+                widths[static_cast<std::size_t>(kColumnSubject)];
+            const int sourceShare = static_cast<int>(
+                (static_cast<long long>(widths[static_cast<std::size_t>(kColumnSource)]) *
+                 stretch) / std::max(1, stretchWant));
+            widths[static_cast<std::size_t>(kColumnSource)] += sourceShare;
+            widths[static_cast<std::size_t>(kColumnSubject)] += stretch - sourceShare;
         }
         for (int column = 0; column < kColumnCount; ++column) {
             ListView_SetColumnWidth(list, column, widths[static_cast<std::size_t>(column)]);

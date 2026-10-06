@@ -170,6 +170,56 @@
 # трогают). Проверено: у списка «Отчёта» и у пробного списка «Очистки» строк 0,
 # проверка не применяется, обход зелёный.
 #
+# ПОДПИСЬ ДИСКА НА КАРТЕ РАЗДЕЛОВ (D-81).
+#
+# Карта разделов рисуется СВОИМИ РУКАМИ (Direct2D, ADR-003):
+# ни одно сообщение окна про неё не говорит, и прежние меры
+# ворот (прямоугольники потомков и общие чернила) дефект
+# D-81 не видели вовсе — при FontScalePercent 200 заголовок
+# диска срезался до 3-6 px видимых глифов против 10-11 px
+# при шкале 100 %, зазор до полосы сегментов схлопывался,
+# а ворота давали код 0: наложение внутри одного окна не
+# меняет ни число прямоугольников, ни долю чернил.
+#
+# Мера та же, что у строк списка (Measure-RowText): пиксель
+# считается чернилами, когда он отличается от самого частого
+# цвета области (фон карты — render::Renderer::beginFrame
+# заливает её палитрой surface перед полосами). Профиль
+# чернил по строкам карты делит её на три полосы:
+#   * подпись диска («Диск 0» слева, модель и шина справа)
+#     — узкая полоса чернил: текст занимает долю ширины,
+#     а не всю её;
+#   * полоса сегментов — сплошная заливка дорожки: чернила
+#     занимают почти всю ширину карты (измерено: 636 px
+#     из 648, то есть 98 %);
+#   * подпись «Свободно … из …» под полосой.
+#
+# Видимая высота подписи — число строк от первой строки с
+# чернилами до последней строки перед полосой сегментов
+# (допуск двух пустых строк: сглаживание шрифта даёт
+# редкие строки без чернил внутри глифов). Полоса сегментов
+# не найдена — карта пуста (диски не прочитаны или всё
+# отфильтровано): у пустой карты подписи нет по определению,
+# и это законное состояние, а не дефект.
+#
+# Отказ — ДВА условия сразу, а не одно. Абсолютное
+# (подпись ниже -MinMapLabelHeightPx) — ровно критерий
+# приёмки D-81: высота подписи при 200 % не ниже, чем
+# при 100 %. Относительное (подпись ниже половины
+# высоты полосы сегментов) — страхует от ложного красного
+# на машине с большим числом дисков: карта сжимается
+# (computeMap, kMinBlockScale 0.55), и при сжатии И
+# подпись, И полоса уменьшаются одним множителем, так что
+# их отношение не меняется; при срезе же подпись вдвое
+# ниже полосы, потому что полоса рисуется на всю высоту
+# блока, а подпись — в срезанной константой полосе.
+# Измерено на этом же бинарнике (900x600, один диск):
+#   шкала 100 %: подпись 10 px, полоса 16 px (10 >= 8)
+#   шкала 200 % до правки: подпись 6 px, полоса 16 px
+#     (6 < 10 и 12 < 16 — оба условия, код 15)
+#   шкала 200 % после правки: подпись 24 px, полоса 31 px
+#     (24 >= 10 и 48 >= 31 — код 0)
+#
 # Снимки страниц: -Shot задаёт имя БАЗОВОГО файла, обход дописывает суффикс
 # -p<N>-<имя> перед расширением (D:\Temp\ui.png -> D:\Temp\ui-p3-cleanup.png).
 #
@@ -200,6 +250,10 @@
 #       полосу уже -MinListTextSpanPercent % ширины. Применяется к СТАРТОВОЙ
 #       странице всегда (страница выбирается ключом -Page — см. «СТРАНИЦА БЕЗ
 #       ФОКУСА»), а к остальным четырём — при -AllPages.
+#  15 — подпись диска на карте разделов срезана: видимая высота подписи
+#       ниже -MinMapLabelHeightPx и ниже половины высоты полосы сегментов
+#       (D-81; страница «Дисков», карта непустая — полоса сегментов
+#       на снимке есть)
 #
 # СТРАНИЦА БЕЗ ФОКУСА (ключ -Page). Проверка невидимых строк меряет область
 # строк списка на ОТКРЫТОЙ странице, а открыть страницу по-старому можно было
@@ -278,6 +332,16 @@ param(
     [double]$MinListTextSpanPercent = 3.0,
     # Уже столбца: подпись в него не помещается ни при каком шрифте.
     [int]$MinColumnWidthPx = 24,
+    # Видимая высота подписи диска на карте разделов (D-81): при
+    # масштабе шрифта 100 % измеряется 10-11 px, при 200 % до
+    # правки D-81 — 3-6 px, после — 24 px. Порог — ровно высота
+    # подписи при шкале 100 %. Второе, относительное условие
+    # (подпись ниже половины высоты полосы сегментов) держит
+    # проверку честной на машине с большим числом дисков, где
+    # карта сжимается (computeMap, kMinBlockScale): и подпись,
+    # и полоса сжимаются одним множителем, их отношение при
+    # этом не меняется, а при срезе — меняется вдвое.
+    [int]$MinMapLabelHeightPx = 10,
     [int]$Width = 0,
     [int]$Height = 0,
     [int]$DpiPercent = 0,
@@ -322,6 +386,7 @@ if ($MinListTextSpanPercent -lt 0 -or $MinListTextSpanPercent -gt 100) {
     exit 2
 }
 if ($MinColumnWidthPx -lt 0) { Write-Host "[ui] MinColumnWidthPx отрицателен: $MinColumnWidthPx"; exit 2 }
+if ($MinMapLabelHeightPx -lt 0) { Write-Host "[ui] MinMapLabelHeightPx отрицателен: $MinMapLabelHeightPx"; exit 2 }
 if (($Width -gt 0) -xor ($Height -gt 0)) {
     Write-Host '[ui] -Width и -Height задаются вместе (задано только одно)'
     exit 2
@@ -446,6 +511,14 @@ $script:smCxVScroll = 8
 $script:classListView = 'SysListView32'
 $script:classTreeView = 'SysTreeView32'
 $script:classHeader = 'SysHeader32'
+# Карта разделов рисуется Direct2D в СВОЁМ дочернем окне
+# (detail::kDisksMapClass — «MrProper.DisksMap»,
+# src\ui\view_disks.cpp), прямом потомке окна экрана
+# «Диски» (detail::kDisksViewClass). Ворота находят её
+# по классу: ни одно сообщение перечисления не знает
+# про содержимое окна собственной отрисовки.
+$script:classDisksView = 'MrProper.DisksView'
+$script:classDisksMap = 'MrProper.DisksMap'
 # Пороги пиксельной меры полосы заголовка (см. Measure-HeaderColumns).
 $script:minHeaderStripPx = 24
 $script:minSeparatorShare = 0.90
@@ -1376,6 +1449,124 @@ function Measure-ListItem($shot, $windowRect, [IntPtr]$hwnd, [string]$class,
     return $result
 }
 
+# Окно карты разделов: прямой потомок окна экрана «Диски»,
+# прямого потомка хоста содержимого. Классы — те же, что
+# объявлены в src\ui\view_disks.cpp (detail::kDisksViewClass
+# и detail::kDisksMapClass); ворота зависят от них,
+# как зависят от классов списков, и об этом написано
+# в шапке («ПОДПИСЬ ДИСКА НА КАРТЕ РАЗДЕЛОВ»).
+# Возвращает [IntPtr]::Zero, когда страница не «Диски»
+# или её окно не открыто: проверять нечего.
+function Find-DisksMapWindow([IntPtr]$hostWindow) {
+    $view = [IntPtr]::Zero
+    foreach ($child in Get-DirectChild $hostWindow) {
+        $c = New-Object Text.StringBuilder 256
+        [void][MrWin]::GetClassNameW($child, $c, 256)
+        if ($c.ToString() -eq $script:classDisksView -and [MrWin]::IsWindowVisible($child)) {
+            $view = $child
+            break
+        }
+    }
+    if ($view -eq [IntPtr]::Zero) { return [IntPtr]::Zero }
+    foreach ($child in Get-DirectChild $view) {
+        $c = New-Object Text.StringBuilder 256
+        [void][MrWin]::GetClassNameW($child, $c, 256)
+        if ($c.ToString() -eq $script:classDisksMap -and [MrWin]::IsWindowVisible($child)) {
+            return $child
+        }
+    }
+    return [IntPtr]::Zero
+}
+
+# Чернила в области карты: видимая высота подписи диска,
+# высота полосы сегментов и зазор между ними (D-81).
+# Полный разбор меры — в шапке, «ПОДПИСЬ ДИСКА НА КАРТЕ
+# РАЗДЕЛОВ». $mapWindow может быть нулевым (страница не
+# «Диски»): тогда Checked = $false и проверка не
+# применяется. Checked = $false также у ПУСТОЙ карты
+# (полоса сегментов на снимке не найдена): у карты
+# без дисков подписи нет по определению.
+function Measure-MapLabel($bytes, $stride, [IntPtr]$mapWindow, $windowRect) {
+    $none = @{ Checked = $false; LabelHeight = 0; LabelTop = -1
+               LabelBottom = -1; BandTop = -1; BandBottom = -1
+               Gap = -1; Width = 0 }
+    if ($mapWindow -eq [IntPtr]::Zero) { return $none }
+    $mapRect = New-Object MrWin+RECT
+    [void][MrWin]::GetWindowRect($mapWindow, [ref]$mapRect)
+    $x0 = $mapRect.L - $windowRect.L
+    $y0 = $mapRect.T - $windowRect.T
+    $x1 = $mapRect.R - $windowRect.L - 1
+    $y1 = $mapRect.B - $windowRect.T - 1
+    $width = $x1 - $x0 + 1
+    $height = $y1 - $y0 + 1
+    if ($width -lt 8 -or $height -lt 8) { return $none }
+    # Фон карты — самый частый цвет её области: рендерер
+    # заливает всю клиентскую область палитрой surface
+    # (Renderer::beginFrame) перед полосами.
+    $counts = @{}
+    for ($y = $y0; $y -le $y1; $y++) {
+        $row = $y * $stride
+        for ($x = $x0; $x -le $x1; $x++) {
+            $i = $row + $x * 4
+            $key = "$($bytes[$i]),$($bytes[$i + 1]),$($bytes[$i + 2])"
+            if ($counts.ContainsKey($key)) { $counts[$key]++ } else { $counts[$key] = 1 }
+        }
+    }
+    if ($counts.Count -eq 0) { return $none }
+    $background = ($counts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Name
+    # Профиль чернил по строкам: сколько пикселей строки
+    # отличается от фона карты.
+    $profile = New-Object int[] $height
+    for ($y = $y0; $y -le $y1; $y++) {
+        $row = $y * $stride
+        $ink = 0
+        for ($x = $x0; $x -le $x1; $x++) {
+            $i = $row + $x * 4
+            $key = "$($bytes[$i]),$($bytes[$i + 1]),$($bytes[$i + 2])"
+            if ($key -ne $background) { $ink++ }
+        }
+        $profile[$y - $y0] = $ink
+    }
+    $half = [int](($width + 1) / 2)
+    # Верхняя текстовая полоса: от первой строки с чернилами
+    # до первой сплошной строки (полоса сегментов).
+    $top = -1
+    for ($i = 0; $i -lt $profile.Length; $i++) {
+        if ($profile[$i] -gt 0) { $top = $i; break }
+    }
+    if ($top -lt 0) { return $none }
+    $bottom = $top
+    $missed = 0
+    for ($i = $top; $i -lt $profile.Length; $i++) {
+        if ($profile[$i] -ge $half) { break }
+        if ($profile[$i] -gt 0) { $bottom = $i; $missed = 0 }
+        else {
+            $missed++
+            if ($missed -gt 2) { break }
+        }
+    }
+    # Полоса сегментов: первая строка не уже половины
+    # ширины карты, и её низ — последняя такая строка
+    # подряд (заливка дорожки сплошная, без пустых
+    # строк внутри).
+    $bandTop = -1
+    for ($i = $bottom + 1; $i -lt $profile.Length; $i++) {
+        if ($profile[$i] -ge $half) { $bandTop = $i; break }
+    }
+    if ($bandTop -lt 0) { return $none }
+    $bandBottom = $bandTop
+    for ($i = $bandTop; $i -lt $profile.Length; $i++) {
+        if ($profile[$i] -lt $half) { break }
+        $bandBottom = $i
+    }
+    return @{ Checked = $true; LabelHeight = ($bottom - $top + 1)
+              LabelTop = $top; LabelBottom = $bottom
+              BandTop = $bandTop; BandBottom = $bandBottom
+              BandHeight = ($bandBottom - $bandTop + 1)
+              Gap = ($bandTop - $bottom - 1); Width = $width
+              Background = $background }
+}
+
 # Раскладка одной страницы. Возвращает @{ Checked; Violations; Hidden } где
 # Violations — массив строк с классом, подписью, прямоугольником в координатах
 # хоста и величиной вылета по каждой стороне, а Hidden — строки списка и
@@ -1820,6 +2011,7 @@ function Invoke-Smoke {
         # белым по белому, пользователь не видит, и никакие счётчики чернил его
         # не показывают. Пустой список (строк 0) проверку не вызывает — «ничего
         # не найдено» законно, см. Measure-ListItem.
+        $script:mapLabelLast = 0
         if (-not $AllPages) {
             $startListHost = Find-ContentHost $hwnd $rect
             if (-not $startListHost.Found) {
@@ -1838,6 +2030,30 @@ function Invoke-Smoke {
                 Write-Host ("[ui] страница выбрана ключом -Page '{0}' (nav.current), фокус не перехватывался" -f $Page)
                 return 14
             }
+            # Подпись диска на карте разделов (D-81): карта рисуется
+            # Direct2D, и ни мера прямоугольников, ни общие чернила
+            # её среза не видят — проверка отдельная, по чернилам
+            # области окна карты (разбор меры — в шапке).
+            $mapWindow = Find-DisksMapWindow $startListHost.Hwnd
+            $mapMeasure = Measure-MapLabel $bytes $stride $mapWindow $rect
+            if ($mapMeasure.Checked) {
+                $script:mapLabelLast = $mapMeasure.LabelHeight
+                Write-Host ("[ui] карта разделов: подпись диска {0} px (строки {1}..{2}), полоса сегментов {3} px (строки {4}..{5}), зазор {6} px, порог {7} px" -f `
+                    $mapMeasure.LabelHeight, $mapMeasure.LabelTop, $mapMeasure.LabelBottom, `
+                    $mapMeasure.BandHeight, $mapMeasure.BandTop, $mapMeasure.BandBottom, `
+                    $mapMeasure.Gap, $MinMapLabelHeightPx)
+                if ($mapMeasure.LabelHeight -lt $MinMapLabelHeightPx -and `
+                        $mapMeasure.LabelHeight * 2 -lt $mapMeasure.BandHeight) {
+                    Write-Host "[ui] ПРОВАЛ: подпись диска на карте разделов срезана (D-81)"
+                    Write-Host ("[ui] видимая высота подписи {0} px ниже порога {1} px И ниже половины полосы сегментов {2} px (половина — {3} px)" -f `
+                        $mapMeasure.LabelHeight, $MinMapLabelHeightPx, $mapMeasure.BandHeight, `
+                        [int]($mapMeasure.BandHeight / 2))
+                    Write-Host ("[ui] карта в снимке: {0}, строки подписи {1}..{2}, полоса сегментов {3}..{4}" -f `
+                        $Shot, $mapMeasure.LabelTop, $mapMeasure.LabelBottom, `
+                        $mapMeasure.BandTop, $mapMeasure.BandBottom)
+                    return 15
+                }
+            }
         }
 
         # --- обход всех страниц: раскладка каждой (ключ -AllPages) --------------
@@ -1851,9 +2067,11 @@ function Invoke-Smoke {
             }
             $walk = New-Object System.Collections.ArrayList
             $walkHidden = New-Object System.Collections.ArrayList
+            $walkMap = New-Object System.Collections.ArrayList
             $script:contentHwnd = $walkHost.Hwnd
             $script:brokenPages = New-Object System.Collections.ArrayList
             $script:hiddenPages = New-Object System.Collections.ArrayList
+            $script:mapPages = New-Object System.Collections.ArrayList
             for ($index = 0; $index -lt $script:pages.Count; $index++) {
                 $page = $script:pages[$index]
                 $state = Switch-AppPage $hwnd $script:contentHwnd $page
@@ -1884,6 +2102,24 @@ function Invoke-Smoke {
                         [void]$walkHidden.Add("  [$($page.Name)] $line")
                     }
                 }
+                # Карта разделов на «Дисках»: та же мера чернил,
+                # что и на стартовой странице (D-81, разбор в
+                # шапке). Окно карты есть только у экрана
+                # «Диски», на остальных четырёх страницах
+                # Find-DisksMapWindow возвращает ноль и
+                # проверка не применяется.
+                $mapWindow = Find-DisksMapWindow $script:contentHwnd
+                $mapMeasure = Measure-MapLabel $pageShotPixels.Bytes $pageShotPixels.Stride $mapWindow $rect
+                if ($mapMeasure.Checked) {
+                    $script:mapLabelLast = $mapMeasure.LabelHeight
+                    Write-Host ("[ui] карта разделов: подпись диска {0} px, полоса сегментов {1} px, зазор {2} px, порог {3} px" -f `
+                        $mapMeasure.LabelHeight, $mapMeasure.BandHeight, $mapMeasure.Gap, $MinMapLabelHeightPx)
+                    if ($mapMeasure.LabelHeight -lt $MinMapLabelHeightPx -and `
+                            $mapMeasure.LabelHeight * 2 -lt $mapMeasure.BandHeight) {
+                        [void]$script:mapPages.Add($page.Name)
+                        [void]$walkMap.Add("  [$($page.Name)] подпись диска $($mapMeasure.LabelHeight) px ниже порога $MinMapLabelHeightPx px и ниже половины полосы сегментов $($mapMeasure.BandHeight) px (строки подписи $($mapMeasure.LabelTop)..$($mapMeasure.LabelBottom), полоса $($mapMeasure.BandTop)..$($mapMeasure.BandBottom), зазор $($mapMeasure.Gap) px)")
+                    }
+                }
             }
             # Оба отказа печатаются целиком, даже когда вернётся только один
             # код: невидимые строки и вылет элемента лежат на разных страницах,
@@ -1897,12 +2133,18 @@ function Invoke-Smoke {
                 Write-Host "[ui] ПРОВАЛ: сломана раскладка на страницах: $($script:brokenPages -join ', ')"
                 foreach ($line in $walk) { Write-Host $line }
             }
-            if ($script:hiddenPages.Count -gt 0 -or $script:brokenPages.Count -gt 0) {
+            if ($script:mapPages.Count -gt 0) {
+                Write-Host "[ui] ПРОВАЛ: подпись диска на карте разделов срезана (D-81) на страницах: $($script:mapPages -join ', ')"
+                foreach ($line in $walkMap) { Write-Host $line }
+            }
+            if ($script:hiddenPages.Count -gt 0 -or $script:brokenPages.Count -gt 0 -or $script:mapPages.Count -gt 0) {
                 Write-Host ("[ui] Хост содержимого: клиентская область {0}x{1}, окно содержимого {2}x{3}" -f $walkHost.W, $walkHost.H, $cw, $ch)
                 # Невидимые строки важнее вылета: элемент за краем пользователь
                 # видит и может нажать, а пустой список не отличить от «ничего
-                # не найдено» вообще.
+                # не найдено» вообще. Срез подписи карты — тот же класс
+                # невидимого дефекта (D-81), что и невидимые строки.
                 if ($script:hiddenPages.Count -gt 0) { return 14 }
+                if ($script:mapPages.Count -gt 0) { return 15 }
                 return 10
             }
             Write-Host '[ui] раскладка всех пяти страниц в порядке'
@@ -1920,10 +2162,12 @@ function Invoke-Smoke {
             Colors      = $contentColors
             InkCenter   = $centerInk
             StartPage   = $startPage
+            MapLabel    = $script:mapLabelLast
         }
-        Write-Host ("[ui] ИТОГ: окно={0} клиент={1} чернила-клиент={2} чернила-содержимое={3} цветов={4} центр={5} страница={6}" -f `
+        Write-Host ("[ui] ИТОГ: окно={0} клиент={1} чернила-клиент={2} чернила-содержимое={3} цветов={4} центр={5} страница={6} подпись-карты={7}" -f `
             $script:lastRun.Window, $script:lastRun.Client, $script:lastRun.InkClient, `
-            $script:lastRun.InkContent, $script:lastRun.Colors, $script:lastRun.InkCenter, $script:lastRun.StartPage)
+            $script:lastRun.InkContent, $script:lastRun.Colors, $script:lastRun.InkCenter, `
+            $script:lastRun.StartPage, $script:lastRun.MapLabel)
 
         Write-Host "[ui] окно нарисовало содержимое. Снимок: $Shot"
         return 0

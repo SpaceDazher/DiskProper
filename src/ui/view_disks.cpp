@@ -2194,6 +2194,47 @@ struct ViewState {
         return got ? static_cast<int>(text.tmHeight) : 0;
     }
 
+    // Метрики карты от МЕТРИК СОБСТВЕННОГО шрифта (D-81).
+    //
+    // Константы MapMetrics (labelHeightDip 14, barHeightDip 16,
+    // captionHeightDip 12) описывают блок диска при шрифте 100 %:
+    // именно под них подобрана геометрия карты. Масштаб шрифта
+    // (FontScalePercent, §5 доступность) меняет кегль, а константы
+    // оставались прежними: при 200 % шрифт заголовка вдвое выше
+    // полосы, drawTextD2D с D2D1_DRAW_TEXT_OPTIONS_CLIP рисовал
+    // заголовок в полосе 14 px, и видимыми оставались верхние
+    // 3 px глифов — подпись срезана, а подпись сегмента наезжала
+    // на неё (замерено, defects.md §3.20.3). Строка состояния
+    // починена тем же приёмом в волне V (D-79): высота полосы
+    // считается от tmHeight шрифта, а не от константы. Здесь —
+    // то же для карты: tmHeight шрифтов, которыми карта печатает
+    // заголовок диска (BodyStrong — тот же role, что и шрифт
+    // дерева, fonts[0]) и подписи (Caption, fonts[1]), переведённый
+    // в DIP текущего DPI. Полоса сегментов масштабируется вместе
+    // с подписью сегмента: в ней печатается тот же шрифт Caption,
+    // и при крупном шрифте её подписи наезжали на заголовок диска.
+    // Константы остаются ПОЛОГОМ: если мерить нечем (шрифты ещё не
+    // созданы — первая раскладка до WM_SETFONT), карта не схлопывается,
+    // а рисуется прежней геометрией.
+    [[nodiscard]] MapMetrics mapMetricsForFonts() const noexcept {
+        MapMetrics scaled = mapMetrics;
+        const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
+        const int labelLinePx = fontLineHeightPx(fonts[0]);
+        const int captionLinePx = fontLineHeightPx(fonts[1]);
+        if (labelLinePx > 0) {
+            scaled.labelHeightDip =
+                std::max(mapMetrics.labelHeightDip, scale.undo(labelLinePx));
+        }
+        if (captionLinePx > 0) {
+            const double captionDip = scale.undo(captionLinePx);
+            scaled.captionHeightDip = std::max(mapMetrics.captionHeightDip, captionDip);
+            // Запас над строкой: подпись сегмента центрирована в
+            // полосе, а не вплотную к её верхнему и нижнему краям.
+            scaled.barHeightDip = std::max(mapMetrics.barHeightDip, captionDip + 2.0);
+        }
+        return scaled;
+    }
+
     // Сколько строк займёт строка состояния в полосе шириной contentWidthPx.
     //
     // Считается РОВНО так, как считает DrawText с DT_WORDBREAK: перенос идёт по
@@ -2244,7 +2285,12 @@ struct ViewState {
         // вдвое меньше. Без этой надбавки подпись обрезается по нижней кромке и
         // экран снова выглядит пустым (проверено снимком окна).
         const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
-        int mapHeightPx = static_cast<int>(model.mapHeightDip(mapMetrics));
+        // Карта считает свою высоту от МЕТРИК СОБСТВЕННОГО шрифта
+        // (D-81): при FontScalePercent 200 константы MapMetrics
+        // вдвое короче шрифта, и окно карты не доставало бы даже
+        // правильно разложенной подписи.
+        const MapMetrics scaledMapMetrics = mapMetricsForFonts();
+        int mapHeightPx = static_cast<int>(model.mapHeightDip(scaledMapMetrics));
         if (mapWillBeEmpty()) mapHeightPx += scale.dip(72.0);
         // Полоса строки состояния — ширина минус поле слева и справа: ровно
         // contentWidth_, который раскладка и вычислит. Считаем здесь тем же
@@ -2433,7 +2479,10 @@ struct ViewState {
         const theme::Metrics scale = theme::metricsForDpi(static_cast<unsigned>(dpi));
         const float width = static_cast<float>(scale.undo(client.right));
         const float height = static_cast<float>(scale.undo(client.bottom));
-        return computeMap(mapMetrics, model.mapDisks(), width, height);
+        // Раскладка — от метрик собственного шрифта (D-81), тех же,
+        // что дали окну карты её высоту в currentLayout(): две
+        // разные метрики дали бы окно, в которое карта не влезает.
+        return computeMap(mapMetricsForFonts(), model.mapDisks(), width, height);
     }
 
     // ------------------------------------------------------------------------
