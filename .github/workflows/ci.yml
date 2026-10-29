@@ -122,7 +122,7 @@ jobs:
             label: "Debug + ASan/UBSan"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # build.bat печатает путь к vcvars и версию CMake — этого достаточно,
       # чтобы отличить «сломался код» от «сменился тулчейн» без лишнего шага.
@@ -193,7 +193,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Своя сборка, артефакт соседнего job не переиспользуется. Причина не в
       # экономии минут, а в проверяемости: сценарии зовут настоящий
@@ -299,7 +299,7 @@ jobs:
       MRPROPER_SANITIZE: "OFF"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Сборка — tools\build.bat Debug
         shell: pwsh
@@ -442,7 +442,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Ворота не должны молча деградировать в «ничего не проверил»: если
       # правил анализа или самого анализатора нет, шаг падает с внятной причиной.
@@ -578,7 +578,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Только релизная сборка: SBOM описывает то, что получает пользователь.
       # Ноги Debug и Debug+ASan не публикуются — это проверочные сборки.
