@@ -63,7 +63,7 @@
   -->
   <assemblyIdentity type="win32"
                    name="MrProper"
-                   version="0.1.0.0"
+                   version="0.2.0.0"
                    processorArchitecture="amd64" />
 
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">

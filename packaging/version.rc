@@ -7,6 +7,11 @@
 // Версия поэтому живёт в одном месте и не собирается из строк в разных
 // файлах кода.
 //
+// Про синхронизацию: packaging/README.md описывает четыре места, где хранится
+// версия (project(VERSION), assemblyIdentity, FILEVERSION, строки версий).
+// После подъёма project(VERSION) до 0.2.0 эти значения обязаны оставаться
+// равными: при расхождении Properties файла и имени установщика будут врать.
+//
 // Встраивание (владелец CMake — задачи 01/02, манифест подключается рядом с
 // ним, полный сниппет в packaging/README.md):
 //
@@ -36,7 +41,7 @@
 #define MRPROPER_VERSION_MAJOR 0
 #endif
 #ifndef MRPROPER_VERSION_MINOR
-#define MRPROPER_VERSION_MINOR 1
+#define MRPROPER_VERSION_MINOR 2
 #endif
 #ifndef MRPROPER_VERSION_PATCH
 #define MRPROPER_VERSION_PATCH 0
@@ -49,10 +54,10 @@
 // препроцессора rc.exe нельзя надёжно склеивать строки, и такая попытка
 // молча даст мусор в свойствах файла.
 #ifndef MRPROPER_FILEVERSION_STRING
-#define MRPROPER_FILEVERSION_STRING "0.1.0.0"
+#define MRPROPER_FILEVERSION_STRING "0.2.0.0"
 #endif
 #ifndef MRPROPER_PRODUCTVERSION_STRING
-#define MRPROPER_PRODUCTVERSION_STRING "0.1.0.0"
+#define MRPROPER_PRODUCTVERSION_STRING "0.2.0.0"
 #endif
 
 // Метаданные издателя. CompanyName и Copyright — плейсхолдеры: перед релизом
