@@ -55,7 +55,7 @@
         * project(MrProper VERSION ...) в CMakeLists.txt,
         * FILEVERSION/PRODUCTVERSION в packaging/version.rc,
         * выводом версии у mrproper-cli (опция с двойным тире).
-      Значение 0.1.0.0 соответствует project(MrProper VERSION 0.1.0).
+      Значение 0.2.0.0 соответствует project(MrProper VERSION 0.2.0).
       Требование о единой версии приложения — §4 FR-8 (отчёт содержит версии
       ОС/приложения), имя продукта в строках версии — §13.1, границы версий
       (MVP v1.0, далее v1.1/v1.2) — §3.

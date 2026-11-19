@@ -96,7 +96,7 @@ int cmdRules(const std::vector<std::string>& args, std::ostream& out, std::ostre
 // Версия
 // ---------------------------------------------------------------------------
 
-// Версия приложения, например "0.1.0". Совпадает с project(MrProper VERSION)
+// Версия приложения, например "0.2.0". Совпадает с project(MrProper VERSION)
 // в корневом CMakeLists: CMake передаёт MRPROPER_VERSION_STRING, а без него
 // берётся значение, совпадающее с project() на текущий момент (как в
 // cmd_rules.cpp). Одна строка версии живёт в одном месте — иначе отчёт,

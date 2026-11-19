@@ -48,7 +48,7 @@ namespace {
 #if defined(MRPROPER_VERSION_STRING)
 constexpr const char* kAppVersion = MRPROPER_VERSION_STRING;
 #else
-constexpr const char* kAppVersion = "0.1.0";
+constexpr const char* kAppVersion = "0.2.0";
 #endif
 
 // Конфигурация сборки: сообщение в --version должно отличать Debug от Release,

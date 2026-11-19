@@ -85,8 +85,14 @@ if(TARGET mrproper_cli)
     # MRPROPER_BUILD_TYPE). При генераторе Visual Studio CMAKE_BUILD_TYPE пуст, а
     # конфигурацию выбирает --config, поэтому значение берётся генераторным
     # выражением.
+    #
+    # MRPROPER_VERSION_STRING — та же история, но про версию: аргументы
+    # args.cpp/cmd_rules.cpp берут её отсюда и падают на «0.2.0» только если
+    # макрос не передан; в сборке он обязан быть, иначе --version покажет
+    # значение, не совпадающее с project() и с ресурсом .exe (§13.1).
     target_compile_definitions(mrproper_cli PRIVATE
         MRPROPER_BUILD_TYPE="$<CONFIG>"
+        MRPROPER_VERSION_STRING="${PROJECT_VERSION}"
     )
 
     # Выход в корень каталога сборки: проверка ищет mrproper-cli.exe по
