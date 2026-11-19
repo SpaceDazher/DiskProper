@@ -71,10 +71,10 @@
 ; Обёртка #ifndef обязательна: /D эмулирует «#define public», то есть
 ; повторный #define безусловно упал бы с «redefined».
 #ifndef MrVersion
-  #define MrVersion "0.1.0"
+  #define MrVersion "0.2.0"
 #endif
 #ifndef MrVersionFull
-  #define MrVersionFull "0.1.0.0"
+  #define MrVersionFull "0.2.0.0"
 #endif
 #ifndef MrAppName
   #define MrAppName "MrProper"
