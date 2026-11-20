@@ -1363,15 +1363,130 @@ TrashStatus transactionDirectoryFor(std::string_view trashRoot, std::string_view
     return TrashStatus::Ok;
 }
 
+// Защитный DACL на корень корзины (D-07, вторая половина). Корень лежит под
+// %ProgramData%, где наследование даёт обычному пользователю право создавать
+// каталоги: без явного DACL любой непривилегированный процесс может посадить
+// транзакцию с валидным именем и корректным манифестом, а восстановление
+// (особенно с перезаписью) исполнит её как рекурсивное удаление. Поэтому на
+// вновь созданном корне наследование снимается (SE_DACL_PROTECTED), а полный
+// доступ остаётся у владельца, SYSTEM и BUILTIN\Administrators.
+//
+// Владелец берётся у самого каталога, а не из токена: корень мог создать другой
+// процесс, и «текущий пользователь» в SDDL был бы не тем, кому корзина
+// принадлежит. Если владельца прочитать не удалось, DACL не ставится: остаться
+// с унаследованным DACL честнее, чем выдать полный доступ постороннему SID.
+TrashStatus applyProtectedTrashRootDacl(std::string_view trashRootUtf8, const TrashOptions& options) {
+    if (trashRootUtf8.empty()) return TrashStatus::InvalidArgument;
+    const std::wstring path = toWide(longPath(std::string(trashRootUtf8)));
+
+    PSID owner = nullptr;
+    PACL currentDacl = nullptr;
+    PSECURITY_DESCRIPTOR current = nullptr;
+    const DWORD readError = ::GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT,
+                                                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                                                    &owner, nullptr, &currentDacl, nullptr, &current);
+    if (readError != ERROR_SUCCESS || current == nullptr || owner == nullptr) {
+        if (current != nullptr) ::LocalFree(current);
+        logTrashFailure(kLogMove, "владелец корня корзины не прочитан: защитный DACL не поставлен",
+                        std::string(trashRootUtf8), readError != ERROR_SUCCESS ? readError : ERROR_ACCESS_DENIED,
+                        options);
+        return readError != ERROR_SUCCESS ? classify(readError) : TrashStatus::AccessDenied;
+    }
+
+    LPWSTR ownerText = nullptr;
+    std::wstring ownerSid;
+    if (::ConvertSidToStringSidW(owner, &ownerText) != FALSE && ownerText != nullptr) {
+        ownerSid.assign(ownerText);
+        ::LocalFree(ownerText);
+    }
+    ::LocalFree(current);
+
+    if (ownerSid.empty()) {
+        logTrashFailure(kLogMove, "владелец корня корзины не выражен SID: защитный DACL не поставлен",
+                        std::string(trashRootUtf8), ERROR_INVALID_DATA, options);
+        return TrashStatus::Unsupported;
+    }
+
+    // «D:P» — DACL с отключённым наследованием; три ACE полного доступа:
+    // владелец, LOCAL SYSTEM и BUILTIN\Administrators.
+    std::wstring sddl = L"D:P(A;;FA;;;";
+    sddl += ownerSid;
+    sddl += L")(A;;FA;;;SY)(A;;FA;;;BA)";
+
+    PSECURITY_DESCRIPTOR fresh = nullptr;
+    if (::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &fresh, nullptr) ==
+        FALSE) {
+        return classifyLastError();
+    }
+
+    BOOL present = FALSE;
+    BOOL valid = FALSE;
+    PACL freshDacl = nullptr;
+    (void)::GetSecurityDescriptorDacl(fresh, &present, &freshDacl, &valid);
+    DWORD setError = ERROR_INVALID_DATA;
+    if (present && freshDacl != nullptr) {
+        setError = ::SetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT,
+                                           DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                           nullptr, nullptr, freshDacl, nullptr);
+    }
+    ::LocalFree(fresh);
+    if (setError != ERROR_SUCCESS) {
+        logTrashFailure(kLogMove, "защитный DACL на корень корзины не поставлен", std::string(trashRootUtf8), setError,
+                        options);
+        return classify(setError);
+    }
+
+    // Чтение обратно: одного SetNamedSecurityInfo мало — он вернул успех, но
+    // проверить, что DACL действительно защищён от наследования, можно только
+    // чтением. Корзина, чей DACL не подтверждён, не считается защищённой.
+    PSECURITY_DESCRIPTOR check = nullptr;
+    PACL checkDacl = nullptr;
+    const DWORD checkError = ::GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                                    nullptr, nullptr, &checkDacl, nullptr, &check);
+    bool verified = false;
+    if (checkError == ERROR_SUCCESS && check != nullptr) {
+        LPWSTR text = nullptr;
+        const DWORD converted = ::ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            check, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &text, nullptr);
+        // ConvertSecurityDescriptorToStringSecurityDescriptorW возвращает длину
+        // строки, а не ERROR_SUCCESS: ноль — это отказ, любое ненулевое — успех.
+        verified = converted != FALSE && text != nullptr && std::wstring_view(text).rfind(L"D:P", 0) == 0;
+        if (text != nullptr) ::LocalFree(text);
+    }
+    if (check != nullptr) ::LocalFree(check);
+    if (!verified) {
+        logTrashFailure(kLogMove, "защитный DACL на корень корзины не подтверждён чтением",
+                        std::string(trashRootUtf8), checkError != ERROR_SUCCESS ? checkError : ERROR_INVALID_DATA,
+                        options);
+        return checkError != ERROR_SUCCESS ? classify(checkError) : TrashStatus::Unsupported;
+    }
+    return TrashStatus::Ok;
+}
+
 TrashStatus createTransactionDirectory(std::string_view trashRoot, std::string_view txId, std::string& dirOut,
                                       const TrashOptions& options) {
     TrashStatus status = transactionDirectoryFor(trashRoot, txId, dirOut, options);
     if (status != TrashStatus::Ok) return status;
 
-    status = ensureDirectoryTreeW(toWide(longPath(std::string(trashRoot))));
+    const std::wstring rootWide = toWide(longPath(std::string(trashRoot)));
+    const bool rootExisted = directoryExists(rootWide);
+    status = ensureDirectoryTreeW(rootWide);
     if (status != TrashStatus::Ok) {
         logTrashFailure(kLogMove, "корень корзины не создан", std::string(trashRoot), ::GetLastError(), options);
         return status;
+    }
+
+    // Защитный DACL ставится один раз — на вновь созданном корне. Повторный
+    // вызов у уже существующего корня не трогает его DACL: корзина могла быть
+    // создана другим пользователем, и переустановка DACL чужим процессом — это
+    // отказ доступа, а не защита.
+    if (!rootExisted) {
+        const TrashStatus dacl = applyProtectedTrashRootDacl(std::string(trashRoot), options);
+        if (dacl != TrashStatus::Ok) {
+            logTrashFailure(kLogMove, "корень корзины создан без защитного DACL", std::string(trashRoot),
+                            ERROR_ACCESS_DENIED, options);
+            return dacl;
+        }
     }
 
     const std::wstring dir = toWide(longPath(dirOut));
@@ -1611,6 +1726,92 @@ TrashInventory loadInventory(std::string_view trashRoot, const TrashOptions& opt
 // Восстановление
 // ---------------------------------------------------------------------------
 
+// Проверка цели восстановления (D-07, первая половина). Цель приезжает из
+// манифеста на диске: подделанная транзакция с originalPath на произвольный
+// каталог превращает «Отмену» (FR-7) в рекурсивное удаление этого каталога
+// (особенно при RestoreAction::Overwrite: clearDestination сносит цель
+// целиком). Поэтому цель проходит ту же границу, что и снос: WalkBoundary над
+// корнем правила. Пустая граница (внутренние операции сервиса корзины) — это
+// прежнее поведение, а не «разрешено всё».
+TrashStatus checkRestoreDestination(const std::string& destination, const TrashOptions& options) {
+    // Форма: относительный путь, «C:x», «..», ADS и пути устройств недопустимы
+    // до любой нормализации — иначе «C:x» превратится в текущий каталог диска.
+    if (!vfs_paths::isRootedFileSystemPath(destination) || vfs_paths::hasDotSegment(destination) ||
+        vfs_paths::hasStreamSuffix(destination)) {
+        logTrashFailure(kLogRestore, "цель восстановления неприемлема как путь файловой системы", destination,
+                        ERROR_INVALID_NAME, options);
+        return TrashStatus::InvalidArgument;
+    }
+
+    // Защищённые каталоги не восстанавливаются никогда (FR-6, белый список):
+    // даже без границы правила манифест не может вернуть файл в C:\Windows.
+    if (vfs_paths::isProtectedPath(destination)) {
+        logTrashFailure(kLogRestore, "цель восстановления в защищённом системном каталоге", destination,
+                        ERROR_ACCESS_DENIED, options);
+        return TrashStatus::AccessDenied;
+    }
+
+    const WalkBoundary boundary(options);
+    const std::wstring wide = toWide(longPath(destination));
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    std::wstring ancestor = wide;
+    // Ближайший существующий предок: сам объект обычно удалён (это и есть
+    // типичное восстановление), а его родитель на диске есть. Проверять надо
+    // предка: resolve() докажет, что путь физически внутри корня.
+    for (;;) {
+        if (attributesOf(ancestor, data)) break;
+        const DWORD error = ::GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND && error != ERROR_INVALID_NAME &&
+            error != ERROR_INVALID_PARAMETER) {
+            // Не «пути нет», а «спросить не смогли»: под невыясненной границей
+            // восстанавливать нельзя.
+            logTrashFailure(kLogRestore, "предок цели восстановления не опрошен", plainOf(ancestor), error, options);
+            return TrashStatus::AccessDenied;
+        }
+        const std::string parent = parentPath(toNarrow(ancestor));
+        if (parent.empty()) {
+            // Выше корня тома не поднимаемся: если корень правила задан, он там
+            // точно не лежит. Без границы это ещё не отказ — предок просто
+            // проверен на reparse ниже.
+            if (boundary.armed()) {
+                logTrashFailure(kLogRestore, "цель восстановления вне корня правила", plainOf(ancestor),
+                                ERROR_ACCESS_DENIED, options);
+                return TrashStatus::AccessDenied;
+            }
+            ancestor.clear();
+            break;
+        }
+        const std::wstring next = toWide(parent);
+        if (next == ancestor) {
+            if (boundary.armed()) {
+                logTrashFailure(kLogRestore, "цель восстановления вне корня правила", plainOf(ancestor),
+                                ERROR_ACCESS_DENIED, options);
+                return TrashStatus::AccessDenied;
+            }
+            ancestor.clear();
+            break;
+        }
+        ancestor = std::move(next);
+    }
+
+    // Сам объект (или ближайший предок) — точка перехода: FR-6 требует не
+    // разворачивать ссылку, иначе MoveFileEx унесёт цель за корень.
+    if (!ancestor.empty() && isReparse(data.dwFileAttributes)) {
+        logTrashFailure(kLogRestore, "цель восстановления — точка перехода", plainOf(ancestor), ERROR_ACCESS_DENIED,
+                        options);
+        return TrashStatus::AccessDenied;
+    }
+
+    if (boundary.armed()) {
+        if (!boundary.allows(ancestor)) {
+            logTrashFailure(kLogRestore, "цель восстановления вне корня правила", plainOf(ancestor), ERROR_ACCESS_DENIED,
+                            options);
+            return TrashStatus::AccessDenied;
+        }
+    }
+    return TrashStatus::Ok;
+}
+
 TrashRestoreResult restoreTrashItem(const TrashRestoreRequest& request, const TrashOptions& options) {
     TrashRestoreResult result;
 
@@ -1635,6 +1836,15 @@ TrashRestoreResult restoreTrashItem(const TrashRestoreRequest& request, const Tr
         request.destinationPath.empty() ? std::string(request.item.originalPath) : request.destinationPath;
     if (destination.empty()) {
         result.status = TrashStatus::InvalidArgument;
+        return result;
+    }
+
+    // D-07: цель из манифеста проверяется до любого изменения на диске.
+    const TrashStatus boundary = checkRestoreDestination(destination, options);
+    if (boundary != TrashStatus::Ok) {
+        result.status = boundary;
+        result.failedPath = destination;
+        result.win32Error = boundary == TrashStatus::InvalidArgument ? ERROR_INVALID_NAME : ERROR_ACCESS_DENIED;
         return result;
     }
 

@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "core/log.hpp"
+#include "vfs_delete.hpp" // единый белый список FR-6 (D-12): таблица живёт там
 #include "win_error.hpp"
 #include "win_handle.hpp"
 
@@ -50,7 +51,6 @@ namespace {
 
 constexpr std::size_t kInitialPathChars = 512;  // типовой путь Windows
 constexpr std::size_t kMaxPathChars = 32768;     // потолок роста буфера пути
-constexpr std::size_t kEnvironmentChars = 260;   // MAX_PATH, типовой предел переменной окружения
 constexpr std::size_t kGrowAttempts = 6u;       // удвоений буфера, потолок по числу попыток
 
 // Префиксы форм пути. Объявлены массивами, а не через auto, чтобы длина была
@@ -236,57 +236,83 @@ void canonicalizeWide(std::wstring& path) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// Защищённые каталоги
+// Защищённые каталоги: единый белый список FR-6 (D-12)
 // ---------------------------------------------------------------------------
+//
+// ЕДИНЫЙ ИСТОЧНИК ИСТИНЫ — таблица mrproper::platform::vfs::rootLists() в
+// vfs_delete.cpp. Она сильнее прежнего локального списка этого модуля по двум
+// причинам, и обе были поводом для расхождения:
+//
+//   * знает разницу «жёсткий запрет» / «мягкий запрет»: System32, SysWOW64,
+//     WinSxS, Installer, DriverStore, assembly — жёстко, а сам каталог Windows
+//     и ProgramData — мягко, то есть снимаются корнем правила, который лежит
+//     строго глубже. Прежний список здесь был плоским и защищал «C:\Windows»
+//     целиком, из-за чего 12 правил набора не могли выполниться никогда
+//     (temp.system, logs.system, ms.update.download, delivery.opt.cache,
+//     crash.dumps.minidump, crash.dumps.memory, memory.dumps.livekernel,
+//     prefetch.files, installer.cache.* три, winsxs.report): фаза A
+//     возвращала ProtectedPath на любой путь под C:\Windows, и вердикт был
+//     окончательным — исполнитель даже не доходил до второй проверки;
+//   * перечисляет тома (GetLogicalDrives + FindFirstVolumeW) и добавляет
+//     System Volume Information, $Recycle.Bin и Recovery для каждого тома, а
+//     также Program Files во всех вариантах и ProgramData. Локальный список
+//     знал только %SystemRoot% и %ProgramFiles% с литеральным запасом.
+//
+// Поэтому здесь больше нет ни литералов «C:\Windows», ни чтения переменных
+// окружения: два списка — это ровно тот дефект, который закрывает D-12. Таблица
+// остаётся в vfs_delete по двум причинам: она строится из Win32 (перечисление
+// томов) и там же стоит второй рубеж проверки перед операцией. Этот модуль
+// читает её через neverDeleteRoots() (жёсткая часть) и protectedRoots()
+// (мягкая часть) и применяет ту же семантику «корень строго глубже», что и
+// vfs_delete::checkProtectedCanonical.
+//
+// Что здесь своего и почему это не второй список. Позиционная проверка
+// «System Volume Information — прямой потомок корня тома»
+// (isProtectedSystemFolderWide): vfs_delete перечисляет тома, а перечисление
+// может не сойтись (отказ FindFirstVolumeW, том без буквы), и тогда каталог
+// остался бы незащищённым. Правило одно, а способов его выразить два — списком
+// томов и положением. Второй список — это когда два модуля по-разному отвечают
+// на вопрос «C:\Windows защищён?»; здесь они отвечают одинаково.
 
-// Канонические расширенные формы защищённых корней и признак «список собран».
-// Состояние общее на процесс, инициализируется под std::call_once: обход
-// каталогов многопоточный (SPEC §5), и гонка за std::vector была бы не просто
-// ошибкой, а порчей данных.
+// Канонические расширенные формы защищённых корней, разделённые по силе
+// запрета, и признак «список собран». Состояние общее на процесс,
+// инициализируется под std::call_once: обход каталогов многопоточный (SPEC §5),
+// и гонка за std::vector была бы не просто ошибкой, а порчей данных.
 struct ProtectedRoots {
-    std::vector<std::wstring> forms;
+    std::vector<std::wstring> hard;     // жёсткий запрет: не снимается ничем
+    std::vector<std::wstring> guarded;  // мягкий: снимает корень правила строго глубже
     bool ready{false};
 };
 
-[[nodiscard]] std::wstring environmentValue(const wchar_t* name) noexcept {
-    if (name == nullptr || *name == L'\0') return {};
-    std::vector<wchar_t> buffer(kEnvironmentChars);
-    for (std::size_t attempt = 0; attempt < kGrowAttempts; ++attempt) {
-        const DWORD written = ::GetEnvironmentVariableW(name, buffer.data(), static_cast<DWORD>(buffer.size()));
-        if (written == 0u) return {};
-        if (written < buffer.size()) return std::wstring(buffer.data(), written);
-        buffer.resize(static_cast<std::size_t>(written) + 1u);
+// Перевод корней единой таблицы в сравнимые расширенные формы. Таблица уже
+// каноническая («\\?\C:\Windows»), поэтому остаётся привести разделители и
+// снять висящий хвост. Сравнение ниже покомпонентное и регистронезависимое, но
+// форму обязаны иметь одинаковую: «\\?\C:\Windows» и «C:\Windows» — это разные
+// строки, и одна из них сравнилась бы с другой как «снаружи».
+void appendForms(std::vector<std::wstring>& forms, const std::vector<std::wstring>& roots) {
+    for (const std::wstring& root : roots) {
+        std::wstring form = root;
+        canonicalizeWide(form);
+        if (form.empty()) continue;
+        // Повторы нужны: на 64-битной Windows ProgramFiles и ProgramW6432
+        // указывают на один каталог, и без дедупликации список содержал бы два
+        // одинаковых элемента.
+        bool known = false;
+        for (const std::wstring& existing : forms) {
+            if (equalsOrdinalCI(existing, form)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) forms.push_back(std::move(form));
     }
-    return {};
 }
 
-// Добавить корень в список, если его там ещё нет. Повторы нужны: на 64-битной
-// Windows ProgramFiles и ProgramW6432 указывают на один каталог, и без
-// дедупликации список содержал бы два одинаковых элемента.
-void addProtectedRoot(std::vector<std::wstring>& forms, std::wstring value) noexcept {
-    if (value.empty() || !toExtendedWide(value)) return;
-    canonicalizeWide(value);
-    if (value.empty()) return;
-    for (const std::wstring& existing : forms) {
-        if (equalsOrdinalCI(existing, value)) return;
-    }
-    forms.push_back(std::move(value));
-}
-
-[[nodiscard]] std::vector<std::wstring> collectProtectedRoots() {
-    std::vector<std::wstring> forms;
-    // Переменная окружения — источник по умолчанию, литерал — запас на
-    // окружение, где переменной нет. Список литералов совпадает с путями в
-    // наборе правил (§9.2), чтобы развёрнутый и неразвёрнутый вид правила вели
-    // себя одинаково.
-    addProtectedRoot(forms, environmentValue(L"SystemRoot"));
-    addProtectedRoot(forms, environmentValue(L"ProgramFiles"));
-    addProtectedRoot(forms, environmentValue(L"ProgramFiles(x86)"));
-    addProtectedRoot(forms, environmentValue(L"ProgramW6432"));
-    addProtectedRoot(forms, L"C:\\Windows");
-    addProtectedRoot(forms, L"C:\\Program Files");
-    addProtectedRoot(forms, L"C:\\Program Files (x86)");
-    return forms;
+[[nodiscard]] ProtectedRoots collectProtectedRoots() {
+    ProtectedRoots built;
+    appendForms(built.hard, mrproper::platform::vfs::neverDeleteRoots());
+    appendForms(built.guarded, mrproper::platform::vfs::protectedRoots());
+    return built;
 }
 
 // Список собирается один раз за процесс. Единственный перехват исключения в
@@ -297,10 +323,10 @@ void addProtectedRoot(std::vector<std::wstring>& forms, std::wstring value) noex
     static std::once_flag once;
     std::call_once(once, [] {
         try {
-            roots.forms = collectProtectedRoots();
+            roots = collectProtectedRoots();
             roots.ready = true;
         } catch (const std::bad_alloc&) {
-            roots.ready = false;
+            roots = ProtectedRoots{};  // список не собрался: ready остаётся false
         }
     });
     return roots;
@@ -338,14 +364,42 @@ void addProtectedRoot(std::vector<std::wstring>& forms, std::wstring value) noex
     return isVolumeRootWide(form.substr(0u, sep));
 }
 
-[[nodiscard]] bool isProtectedWide(std::wstring_view form) noexcept {
+// «child лежит внутри root или совпадает с ним». Та же проверка, что
+// vfs_delete::pathInside, и по той же причине: сравнение покомпонентное
+// («C:\Windows.old» не внутри «C:\Windows»), регистронезависимое (его задаёт
+// файловая система тома, а не язык системы), а завершающие разделители уже
+// сняты канонизацией обеих сторон.
+[[nodiscard]] bool isInsideForm(std::wstring_view form, std::wstring_view root) noexcept {
+    if (root.empty() || form.size() < root.size()) return false;
+    if (!startsWithOrdinalCI(form, root)) return false;
+    // Граница компонента: «C:\Windows.old» не защищён, «C:\Windows» — да.
+    return form.size() == root.size() || form[root.size()] == L'\\';
+}
+
+// Строгое вхождение: нужно для правила «мягкий запрет снимается только корнем
+// правила, который строго глубже защищённого каталога». Корень, равный
+// защищённому каталогу, снятия не даёт: иначе правило с локатором
+// «C:\Windows\**» снесло бы систему целиком.
+[[nodiscard]] bool isStrictlyInsideForm(std::wstring_view form, std::wstring_view root) noexcept {
+    return form.size() > root.size() && isInsideForm(form, root);
+}
+
+// Ответ на вопрос «этот путь защищён?». ruleRoot — корень правила в той же
+// расширенной форме; пустой корень означает «корень неизвестен», и тогда
+// мягкий запрет действует (fail-closed: незнание не открывает C:\Windows).
+[[nodiscard]] bool isProtectedWide(std::wstring_view form, std::wstring_view ruleRoot) noexcept {
     if (form.empty()) return false;
     const ProtectedRoots& roots = protectedRoots();
-    if (!roots.ready) return true;  // список не собрался: не знаем — не пропускаем
-    for (const std::wstring& root : roots.forms) {
-        if (root.empty() || !startsWithOrdinalCI(form, root)) continue;
-        // Граница компонента: «C:\Windows.old» не защищён, «C:\Windows» — да.
-        if (form.size() == root.size() || form[root.size()] == L'\\') return true;
+    if (!roots.ready) return true;  // список не собран: не знаем — не пропускаем
+    for (const std::wstring& root : roots.hard) {
+        if (isInsideForm(form, root)) return true;
+    }
+    for (const std::wstring& root : roots.guarded) {
+        // Мягкий запрет. Корень правила «C:\Windows\Temp» лежит строго глубже
+        // «C:\Windows», и всё, что внутри него, разрешено — это temp.system,
+        // logs.system, prefetch и остальные правила, которые до D-12 не могли
+        // выполниться никогда. Корень «C:\Windows» не снимает ничего.
+        if (isInsideForm(form, root) && !isStrictlyInsideForm(ruleRoot, root)) return true;
     }
     return isProtectedSystemFolderWide(form);
 }
@@ -516,18 +570,30 @@ bool isInsideRoot(std::string_view pathUtf8, std::string_view rootUtf8) noexcept
 }
 
 std::vector<std::string> protectedRootsUtf8() {
+    // Единый белый список FR-6 без деления на силу запрета: и жёсткие корни
+    // (System32, WinSxS, Installer, Program Files, тома), и мягкие (сам каталог
+    // Windows, ProgramData). Разница между ними видна только вместе с корнем
+    // правила, а здесь его нет; поэтому отчёт показывает весь список, а решение
+    // принимают isProtectedPath и checkRuleRoot.
     std::vector<std::string> out;
     const ProtectedRoots& roots = protectedRoots();
-    out.reserve(roots.forms.size());
-    for (const std::wstring& form : roots.forms) {
-        std::string text;
-        if (platform::tryToUtf8(form, text)) out.push_back(std::move(text));
+    out.reserve(roots.hard.size() + roots.guarded.size());
+    const std::vector<std::wstring>* groups[2] = {&roots.hard, &roots.guarded};
+    for (const std::vector<std::wstring>* group : groups) {
+        for (const std::wstring& form : *group) {
+            std::string text;
+            if (platform::tryToUtf8(form, text)) out.push_back(std::move(text));
+        }
     }
     return out;
 }
 
 bool isProtectedPath(std::string_view pathUtf8) noexcept {
-    return isProtectedWide(canonicalWide(toExtendedPath(pathUtf8)));
+    // Корень правила здесь не нужен: вопрос «этот путь защищён сам по себе», и
+    // мягкий запрет на него отвечает «да» — без корня снимать его нечем. Это
+    // тот же ответ, который даёт vfs_delete::isProtectedPath, и совпадение
+    // ответов двух слоёв — половина сути D-12.
+    return isProtectedWide(canonicalWide(toExtendedPath(pathUtf8)), std::wstring_view{});
 }
 
 const char* verdictName(Verdict verdict) noexcept {
@@ -616,7 +682,15 @@ Guard checkRuleRoot(std::string_view pathUtf8, const RootGuard& root) noexcept {
         logRejected("путь вне корня правила", out.verdict, pathUtf8, 0u);
         return out;
     }
-    if (isProtectedPath(resolution.path)) {
+    // Единый белый список FR-6 (D-12). Корень правила нужен здесь не для
+    // границы (её только что проверил isInsideRoot), а для мягкого запрета:
+    // «C:\Windows» защищён ровно до тех пор, пока корень правила не лежит
+    // строго глубже. Поэтому корень приводится к той же расширенной форме, что
+    // и путь: сравнение покомпонентное и регистронезависимое, но форму обязаны
+    // иметь одинаковую, иначе «C:\Windows\Temp» сравнился бы с
+    // «\\?\C:\Windows\Temp» как два разных пути.
+    const std::wstring ruleRootForm = canonicalWide(toExtendedPath(root.root));
+    if (isProtectedWide(canonicalWide(toExtendedPath(resolution.path)), ruleRootForm)) {
         out.verdict = Verdict::ProtectedPath;
         logRejected("путь в защищённом системном каталоге", out.verdict, pathUtf8, 0u);
         return out;

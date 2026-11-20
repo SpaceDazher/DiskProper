@@ -29,6 +29,8 @@
 
 #include <windows.h>
 #include <winioctl.h>
+#include <aclapi.h>  // GetNamedSecurityInfoW, ConvertSecurityDescriptorToStringSecurityDescriptorW
+#include <sddl.h>    // SDDL_REVISION_1
 
 #include <atomic>
 #include <cstddef>
@@ -46,6 +48,7 @@
 namespace {
 
 namespace trash = mrproper::platform;
+namespace core = mrproper::core;
 
 using ScopedHandle = mrproper::platform::unique_handle<mrproper::platform::KernelHandlePolicy>;
 
@@ -405,6 +408,356 @@ TEST(trashBoundary_unresolvableRootFailsClosed) {
     CHECK(exists(fixture.payload()));  // файл обязан остаться на месте
 
     fixture.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// D-07: граница восстановления и защитный DACL на корень корзины
+// ---------------------------------------------------------------------------
+//
+// Подделанная транзакция (её манифест лежит на диске и имеет корректную схему)
+// раньше исполнялась буквально: цель восстановления бралась из originalPath и
+// ни с какой границей не сверялась. MoveFileExW не знает про корень правила,
+// поэтому «цель вне корня» или «цель через junction» уносили
+// восстановление (и перезапись) за пределы правила. Вторая половина — корень
+// корзины создавался с унаследованным DACL, то есть любой непривилегированный
+// процесс мог посадить в %ProgramData% свою транзакцию.
+
+// Уборка дерева: junction снимается раньше, а файлы — с FILE_ATTRIBUTE_NORMAL.
+void removeTreePath(const std::wstring& path) {
+    const std::wstring ext = extended(path);
+    WIN32_FIND_DATAW data{};
+    std::wstring pattern = ext + L"\\*";
+    ScopedHandle find(::FindFirstFileW(pattern.c_str(), &data));
+    if (find) {
+        do {
+            const std::wstring name(data.cFileName);
+            if (name == L"." || name == L"..") continue;
+            const std::wstring child = ext + L"\\" + name;
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                removeTreePath(child);
+            } else {
+                ::SetFileAttributesW(child.c_str(), FILE_ATTRIBUTE_NORMAL);
+                ::DeleteFileW(child.c_str());
+            }
+        } while (::FindNextFileW(find.get(), &data) != FALSE);
+    }
+    ::RemoveDirectoryW(ext.c_str());
+}
+
+[[nodiscard]] bool readTextFile(const std::wstring& path, std::string& out, std::string& why) {
+    ScopedHandle file(::CreateFileW(extended(path).c_str(), GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file) {
+        why = "не удалось открыть файл " + trash::toUtf8(path);
+        return false;
+    }
+    char buffer[256] = {};
+    DWORD read = 0;
+    if (!::ReadFile(file.get(), buffer, static_cast<DWORD>(sizeof(buffer) - 1u), &read, nullptr)) {
+        why = "не удалось прочитать файл " + trash::toUtf8(path);
+        return false;
+    }
+    out.assign(buffer, read);
+    return true;
+}
+
+// DACL корня в SDDL: нужен и тесту, и как доказательство «прочитано обратно».
+[[nodiscard]] bool readDaclSddl(const std::wstring& path, std::wstring& sddl, std::string& why) {
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD error = ::GetNamedSecurityInfoW(extended(path).c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                                nullptr, nullptr, &dacl, nullptr, &descriptor);
+    if (error != ERROR_SUCCESS || descriptor == nullptr) {
+        why = "DACL не прочитан: " + trash::win32ErrorText(error) + " (" + std::to_string(error) + ")";
+        return false;
+    }
+    LPWSTR text = nullptr;
+    const DWORD converted = ::ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        descriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &text, nullptr);
+    ::LocalFree(descriptor);
+    // Возвращается длина строки, а не ERROR_SUCCESS: ноль — отказ.
+    if (converted == FALSE || text == nullptr) {
+        why = "DACL не переведён в SDDL";
+        return false;
+    }
+    sddl.assign(text);
+    ::LocalFree(text);
+    return true;
+}
+
+// Фикстура восстановления: корень правила, «дальний» каталог с жертвой, корзину
+// и транзакцию с одним элементом.
+class RestoreFixture {
+public:
+    RestoreFixture() {
+        base_ = tempRoot();
+        rule_ = base_ + L"\\rule";
+        outside_ = base_ + L"\\outside";
+        trash_ = base_ + L"\\trash";
+        txDir_ = trash_ + L"\\" + kTxIdWide;
+        payload_ = txDir_ + L"\\p0";
+        junction_ = rule_ + L"\\shortcut";
+        victim_ = outside_ + L"\\victim.txt";
+    }
+
+    bool create(std::string& why) {
+        if (base_.empty()) {
+            why = "не найден %TEMP%";
+            return false;
+        }
+        if (!makeDirectories(rule_, why)) return false;
+        if (!makeDirectories(outside_, why)) return false;
+        if (!makeDirectories(txDir_, why)) return false;
+        if (!writeFile(payload_, "payload", why)) return false;
+        return writeFile(victim_, "keep", why);
+    }
+
+    void cleanup() {
+        removeJunction(junction_);
+        removeTreePath(base_);
+    }
+
+    // Манифест с одним элементом: originalPath — цель восстановления.
+    bool writeTransaction(const std::wstring& originalPath, std::string& why) {
+        core::TrashItem item;
+        item.kind = core::TrashItemKind::File;
+        item.originalPath = trash::toUtf8(originalPath);
+        item.payload = "p0";
+        item.bytes = 7;
+        item.fileCount = 1;
+        item.mtime = 1780000000;
+
+        core::TrashTransaction tx;
+        tx.txId = kTxId;
+        tx.createdAt = 1780000000;
+        tx.appVersion = "test";
+        tx.items.push_back(std::move(item));
+        tx.state = core::TrashTxState::Committed;
+
+        trash::TrashOptions quiet;
+        quiet.logFailures = false;
+        const trash::TrashStatus status = trash::writeManifest(trash::toUtf8(txDir_), tx, quiet);
+        if (status != trash::TrashStatus::Ok) {
+            why = std::string("манифест не записан: ") + trash::toString(status);
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] trash::TrashRestoreRequest request(const std::wstring& originalPath,
+                                                     core::RestoreAction action) const {
+        trash::TrashRestoreRequest request;
+        request.transactionDir = trash::toUtf8(txDir_);
+        request.item.kind = core::TrashItemKind::File;
+        request.item.originalPath = trash::toUtf8(originalPath);
+        request.item.payload = "p0";
+        request.item.bytes = 7;
+        request.item.fileCount = 1;
+        request.item.mtime = 1780000000;
+        request.action = action;
+        return request;
+    }
+
+    [[nodiscard]] const std::wstring& ruleRoot() const { return rule_; }
+    [[nodiscard]] const std::wstring& outsideDir() const { return outside_; }
+    [[nodiscard]] const std::wstring& junction() const { return junction_; }
+    [[nodiscard]] const std::wstring& victim() const { return victim_; }
+    [[nodiscard]] const std::wstring& txDir() const { return txDir_; }
+
+private:
+    static constexpr const char* kTxId = "20260927T225900Z-000001-abcdef";
+    static constexpr const wchar_t* kTxIdWide = L"20260927T225900Z-000001-abcdef";
+
+    std::wstring base_;
+    std::wstring rule_;
+    std::wstring outside_;
+    std::wstring trash_;
+    std::wstring txDir_;
+    std::wstring payload_;
+    std::wstring junction_;
+    std::wstring victim_;
+};
+
+TEST(trashRestore_forgedTargetOutsideRootIsRefused) {
+    RestoreFixture fixture;
+    std::string why;
+    if (!fixture.create(why)) {
+        skip("trashRestore_forgedTargetOutsideRootIsRefused", why);
+        return;
+    }
+    if (!fixture.writeTransaction(fixture.victim(), why)) {
+        skip("trashRestore_forgedTargetOutsideRootIsRefused", why);
+        fixture.cleanup();
+        return;
+    }
+
+    // Подделанная транзакция: originalPath — файл вне корня правила, действие
+    // Overwrite. MoveFileExW про границу не знает и перезаписал бы жертву.
+    const trash::TrashOptions options = quietOptions(fixture.ruleRoot());
+    const trash::TrashRestoreResult result = trash::restoreTrashItem(
+        fixture.request(fixture.victim(), core::RestoreAction::Overwrite), options);
+
+    CHECK(!result.ok());  // подделанная транзакция обязана получить отказ
+    CHECK(result.status == trash::TrashStatus::AccessDenied);  // внятная причина
+    CHECK(result.failedPath == trash::toUtf8(fixture.victim()));
+
+    std::string content;
+    CHECK(readTextFile(fixture.victim(), content, why));  // жертва не перезаписана
+    CHECK(content == std::string("keep"));
+
+    fixture.cleanup();
+    CHECK(!exists(fixture.victim()));  // уборка фикстуры сработала
+}
+
+TEST(trashRestore_junctionTargetIsRefused) {
+    RestoreFixture fixture;
+    std::string why;
+    if (!fixture.create(why)) {
+        skip("trashRestore_junctionTargetIsRefused", why);
+        return;
+    }
+    // Junction внутри корня правила ведёт в «дальний» каталог: цель
+    // rule\shortcut\smuggled.txt лексически внутри корня, физически — снаружи.
+    if (!createJunction(fixture.junction(), fixture.outsideDir(), why)) {
+        skip("trashRestore_junctionTargetIsRefused", why);
+        fixture.cleanup();
+        return;
+    }
+    const std::wstring smuggled = fixture.junction() + L"\\smuggled.txt";
+    if (!fixture.writeTransaction(smuggled, why)) {
+        skip("trashRestore_junctionTargetIsRefused", why);
+        fixture.cleanup();
+        return;
+    }
+
+    const trash::TrashOptions options = quietOptions(fixture.ruleRoot());
+    const trash::TrashRestoreResult result =
+        trash::restoreTrashItem(fixture.request(smuggled, core::RestoreAction::Restore), options);
+
+    CHECK(!result.ok());  // цель через junction — отказ
+    CHECK(result.status == trash::TrashStatus::AccessDenied);
+    CHECK(!exists(fixture.outsideDir() + L"\\smuggled.txt"));  // за корень ничего не ушло
+    CHECK(exists(fixture.victim()));  // жертва на месте
+
+    fixture.cleanup();
+    CHECK(!exists(fixture.victim()));
+}
+
+TEST(trashRestore_adsTargetIsRefused) {
+    RestoreFixture fixture;
+    std::string why;
+    if (!fixture.create(why)) {
+        skip("trashRestore_adsTargetIsRefused", why);
+        return;
+    }
+    // ADS: имя потока, а не файла (§5 «ADS не трогаем»).
+    const std::wstring ads = fixture.ruleRoot() + L"\\ads.txt:stream";
+    if (!fixture.writeTransaction(ads, why)) {
+        skip("trashRestore_adsTargetIsRefused", why);
+        fixture.cleanup();
+        return;
+    }
+
+    const trash::TrashOptions options = quietOptions(fixture.ruleRoot());
+    const trash::TrashRestoreResult result =
+        trash::restoreTrashItem(fixture.request(ads, core::RestoreAction::Restore), options);
+
+    CHECK(!result.ok());  // ADS обязан быть отвергнут
+    CHECK(result.status == trash::TrashStatus::InvalidArgument);  // с внятной причиной
+
+    fixture.cleanup();
+}
+
+TEST(trashRestore_legitimateTargetSucceeds) {
+    RestoreFixture fixture;
+    std::string why;
+    if (!fixture.create(why)) {
+        skip("trashRestore_legitimateTargetSucceeds", why);
+        return;
+    }
+    // Законная цель: файл внутри корня правила, на диске его нет (его удалили).
+    const std::wstring restored = fixture.ruleRoot() + L"\\restored.txt";
+    if (!fixture.writeTransaction(restored, why)) {
+        skip("trashRestore_legitimateTargetSucceeds", why);
+        fixture.cleanup();
+        return;
+    }
+
+    const trash::TrashOptions options = quietOptions(fixture.ruleRoot());
+    const trash::TrashRestoreResult result =
+        trash::restoreTrashItem(fixture.request(restored, core::RestoreAction::Restore), options);
+
+    if (!result.ok()) {
+        std::printf("         [diag] status=%s win32=%u failed=%s\n", trash::toString(result.status),
+                    result.win32Error, result.failedPath.c_str());
+    }
+    CHECK(result.ok());  // законная цель обязана вернуться на место
+    CHECK(exists(restored));
+
+    std::string content;
+    CHECK(readTextFile(restored, content, why));
+    CHECK(content == std::string("payload"));
+
+    fixture.cleanup();
+    CHECK(!exists(restored));
+}
+
+TEST(trashRestore_emptyRootKeepsServiceBehaviour) {
+    RestoreFixture fixture;
+    std::string why;
+    if (!fixture.create(why)) {
+        skip("trashRestore_emptyRootKeepsServiceBehaviour", why);
+        return;
+    }
+    // Пустая граница — внутренняя операция сервиса корзины: корень правила не
+    // задан, и восстановление законной цели обязано работать как раньше.
+    const std::wstring restored = fixture.ruleRoot() + L"\\service.txt";
+    if (!fixture.writeTransaction(restored, why)) {
+        skip("trashRestore_emptyRootKeepsServiceBehaviour", why);
+        fixture.cleanup();
+        return;
+    }
+
+    const trash::TrashOptions options = quietOptions({});
+    const trash::TrashRestoreResult result =
+        trash::restoreTrashItem(fixture.request(restored, core::RestoreAction::Restore), options);
+
+    CHECK(result.ok());  // сервисное восстановление без границы не сломано
+    CHECK(exists(restored));
+
+    fixture.cleanup();
+}
+
+TEST(trashRestore_protectiveDaclOnNewRoot) {
+    // Корень корзины создаётся с защищённым DACL: наследование снято, полный
+    // доступ у владельца, SYSTEM и Administrators. Проверка — чтением обратно.
+    const std::wstring root = tempRoot();
+    if (root.empty()) {
+        skip("trashRestore_protectiveDaclOnNewRoot", "не найден %TEMP%");
+        return;
+    }
+
+    std::string dirOut;
+    trash::TrashOptions options;
+    options.logFailures = false;
+    options.applyTimestamps = false;
+    options.applyAcl = false;
+    const trash::TrashStatus status =
+        trash::createTransactionDirectory(trash::toUtf8(root), "20260927T225900Z-000001-abcdef", dirOut, options);
+    if (status != trash::TrashStatus::Ok) {
+        std::printf("         [diag] createTransactionDirectory status=%s\n", trash::toString(status));
+    }
+    CHECK(status == trash::TrashStatus::Ok);  // корень создан
+
+    std::wstring sddl;
+    std::string why;
+    CHECK(readDaclSddl(root, sddl, why));  // DACL прочитан обратно
+    CHECK(sddl.rfind(L"D:P", 0) == 0);  // DACL защищён от наследования
+    CHECK(sddl.find(L"SY") != std::wstring::npos);  // SYSTEM полный доступ
+    CHECK(sddl.find(L"BA") != std::wstring::npos);  // Administrators полный доступ
+
+    removeTreePath(root);
 }
 
 }  // namespace

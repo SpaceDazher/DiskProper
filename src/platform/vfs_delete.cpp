@@ -273,11 +273,52 @@ void appendChild(std::vector<std::wstring>& out, const std::wstring& parent, std
     return value;
 }
 
+// Каталог Windows. GetWindowsDirectoryW — источник по умолчанию, запас —
+// %SystemRoot%, последний запас — литерал «C:\Windows»: прежний белый список
+// vfs_paths (до D-12) знал ровно этот литерал, и единая таблица не имеет права
+// стать слабее ни одного из двух списков, которые она заменила.
+[[nodiscard]] std::wstring systemRootWide() {
+    wchar_t windows[MAX_PATH] = {};
+    const UINT length = ::GetWindowsDirectoryW(windows, MAX_PATH);
+    if (length > 0 && length < MAX_PATH) return std::wstring(windows, length);
+    const DWORD needed = ::GetEnvironmentVariableW(L"SystemRoot", nullptr, 0);
+    if (needed > 0 && needed < MAX_PATH) {
+        std::wstring value(needed, L'\0');
+        const DWORD written = ::GetEnvironmentVariableW(L"SystemRoot", value.data(), needed);
+        if (written > 0 && written < needed) {
+            value.resize(written);
+            return value;
+        }
+    }
+    return std::wstring(L"C:\\Windows");
+}
+
+// Добавить корень, если его там ещё нет. Повторы нужны: на 64-битной Windows
+// ProgramFiles и ProgramW6432 указывают на один каталог, и без дедупликации
+// список содержал бы два одинаковых элемента.
+void pushUnique(std::vector<std::wstring>& out, std::wstring value) {
+    const std::wstring canonical = canonicalizePath(value);
+    if (canonical.empty()) return;
+    for (const std::wstring& existing : out) {
+        if (equalNoCase(existing, canonical)) return;
+    }
+    out.push_back(std::move(canonical));
+}
+
 // Список строится один раз за жизнь процесса: он зависит от установки (буквы
 // дисков, %ProgramFiles%, %ProgramData%), а не от проверяемого пути, и в рантайме
 // не меняется. Потокобезопасен (инициализация локальной статической переменной
 // гарантирована стандартом), поэтому deleteTree из нескольких потоков движка
 // (§4 FR-6: пул) не синхронизируется вручную.
+//
+// D-12: это ЕДИНСТВЕННЫЙ белый список FR-6 на проект, и он живёт здесь, а не в
+// vfs_paths. Причины: (1) таблица строится из Win32 — перечисление томов,
+// GetWindowsDirectoryW/GetSystemDirectoryW, переменные окружения; (2) здесь же
+// стоит второй рубеж проверки перед операцией (checkProtectedCanonical). Оба
+// слоя читают её через neverDeleteRoots() и protectedRoots(); vfs_paths
+// применяет ту же семантику «мягкий запрет снимает корень строго глубже».
+// До D-12 списков было два, и они расходились: vfs_paths защищал C:\Windows
+// жёстко, из-за чего 12 правил набора не могли выполниться никогда.
 [[nodiscard]] const RootLists& rootLists() {
     static const RootLists lists = [] {
         RootLists built;
@@ -312,19 +353,19 @@ void appendChild(std::vector<std::wstring>& out, const std::wstring& parent, std
         // каталог Windows: правила temp.system и logs чистят C:\Windows\Temp и
         // C:\Windows\Logs, а вот C:\Windows целиком снять запрет не может,
         // потому что корень правила должен быть строго глубже.
-        wchar_t windows[MAX_PATH] = {};
-        const UINT windowsLength = ::GetWindowsDirectoryW(windows, MAX_PATH);
-        if (windowsLength > 0 && windowsLength < MAX_PATH) {
-            const std::wstring systemRoot(windows, windowsLength);
-            appendChild(built.never, systemRoot, L"System32");
-            appendChild(built.never, systemRoot, L"SysWOW64");
-            appendChild(built.never, systemRoot, L"WinSxS");
-            appendChild(built.never, systemRoot, L"Installer");
-            appendChild(built.never, systemRoot, L"DriverStore");
-            appendChild(built.never, systemRoot, L"assembly");
-            const std::wstring canonical = canonicalizePath(systemRoot);
-            if (!canonical.empty()) built.guarded.push_back(canonical);
-        }
+        const std::wstring systemRoot = systemRootWide();
+        appendChild(built.never, systemRoot, L"System32");
+        appendChild(built.never, systemRoot, L"SysWOW64");
+        appendChild(built.never, systemRoot, L"WinSxS");
+        appendChild(built.never, systemRoot, L"Installer");
+        appendChild(built.never, systemRoot, L"DriverStore");
+        appendChild(built.never, systemRoot, L"assembly");
+        pushUnique(built.guarded, systemRoot);
+        // Литеральный запас «C:\Windows» — тот же, что был в списке vfs_paths до
+        // D-12. Лишнего он не открывает: если Windows действительно на другом
+        // диске, этого каталога на машине нет, а правило с таким литералом
+        // кандидатов не даёт (так написано в rules/crash.dumps.json).
+        pushUnique(built.guarded, L"C:\\Windows");
         wchar_t system[MAX_PATH] = {};
         const UINT systemLength = ::GetSystemDirectoryW(system, MAX_PATH);
         if (systemLength > 0 && systemLength < MAX_PATH) {
@@ -335,13 +376,14 @@ void appendChild(std::vector<std::wstring>& out, const std::wstring& parent, std
         // Program Files во всех вариантах: на 32-битном клиенте «ProgramFiles» —
         // x86-каталог, а настоящий 64-битный лежит в ProgramW6432.
         for (const wchar_t* name : {L"ProgramFiles", L"ProgramFiles(x86)", L"ProgramW6432"}) {
-            const std::wstring canonical = canonicalizePath(environmentValue(name));
-            if (!canonical.empty()) built.never.push_back(canonical);
+            pushUnique(built.never, environmentValue(name));
         }
+        // Литеральный запас: те же пути, что знал список vfs_paths до D-12.
+        pushUnique(built.never, L"C:\\Program Files");
+        pushUnique(built.never, L"C:\\Program Files (x86)");
         // ProgramData — мягкий запрет: правило wer чистит
         // C:\ProgramData\Microsoft\Windows\WER, но не сам ProgramData.
-        const std::wstring programData = canonicalizePath(environmentValue(L"ProgramData"));
-        if (!programData.empty()) built.guarded.push_back(programData);
+        pushUnique(built.guarded, environmentValue(L"ProgramData"));
 
         return built;
     }();
@@ -836,12 +878,24 @@ ProtectionCheck checkProtected(std::wstring_view path, const DeleteOptions& opti
 }
 
 bool isProtectedPath(std::wstring_view path) {
-    // Корень правила здесь не нужен: вопрос «этот путь защищён сам по себе».
-    // Непригодный путь тоже считается неразрешённым — иначе вызывающий получил бы
-    // «можно удалять» для пустой строки.
-    DeleteOptions options;
-    options.allowedRoot = path;
-    return !checkProtected(path, options).allowed();
+    // «Этот путь защищён сам по себе»: корень правила здесь не участвует, и
+    // мягкий запрет отвечает «да» — без корня снимать его нечем. Прежняя
+    // реализация подставляла сам путь в allowedRoot, то есть отвечала «нет» для
+    // C:\Windows и C:\ProgramData, и два слоя расходились в ответе на один и тот
+    // же вопрос (D-12). Теперь тот же ответ даёт vfs_paths::isProtectedPath.
+    const std::wstring canonical = canonicalizePath(path);
+    if (canonical.empty()) return true;  // непригодный путь — не «можно удалять»
+    const RootLists& lists = rootLists();
+    for (const std::wstring& volume : lists.volumes) {
+        if (equalNoCase(canonical, volume)) return true;
+    }
+    for (const std::wstring& forbidden : lists.never) {
+        if (pathInside(canonical, forbidden)) return true;
+    }
+    for (const std::wstring& guarded : lists.guarded) {
+        if (pathInside(canonical, guarded)) return true;
+    }
+    return false;
 }
 
 std::optional<FileStamp> readFileStamp(std::wstring_view path) {
